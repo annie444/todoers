@@ -1,0 +1,28 @@
+[package]
+name = "todoers-types"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_arrays = { workspace = true }
+zeroize = { workspace = true }
+secrecy = { workspace = true }
+sha2 = { workspace = true }
+uuid = { workspace = true }
+hmac = { workspace = true }
+sqlx = { workspace = true, features = [
+  "derive",
+  "runtime-tokio",
+  "macros",
+  "uuid",
+  "time",
+] }
+base64 = { workspace = true }
+
+[features]
+default = ["sqlite"]
+postgres = ["sqlx/postgres", "sqlx/tls-rustls-ring-native-roots"]
+sqlite = ["sqlx/sqlite"]

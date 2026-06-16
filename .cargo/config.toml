@@ -1,0 +1,8 @@
+[alias]
+b = "build"
+c = "check"
+t = "test"
+r = "run"
+rr = "run --release"
+todoers = ["run", "--package", "todoers", "--"]
+server = ["run", "--package", "todoers-server", "--"]

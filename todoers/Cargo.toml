@@ -1,0 +1,33 @@
+[package]
+name = "todoers"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+todoers-types = { path = "../todoers-types" }
+
+sqlx = { workspace = true, features = [
+  "derive",
+  "tls-rustls-ring-native-roots",
+  "runtime-tokio",
+  "macros",
+  "migrate",
+  "regexp",
+  "uuid",
+  "time",
+  "sqlite",
+] }
+clap = { workspace = true }
+ratatui = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+ed25519-dalek = { workspace = true }
+chacha20poly1305 = { workspace = true }
+dryoc = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+old_rand_core = { workspace = true }
+secrecy = { workspace = true }
+zeroize = { workspace = true }
