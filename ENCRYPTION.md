@@ -68,6 +68,24 @@ Both wrappings produce `nonce(24) ‖ XChaCha20-Poly1305(master, id ‖ sign)`. 
 wrong key (wrong password / wrong `export_key`) fails the AEAD tag check.
 `build_local_account` re-creates the local copy after a fresh-device login.
 
+### Optional third wrapping — password-less device unlock (`crypto::device_*`)
+
+When a device opts in (`[device_unlock]` config), the same secret keys are sealed
+a **third** way: to a local **AGE/SSH** key via the `age` crate, written to
+`account.device_wrapped_keys`. Bundled in that cache is a per-device **Ed25519
+device-auth keypair**; its public half is enrolled with the server (`POST
+/v1/auth/devices`). On later launches the app decrypts the cache with the local
+key (no password) and does a **device login** — signing a server challenge with
+the device-auth key — to get a session. AGE is encryption-only, so the dedicated
+Ed25519 key keeps the server's check uniform (it only ever does Ed25519 verify).
+
+The cache blob is **class-1** (already encrypted), safe at rest like the others.
+Its protection is only as strong as the local key — prefer agent/passphrase/
+hardware-backed keys over a plaintext identity file. Trusted keys are stored
+server-side as plaintext public keys (no list content), so zero-knowledge holds.
+**Revoking** a device rejects its future logins and deletes its live sessions;
+enroll/revoke require step-up (a recent password, never a device, session).
+
 Unwrapped private keys and DEKs are **class-3** material: in memory only
 (`UnlockedKeys`), never written to disk.
 

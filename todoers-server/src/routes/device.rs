@@ -38,6 +38,9 @@ pub async fn enroll(
     auth: AuthMember,
     Json(req): Json<EnrollDeviceRequest>,
 ) -> AppResult<StatusCode> {
+    // Enrolling a durable password-less credential is sensitive: require a recent
+    // password login (never a device-minted session).
+    auth.require_password_step_up()?;
     state
         .db
         .enroll_trusted_device_key(
@@ -65,6 +68,9 @@ pub async fn revoke(
     auth: AuthMember,
     Path(device_id): Path<Uuid>,
 ) -> AppResult<StatusCode> {
+    // Revocation is the compromise kill-switch: also gate it behind step-up so a
+    // compromised device can't revoke the owner's other devices.
+    auth.require_password_step_up()?;
     state
         .db
         .revoke_trusted_device_key(auth.member_id, device_id)
@@ -150,9 +156,11 @@ pub async fn login_finish(
 
     let (token, token_hash) = mint_session_token();
     let expires_at = OffsetDateTime::now_utc() + SESSION_TTL;
+    // Tag the session with this device so revocation can kill it and step-up auth
+    // can tell it apart from a password login.
     state
         .db
-        .create_session(member_id, &token_hash, expires_at)
+        .create_session(member_id, &token_hash, expires_at, Some(device_id))
         .await?;
 
     Ok(Json(DeviceLoginFinishResponse {
@@ -241,6 +249,75 @@ mod tests {
                 .is_none(),
             "device login must be rejected after revocation"
         );
+    }
+
+    /// Step-up: a device-minted session must NOT be able to enroll another device
+    /// (prevents a compromised device from escalating), and revoking a device must
+    /// immediately kill the session it minted (per-device session tagging).
+    #[sqlx::test(migrations = "db/migrations")]
+    async fn step_up_and_session_tagging(db: sqlx::PgPool) {
+        let state = crate::state::AppState::new_for_test(db);
+        let server = TestServer::new(crate::routes::build_router(state).await);
+
+        let pw_token = crate::routes::testutil::register_and_login(&server, "dev3", "pw").await;
+        let login = crate::routes::testutil::login(&server, "dev3", "pw").await;
+        let member_id = login.member_id;
+
+        // Enroll a device with the (fresh) password session.
+        let mut rng = OsRng;
+        let device_key = SigningKey::generate(&mut rng);
+        let device_id = Uuid::new_v4();
+        server
+            .post("/v1/auth/devices")
+            .add_header(AUTHORIZATION, format!("Bearer {pw_token}"))
+            .json(&EnrollDeviceRequest {
+                device_id,
+                device_signing_pub: device_key.verifying_key().to_bytes(),
+                label: "laptop".into(),
+            })
+            .await
+            .assert_status(StatusCode::CREATED);
+
+        // Get a DEVICE session, then confirm it can read but cannot enroll.
+        let device_token = do_device_login(&server, member_id, device_id, &device_key)
+            .await
+            .expect("device login should succeed");
+        // Read-only is fine for a device session.
+        server
+            .get("/v1/auth/devices")
+            .add_header(AUTHORIZATION, format!("Bearer {device_token}"))
+            .await
+            .assert_status_ok();
+        // Enrolling another device from a device session is forbidden (step-up).
+        let other_key = SigningKey::generate(&mut rng);
+        server
+            .post("/v1/auth/devices")
+            .add_header(AUTHORIZATION, format!("Bearer {device_token}"))
+            .json(&EnrollDeviceRequest {
+                device_id: Uuid::new_v4(),
+                device_signing_pub: other_key.verifying_key().to_bytes(),
+                label: "rogue".into(),
+            })
+            .await
+            .assert_status(StatusCode::FORBIDDEN);
+        // Revoking from a device session is likewise forbidden.
+        server
+            .delete(&format!("/v1/auth/devices/{device_id}"))
+            .add_header(AUTHORIZATION, format!("Bearer {device_token}"))
+            .await
+            .assert_status(StatusCode::FORBIDDEN);
+
+        // Revoke with the password session → the device's live session dies too.
+        server
+            .delete(&format!("/v1/auth/devices/{device_id}"))
+            .add_header(AUTHORIZATION, format!("Bearer {pw_token}"))
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+        server
+            .get("/v1/auth/devices")
+            .add_header(AUTHORIZATION, format!("Bearer {device_token}"))
+            .await
+            .assert_status(StatusCode::UNAUTHORIZED);
     }
 
     /// A wrong signature must not authenticate.

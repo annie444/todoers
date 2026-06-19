@@ -70,6 +70,23 @@ endpoints require a bearer token via `AuthMember`.
 | POST | `/v1/auth/login/finish` | Finishes the AKE, mints a session token (only its SHA-512 hash is stored), returns the token + escrow blob for a fresh device to rehydrate keys. |
 | POST | `/v1/auth/logout` | Revokes **this device's** session (per-device, by token hash). Requires auth. |
 
+Sessions are **tagged with the device** that minted them: `NULL` for a password
+login, the `device_id` for a device login (below). This lets revocation kill a
+device's live sessions and lets sensitive ops require a password session.
+
+### Password-less device login — trusted device keys (`routes/device.rs`)
+A device seals its keys on disk under a local AGE/SSH key and enrolls a per-device
+Ed25519 *device-auth* public key. It then logs in without a password by signing a
+server challenge (`device_challenge_view`), verified against the enrolled key.
+
+| Method | Path | Notes |
+| --- | --- | --- |
+| POST | `/v1/auth/devices` | Enroll this device's Ed25519 trusted key. **Step-up:** requires a recent *password* session (a device session or a stale one → `403`). → `201`. |
+| GET | `/v1/auth/devices` | List the caller's enrolled devices (any session). |
+| DELETE | `/v1/auth/devices/{device_id}` | Revoke a device (compromise kill-switch): future device logins are rejected **and** its live sessions are deleted. **Step-up** required. → `204`. |
+| POST | `/v1/auth/device-login/start` | Issue a challenge for an enrolled, non-revoked device (else `401`). Stashes `device_id ‖ nonce` in the consume-once `login_cache`. |
+| POST | `/v1/auth/device-login/finish` | Verify the signed challenge (gated by `verify_signatures`), mint a session **tagged with `device_id`**, and return the token + public identity (no escrow blob — the device already has its keys). |
+
 ### Control plane — lists, members, keys (`routes/lists.rs`, `routes/users.rs`)
 | Method | Path | Notes |
 | --- | --- | --- |

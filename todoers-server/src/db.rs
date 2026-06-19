@@ -38,6 +38,15 @@ pub struct UserKeysRow {
     pub wrapped_secret_keys: Vec<u8>,
 }
 
+/// A resolved session: which member, which device minted it (`None` = password
+/// login), and when — the last two drive step-up auth for sensitive operations.
+#[derive(Debug, Clone)]
+pub struct SessionRow {
+    pub member_id: Uuid,
+    pub device_id: Option<Uuid>,
+    pub created_at: OffsetDateTime,
+}
+
 impl Db {
     const LOGIN_TTL: Duration = Duration::minutes(1);
     pub async fn new(config: &DbConfig) -> anyhow::Result<Self> {
@@ -512,34 +521,39 @@ impl Db {
     }
 
     /// Record a freshly minted session. `token_hash` is the hash of the bearer
-    /// token (the token itself never touches the DB).
+    /// token (the token itself never touches the DB). `device_id` is `None` for a
+    /// password login and `Some(..)` for a password-less device login.
     pub async fn create_session(
         &self,
         member_id: Uuid,
         token_hash: &[u8],
         expires_at: OffsetDateTime,
+        device_id: Option<Uuid>,
     ) -> AppResult<()> {
         sqlx::query!(
             r#"
-            INSERT INTO sessions (token_hash, member_id, expires_at)
-            VALUES ($1, $2, $3)
+            INSERT INTO sessions (token_hash, member_id, expires_at, device_id)
+            VALUES ($1, $2, $3, $4)
             "#,
             token_hash,
             member_id,
             expires_at,
+            device_id,
         )
         .execute(&self.pool)
         .await?;
         Ok(())
     }
 
-    /// Resolve a presented token hash to its member, enforcing expiry. Used by
-    /// the `AuthMember` extractor on every authenticated request.
-    pub async fn lookup_session(&self, token_hash: &[u8]) -> AppResult<Option<Uuid>> {
+    /// Resolve a presented token hash to its session, enforcing expiry. Used by
+    /// the `AuthMember` extractor on every authenticated request; the device tag
+    /// and creation time drive step-up auth.
+    pub async fn lookup_session(&self, token_hash: &[u8]) -> AppResult<Option<SessionRow>> {
         let now = OffsetDateTime::now_utc();
-        let member_id = sqlx::query_scalar!(
+        let row = sqlx::query_as!(
+            SessionRow,
             r#"
-            SELECT s.member_id
+            SELECT s.member_id, s.device_id, s.created_at
             FROM sessions s
             WHERE s.token_hash = $1 AND s.expires_at > $2
             "#,
@@ -548,7 +562,7 @@ impl Db {
         )
         .fetch_optional(&self.pool)
         .await?;
-        Ok(member_id)
+        Ok(row)
     }
 
     /// Revoke exactly one session — the device whose bearer token hashes to
@@ -688,24 +702,38 @@ impl Db {
         Ok(row)
     }
 
-    /// Revoke a device: future device logins for it are rejected. Idempotent.
+    /// Revoke a device: future device logins for it are rejected AND any live
+    /// sessions it minted are deleted, so a lost/compromised device loses access
+    /// immediately rather than at token expiry. Idempotent.
     pub async fn revoke_trusted_device_key(
         &self,
         member_id: Uuid,
         device_id: Uuid,
     ) -> AppResult<()> {
-        sqlx::query!(
-            r#"
-            UPDATE trusted_device_keys
-            SET revoked_at = now()
-            WHERE member_id = $1 AND device_id = $2 AND revoked_at IS NULL
-            "#,
-            member_id,
-            device_id,
-        )
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        self.safe_transaction(async move |tx| {
+            sqlx::query!(
+                r#"
+                UPDATE trusted_device_keys
+                SET revoked_at = now()
+                WHERE member_id = $1 AND device_id = $2 AND revoked_at IS NULL
+                "#,
+                member_id,
+                device_id,
+            )
+            .execute(&mut *tx)
+            .await?;
+
+            // Kill any sessions this device minted (per-device session tagging).
+            sqlx::query!(
+                "DELETE FROM sessions WHERE member_id = $1 AND device_id = $2",
+                member_id,
+                device_id,
+            )
+            .execute(&mut *tx)
+            .await?;
+            Ok(())
+        })
+        .await
     }
 
     /// List a member's enrolled devices (active and revoked) for management UIs.

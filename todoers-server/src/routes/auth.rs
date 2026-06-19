@@ -39,6 +39,10 @@ use crate::state::AppState;
 /// password-less device-login path (`routes::device`).
 pub(crate) const SESSION_TTL: Duration = Duration::days(30);
 
+/// How recently a PASSWORD login must have happened for a step-up-gated
+/// operation (enroll/revoke trusted device keys) to be allowed.
+pub(crate) const STEP_UP_TTL: Duration = Duration::minutes(5);
+
 /// The authenticated caller, resolved from a session token on every request.
 #[derive(Debug, Clone)]
 pub struct AuthMember {
@@ -46,6 +50,28 @@ pub struct AuthMember {
     /// Hash of the bearer token this request authenticated with. Lets handlers
     /// like logout revoke exactly this session (this device), not all of them.
     pub token_hash: Vec<u8>,
+    /// Device that minted this session: `None` for a password login, `Some(..)`
+    /// for a password-less device login.
+    pub device_id: Option<Uuid>,
+    /// When this session was created — used together with `device_id` for step-up.
+    pub created_at: OffsetDateTime,
+}
+
+impl AuthMember {
+    /// Require a recent PASSWORD (non-device) login for sensitive operations like
+    /// enrolling or revoking trusted device keys. A device-minted session can
+    /// never perform these (so a compromised device can't escalate by enrolling
+    /// more devices or revoking the owner's), and a stale password session must
+    /// re-authenticate.
+    pub(crate) fn require_password_step_up(&self) -> AppResult<()> {
+        if self.device_id.is_some() {
+            return Err(AppError::StepUpRequired);
+        }
+        if OffsetDateTime::now_utc() - self.created_at > STEP_UP_TTL {
+            return Err(AppError::StepUpRequired);
+        }
+        Ok(())
+    }
 }
 
 impl FromRequestParts<AppState> for AuthMember {
@@ -68,14 +94,16 @@ impl FromRequestParts<AppState> for AuthMember {
 
         // Look the token up by its hash; expiry is enforced in the query.
         let token_hash = hash_token(token)?;
-        let member_id = state
+        let session = state
             .db
             .lookup_session(&token_hash)
             .await?
             .ok_or(AppError::Unauthorized)?;
         Ok(AuthMember {
-            member_id,
+            member_id: session.member_id,
             token_hash,
+            device_id: session.device_id,
+            created_at: session.created_at,
         })
     }
 }
@@ -240,9 +268,10 @@ pub async fn login_finish(
 
     let (token, token_hash) = mint_session_token();
     let expires_at = OffsetDateTime::now_utc() + SESSION_TTL;
+    // Password login → no device tag (this is what step-up auth requires).
     state
         .db
-        .create_session(member_id, &token_hash, expires_at)
+        .create_session(member_id, &token_hash, expires_at, None)
         .await?;
 
     Ok(Json(LoginFinishResponse {
