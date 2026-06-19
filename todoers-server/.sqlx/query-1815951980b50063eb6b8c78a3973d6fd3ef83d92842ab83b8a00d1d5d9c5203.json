@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE trusted_device_keys\n            SET revoked_at = now()\n            WHERE member_id = $1 AND device_id = $2 AND revoked_at IS NULL\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "1815951980b50063eb6b8c78a3973d6fd3ef83d92842ab83b8a00d1d5d9c5203"
+}

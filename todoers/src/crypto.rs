@@ -3,13 +3,18 @@
 use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce, aead::Aead};
 use dryoc::dryocbox::{DryocBox, KeyPair, PublicKey};
+use std::io::{Read, Write};
+use std::str::FromStr;
+
 use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
 use old_rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 use zeroize::Zeroize;
 
 use todoers_types::{
-    Ed25519Pub, Epoch, KeySlot, ListId, ListMetadata, Member, MemberId, UpdatePayload, X25519Pub,
+    DEVICE_CHALLENGE_VERSION, Ed25519Pub, Epoch, KeySlot, ListId, ListMetadata, Member, MemberId,
+    UpdatePayload, X25519Pub, device_challenge_view,
 };
 
 use crate::error::{AppError, AppResult};
@@ -252,6 +257,145 @@ pub fn unwrap_secret_keys(master: &[u8; 32], blob: &[u8]) -> AppResult<([u8; 32]
     identity_secret.copy_from_slice(&plaintext[..32]);
     signing_seed.copy_from_slice(&plaintext[32..]);
     Ok((identity_secret, signing_seed))
+}
+
+// ---------------------------------------------------------------------------
+// Device vault — encrypt the unlocked keys to a LOCAL AGE/SSH key so the app can
+// unlock without a password (password-less device unlock). The sealed blob is
+// class-1 (already encrypted), safe at rest exactly like `wrapped_secret_keys`.
+// The protection is only as strong as the local private key: prefer an
+// agent/passphrase/hardware-backed key over a plaintext identity file.
+// ---------------------------------------------------------------------------
+
+/// Which kind of local key protects the on-disk key cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceBackend {
+    /// Native age recipient (`age1…`) / identity (`AGE-SECRET-KEY-…`).
+    Age,
+    /// OpenSSH key (`ssh-ed25519 …` recipient, OpenSSH private key identity).
+    Ssh,
+}
+
+impl DeviceBackend {
+    /// Parse the backend name from config (`"age"` / `"ssh"`).
+    #[tracing::instrument]
+    pub fn parse(s: &str) -> AppResult<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "age" => Ok(Self::Age),
+            "ssh" => Ok(Self::Ssh),
+            other => Err(AppError::DeviceVault(format!(
+                "unknown device-unlock backend {other:?}; expected \"age\" or \"ssh\""
+            ))),
+        }
+    }
+}
+
+/// Encrypt `plaintext` to a local AGE/SSH `recipient`, returning an age file.
+#[tracing::instrument(skip(plaintext))]
+pub fn device_seal(
+    backend: DeviceBackend,
+    recipient: &str,
+    plaintext: &[u8],
+) -> AppResult<Vec<u8>> {
+    let recipient = recipient.trim();
+    let encryptor = match backend {
+        DeviceBackend::Age => {
+            let r = age::x25519::Recipient::from_str(recipient)
+                .map_err(|e| AppError::DeviceVault(format!("invalid age recipient: {e}")))?;
+            age::Encryptor::with_recipients(std::iter::once(&r as &dyn age::Recipient))
+        }
+        DeviceBackend::Ssh => {
+            let r = age::ssh::Recipient::from_str(recipient)
+                .map_err(|e| AppError::DeviceVault(format!("invalid ssh recipient: {e:?}")))?;
+            age::Encryptor::with_recipients(std::iter::once(&r as &dyn age::Recipient))
+        }
+    }
+    .map_err(|e| AppError::DeviceVault(format!("failed to build encryptor: {e}")))?;
+
+    let mut out = Vec::new();
+    let mut writer = encryptor
+        .wrap_output(&mut out)
+        .map_err(|e| AppError::DeviceVault(format!("failed to start encryption: {e}")))?;
+    writer
+        .write_all(plaintext)
+        .map_err(|e| AppError::DeviceVault(format!("encryption write failed: {e}")))?;
+    writer
+        .finish()
+        .map_err(|e| AppError::DeviceVault(format!("encryption finalize failed: {e}")))?;
+    Ok(out)
+}
+
+/// Decrypt an age `blob` with a local AGE/SSH identity (the file contents, not a
+/// path). Passphrase-encrypted SSH keys are rejected for now — use an unencrypted
+/// or agent-backed key (interactive passphrase prompts are a follow-up).
+#[tracing::instrument(skip(identity_contents, blob))]
+pub fn device_open(
+    backend: DeviceBackend,
+    identity_contents: &str,
+    blob: &[u8],
+) -> AppResult<Vec<u8>> {
+    let decryptor = age::Decryptor::new_buffered(blob)
+        .map_err(|e| AppError::DeviceVault(format!("not a valid age file: {e}")))?;
+
+    let mut reader = match backend {
+        DeviceBackend::Age => {
+            // An age identity file may hold comments (`#…`) and one or more keys.
+            let identities = identity_contents
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(|l| {
+                    age::x25519::Identity::from_str(l)
+                        .map_err(|e| AppError::DeviceVault(format!("invalid age identity: {e}")))
+                })
+                .collect::<AppResult<Vec<_>>>()?;
+            if identities.is_empty() {
+                return Err(AppError::DeviceVault("no age identities found".into()));
+            }
+            decryptor
+                .decrypt(identities.iter().map(|i| i as &dyn age::Identity))
+                .map_err(|e| AppError::DeviceVault(format!("decryption failed: {e}")))?
+        }
+        DeviceBackend::Ssh => {
+            let identity = age::ssh::Identity::from_buffer(identity_contents.as_bytes(), None)
+                .map_err(|e| AppError::DeviceVault(format!("invalid ssh identity: {e}")))?;
+            match identity {
+                age::ssh::Identity::Encrypted(_) => {
+                    return Err(AppError::DeviceVault(
+                        "the SSH key is passphrase-encrypted; use an unencrypted or agent-backed \
+                         key (interactive passphrase prompts are a follow-up)"
+                            .into(),
+                    ));
+                }
+                age::ssh::Identity::Unsupported(_) => {
+                    return Err(AppError::DeviceVault("unsupported SSH key type".into()));
+                }
+                age::ssh::Identity::Unencrypted(_) => decryptor
+                    .decrypt(std::iter::once(&identity as &dyn age::Identity))
+                    .map_err(|e| AppError::DeviceVault(format!("decryption failed: {e}")))?,
+            }
+        }
+    };
+
+    let mut out = Vec::new();
+    reader
+        .read_to_end(&mut out)
+        .map_err(|e| AppError::DeviceVault(format!("decryption read failed: {e}")))?;
+    Ok(out)
+}
+
+/// Sign a server-issued device-login challenge with the per-device Ed25519
+/// device-auth key. Mirrors the server's `device_challenge_view` byte layout.
+#[tracing::instrument(skip(device_signing_seed, nonce))]
+pub fn sign_device_challenge(
+    device_signing_seed: &[u8; 32],
+    member_id: &Uuid,
+    device_id: &Uuid,
+    nonce: &[u8],
+) -> [u8; 64] {
+    let sk = ed25519_dalek::SigningKey::from_bytes(device_signing_seed);
+    let msg = device_challenge_view(DEVICE_CHALLENGE_VERSION, member_id, device_id, nonce);
+    sk.sign(&msg).to_bytes()
 }
 
 // ---------------------------------------------------------------------------

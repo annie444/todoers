@@ -5,13 +5,17 @@
 use anyhow::Context;
 use reqwest::Client;
 use tracing::error;
+use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use todoers_types::{
-    FinishRegisterResponse, LoginFinishResponse, LoginStartResponse, StartRegisterResponse,
+    DeviceInfo, DeviceLoginFinishRequest, DeviceLoginFinishResponse, DeviceLoginStartRequest,
+    DeviceLoginStartResponse, EnrollDeviceRequest, FinishRegisterResponse, ListDevicesResponse,
+    LoginFinishResponse, LoginStartResponse, StartRegisterResponse,
 };
 
 use crate::auth::{self, AccountRow, NewAccount, UnlockedKeys};
+use crate::crypto::DeviceBackend;
 
 /// Run the full two-message OPAQUE registration against `base_url` and return the
 /// local `NewAccount` to persist. Network/server failures (including a duplicate
@@ -203,4 +207,182 @@ pub async fn local_unlock(
         }
     };
     Ok(keys)
+}
+
+// ── Password-less device unlock (trusted device keys) ─────────────────────────
+
+/// Enroll this device's Ed25519 trusted key with the server. Authenticated with
+/// the current session `token` (typically obtained from a password login).
+#[tracing::instrument(skip(token, device_signing_pub))]
+pub async fn enroll_device(
+    base_url: &str,
+    token: &str,
+    device_id: Uuid,
+    device_signing_pub: [u8; 32],
+    label: &str,
+) -> anyhow::Result<()> {
+    let base = base_url.trim_end_matches('/');
+    Client::new()
+        .post(format!("{base}/v1/auth/devices"))
+        .bearer_auth(token)
+        .json(&EnrollDeviceRequest {
+            device_id,
+            device_signing_pub,
+            label: label.to_string(),
+        })
+        .send()
+        .await
+        .context("device enroll request failed")?
+        .error_for_status()
+        .context("device enroll rejected by server")?;
+    Ok(())
+}
+
+/// List this account's enrolled devices.
+#[tracing::instrument(skip(token))]
+pub async fn list_devices(base_url: &str, token: &str) -> anyhow::Result<Vec<DeviceInfo>> {
+    let base = base_url.trim_end_matches('/');
+    let resp: ListDevicesResponse = Client::new()
+        .get(format!("{base}/v1/auth/devices"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .context("list devices request failed")?
+        .error_for_status()
+        .context("list devices rejected by server")?
+        .json()
+        .await
+        .context("invalid list devices response")?;
+    Ok(resp.devices)
+}
+
+/// Revoke a device (compromise kill-switch). The server then rejects its logins.
+#[tracing::instrument(skip(token))]
+pub async fn revoke_device(base_url: &str, token: &str, device_id: Uuid) -> anyhow::Result<()> {
+    let base = base_url.trim_end_matches('/');
+    Client::new()
+        .delete(format!("{base}/v1/auth/devices/{device_id}"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .context("revoke device request failed")?
+        .error_for_status()
+        .context("revoke device rejected by server")?;
+    Ok(())
+}
+
+/// Two-message password-less device login: fetch a challenge, sign it with the
+/// device-auth seed, and exchange it for a fresh session token.
+#[tracing::instrument(skip(device_signing_seed))]
+pub async fn device_login(
+    base_url: &str,
+    member_id: Uuid,
+    device_id: Uuid,
+    device_signing_seed: &[u8; 32],
+) -> anyhow::Result<DeviceLoginFinishResponse> {
+    let base = base_url.trim_end_matches('/');
+    let client = Client::new();
+
+    let start: DeviceLoginStartResponse = client
+        .post(format!("{base}/v1/auth/device-login/start"))
+        .json(&DeviceLoginStartRequest {
+            member_id,
+            device_id,
+        })
+        .send()
+        .await
+        .context("device-login/start request failed")?
+        .error_for_status()
+        .context("device-login/start rejected by server")?
+        .json()
+        .await
+        .context("invalid device-login/start response")?;
+
+    let signature = crate::crypto::sign_device_challenge(
+        device_signing_seed,
+        &member_id,
+        &device_id,
+        &start.challenge,
+    );
+
+    let finish: DeviceLoginFinishResponse = client
+        .post(format!("{base}/v1/auth/device-login/finish"))
+        .json(&DeviceLoginFinishRequest {
+            login_id: start.login_id,
+            signature,
+        })
+        .send()
+        .await
+        .context("device-login/finish request failed")?
+        .error_for_status()
+        .context("device-login/finish rejected by server")?
+        .json()
+        .await
+        .context("invalid device-login/finish response")?;
+    Ok(finish)
+}
+
+/// Full password-less unlock: decrypt the on-disk cache with the local AGE/SSH
+/// identity to recover the keys + device-auth key, then device-login for a fresh
+/// token. If the server is unreachable, returns the cached keys with an empty
+/// token (offline unlock) rather than failing.
+#[tracing::instrument(skip(blob))]
+pub async fn unlock_via_device(
+    base_url: &str,
+    backend: DeviceBackend,
+    identity_path: &str,
+    device_id: [u8; 16],
+    blob: Vec<u8>,
+) -> anyhow::Result<Zeroizing<UnlockedKeys>> {
+    let identity_contents = tokio::fs::read_to_string(identity_path)
+        .await
+        .with_context(|| format!("reading device identity file {identity_path}"))?;
+
+    // age decryption (and any agent round-trips) are blocking; keep them off the loop.
+    let payload = tokio::task::spawn_blocking(move || {
+        auth::unlock_from_device_cache(backend, &identity_contents, &blob)
+    })
+    .await
+    .context("device unlock task panicked")?
+    .context("failed to decrypt device cache")?;
+
+    let member_uuid = Uuid::from_bytes(payload.keys.member_id.0);
+    let device_uuid = Uuid::from_bytes(payload.device_id);
+
+    let mut keys = payload.keys.clone();
+    match device_login(base_url, member_uuid, device_uuid, &payload.device_signing_seed).await {
+        Ok(resp) => keys.token = resp.token,
+        Err(e) => {
+            error!(?e, "device login failed; continuing offline with cached keys");
+            keys.token = String::new();
+        }
+    }
+    Ok(Zeroizing::new(keys))
+}
+
+/// Generate a device-auth keypair, seal the keys to `recipient`, and enroll the
+/// trusted key with the server. Returns `(device_id, sealed_blob)` for the caller
+/// to persist locally. The device-auth private seed lives ONLY inside the blob.
+#[tracing::instrument(skip(token, keys))]
+pub async fn enroll_this_device(
+    base_url: &str,
+    token: &str,
+    backend: DeviceBackend,
+    recipient: &str,
+    keys: &UnlockedKeys,
+    label: &str,
+) -> anyhow::Result<([u8; 16], Vec<u8>)> {
+    let (device_id, device_seed, device_pub) = auth::generate_device_identity();
+
+    let keys = keys.clone();
+    let recipient = recipient.to_string();
+    let blob = tokio::task::spawn_blocking(move || {
+        auth::build_device_cache(backend, &recipient, &keys, device_id, device_seed, device_pub)
+    })
+    .await
+    .context("device cache sealing panicked")?
+    .context("failed to seal device cache")?;
+
+    enroll_device(base_url, token, Uuid::from_bytes(device_id), device_pub, label).await?;
+    Ok((device_id, blob))
 }

@@ -436,6 +436,87 @@ pub struct LoginFinishResponse {
     pub wrapped_secret_keys: Vec<u8>,
 }
 
+// ── Trusted device keys (password-less device unlock) ────────────────────────
+// A device stores its unlocked keys encrypted on disk under a local AGE/SSH key
+// (password-less unlock). Inside that encrypted cache it also keeps a dedicated
+// Ed25519 *device-auth* keypair; the public half is enrolled with the server as
+// a "trusted key". To sync without a password the device does a challenge/response
+// "device login": the server hands it a random nonce, it signs
+// `device_challenge_view(..)` with the device-auth key, and the server verifies
+// against the enrolled public key. Revoking a device removes its trusted key, so
+// the server then rejects that device even if its on-disk cache was stolen.
+
+/// Domain-separated version tag for the device-auth challenge signature. Bumped
+/// only if the signed byte layout changes; client and server MUST agree.
+pub const DEVICE_CHALLENGE_VERSION: u8 = 1;
+
+/// `POST /v1/auth/devices` — enroll this device's trusted (Ed25519) public key.
+/// Authenticated with an ordinary session (a password login, typically).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct EnrollDeviceRequest {
+    /// Client-generated 16-byte device identifier (opaque to the server).
+    pub device_id: Uuid,
+    /// Ed25519 public key the server will verify device-login challenges against.
+    #[serde(with = "b6432")]
+    pub device_signing_pub: [u8; 32],
+    /// Human label for `GET /v1/auth/devices` (e.g. hostname). Not a secret.
+    pub label: String,
+}
+
+/// One enrolled device as returned by `GET /v1/auth/devices`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DeviceInfo {
+    pub device_id: Uuid,
+    pub label: String,
+    /// Unix seconds when the device was enrolled.
+    pub created_at: i64,
+    /// True once the device has been revoked (its trusted key no longer authenticates).
+    pub revoked: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ListDevicesResponse {
+    pub devices: Vec<DeviceInfo>,
+}
+
+/// `POST /v1/auth/device-login/start` — begin a password-less device login.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DeviceLoginStartRequest {
+    pub member_id: Uuid,
+    pub device_id: Uuid,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DeviceLoginStartResponse {
+    /// Echoed back on finish so the server can recover the stashed challenge.
+    pub login_id: Uuid,
+    /// Random nonce the client must sign with its device-auth key.
+    #[serde(with = "b64")]
+    pub challenge: Vec<u8>,
+}
+
+/// `POST /v1/auth/device-login/finish` — prove possession of the device-auth key.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DeviceLoginFinishRequest {
+    pub login_id: Uuid,
+    /// Ed25519 signature over `device_challenge_view(..)`.
+    #[serde(with = "b6464")]
+    pub signature: [u8; 64],
+}
+
+/// On success: a session token plus the public identity. Unlike password login
+/// there is NO `wrapped_secret_keys` here — the device already recovered its keys
+/// from its local encrypted cache.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DeviceLoginFinishResponse {
+    pub token: String,
+    pub member_id: Uuid,
+    #[serde(with = "b64")]
+    pub identity_pub: Vec<u8>,
+    #[serde(with = "b64")]
+    pub signing_pub: Vec<u8>,
+}
+
 // ── Updates ─────────────────────────────────────────────────────────────────
 
 /// Body of `POST /lists/{list_id}/updates`. `seq` is NOT present — the server
@@ -584,6 +665,28 @@ pub fn aead_aad(version: u8, list_id: &Uuid, epoch: u32, author: &Uuid, nonce: &
     v.extend_from_slice(list_id.as_bytes());
     v.extend_from_slice(&epoch.to_le_bytes());
     v.extend_from_slice(author.as_bytes());
+    v.extend_from_slice(nonce);
+    v
+}
+
+/// Canonical signed view for a password-less device-login challenge. The device
+/// signs this with its Ed25519 device-auth key; the server verifies it against the
+/// enrolled trusted key. Domain-separated so a device-login signature can never be
+/// confused with an update signature (`signing_view`).
+///
+///   view = "todoers:device-challenge:v1" ‖ version ‖ member_id(16) ‖ device_id(16) ‖ nonce
+pub fn device_challenge_view(
+    version: u8,
+    member_id: &Uuid,
+    device_id: &Uuid,
+    nonce: &[u8],
+) -> Vec<u8> {
+    const DOMAIN: &[u8] = b"todoers:device-challenge:v1";
+    let mut v = Vec::with_capacity(DOMAIN.len() + 1 + 16 + 16 + nonce.len());
+    v.extend_from_slice(DOMAIN);
+    v.push(version);
+    v.extend_from_slice(member_id.as_bytes());
+    v.extend_from_slice(device_id.as_bytes());
     v.extend_from_slice(nonce);
     v
 }

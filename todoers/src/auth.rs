@@ -364,6 +364,83 @@ pub fn build_local_account(
     })
 }
 
+// ── Password-less device unlock ───────────────────────────────────────────────
+// A THIRD wrapping of the secret keys, alongside escrow (server) and local
+// (Argon2id): the unlocked keys are sealed to a local AGE/SSH key for
+// password-less unlock. Bundled with them is a dedicated Ed25519 device-auth
+// keypair whose public half is enrolled with the server; the private half signs
+// the server's device-login challenge so this device can also SYNC without a
+// password. Revoking the device server-side then rejects it even if this cache
+// (and the local key) were stolen.
+
+/// The plaintext sealed inside the on-disk device cache. Class-3 material: only
+/// ever exists decrypted in memory.
+#[derive(Clone, Serialize, Deserialize, Zeroize)]
+pub struct DeviceCachePayload {
+    /// The unlocked identity. Its `token` is always blanked before sealing — a
+    /// fresh session is minted via device login, never cached.
+    pub keys: UnlockedKeys,
+    /// Opaque 16-byte device id, enrolled with the server.
+    pub device_id: [u8; 16],
+    /// Ed25519 device-auth seed (signs the device-login challenge).
+    pub device_signing_seed: [u8; 32],
+    /// Ed25519 device-auth public key (enrolled as the server-side trusted key).
+    pub device_signing_pub: [u8; 32],
+}
+
+/// Generate a fresh device id + Ed25519 device-auth keypair for enrollment.
+/// Returns `(device_id, signing_seed, signing_pub)`.
+#[tracing::instrument]
+pub fn generate_device_identity() -> ([u8; 16], [u8; 32], [u8; 32]) {
+    let mut device_id = [0u8; 16];
+    {
+        use old_rand_core::RngCore;
+        OsRng.fill_bytes(&mut device_id);
+    }
+    let (seed, pubkey) = crypto::generate_signing();
+    (device_id, seed, pubkey.0)
+}
+
+/// Seal the unlocked keys + device-auth keypair to a local AGE/SSH recipient,
+/// producing the on-disk cache blob (class-1, safe at rest).
+#[tracing::instrument(skip(keys, device_signing_seed))]
+pub fn build_device_cache(
+    backend: crypto::DeviceBackend,
+    recipient: &str,
+    keys: &UnlockedKeys,
+    device_id: [u8; 16],
+    device_signing_seed: [u8; 32],
+    device_signing_pub: [u8; 32],
+) -> AppResult<Vec<u8>> {
+    let mut keys = keys.clone();
+    keys.token.zeroize(); // never cache a live session token
+    let payload = DeviceCachePayload {
+        keys,
+        device_id,
+        device_signing_seed,
+        device_signing_pub,
+    };
+    let mut json = serde_json::to_vec(&payload).map_err(|_| AppError::Aead)?;
+    let sealed = crypto::device_seal(backend, recipient, &json);
+    json.zeroize();
+    sealed
+}
+
+/// Open the on-disk device cache with the local AGE/SSH identity, recovering the
+/// unlocked keys and device-auth keypair. A wrong/absent key fails decryption.
+#[tracing::instrument(skip(identity_contents, blob))]
+pub fn unlock_from_device_cache(
+    backend: crypto::DeviceBackend,
+    identity_contents: &str,
+    blob: &[u8],
+) -> AppResult<Zeroizing<DeviceCachePayload>> {
+    let mut json = crypto::device_open(backend, identity_contents, blob)?;
+    let payload: DeviceCachePayload =
+        serde_json::from_slice(&json).map_err(|_| AppError::Aead)?;
+    json.zeroize();
+    Ok(Zeroizing::new(payload))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -495,6 +572,82 @@ mod tests {
 
         // Wrong password must fail to unlock offline.
         assert!(unlock_offline(Zeroizing::new("wrong password".to_string()), row).is_err());
+    }
+
+    /// Seal the unlocked keys to a freshly generated age key, recover them from
+    /// the cache, and confirm the bundled device-auth key signs a challenge that
+    /// verifies against its enrolled public key (the server's check).
+    #[test]
+    fn device_cache_round_trip_and_challenge() {
+        use secrecy::ExposeSecret;
+
+        let keys = UnlockedKeys {
+            member_id: MemberId([5u8; 16]),
+            identity_secret: [9u8; 32],
+            identity_pub: X25519Pub([1u8; 32]),
+            signing_seed: [7u8; 32],
+            signing_pub: Ed25519Pub([2u8; 32]),
+            token: "live-token-should-not-be-cached".into(),
+        };
+
+        // A throwaway local age key plays the role of the user's AGE identity.
+        let identity = age::x25519::Identity::generate();
+        let recipient = identity.to_public().to_string();
+        let identity_str = identity.to_string().expose_secret().to_string();
+
+        let (device_id, device_seed, device_pub) = generate_device_identity();
+        let blob = build_device_cache(
+            crypto::DeviceBackend::Age,
+            &recipient,
+            &keys,
+            device_id,
+            device_seed,
+            device_pub,
+        )
+        .unwrap();
+
+        // The sealed blob must not be the plaintext, and must not leak the token.
+        assert!(!blob.windows(9).any(|w| w == b"live-toke"));
+
+        let recovered =
+            unlock_from_device_cache(crypto::DeviceBackend::Age, &identity_str, &blob).unwrap();
+        assert_eq!(recovered.keys.identity_secret, keys.identity_secret);
+        assert_eq!(recovered.keys.signing_seed, keys.signing_seed);
+        assert_eq!(recovered.keys.member_id, keys.member_id);
+        assert_eq!(recovered.device_id, device_id);
+        assert!(recovered.keys.token.is_empty(), "token must not be cached");
+
+        // The device-auth key signs a challenge that verifies against device_pub,
+        // exactly as the server will verify it.
+        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+        let member_uuid = Uuid::from_bytes(keys.member_id.0);
+        let device_uuid = Uuid::from_bytes(device_id);
+        let nonce = [42u8; 32];
+        let sig = crypto::sign_device_challenge(
+            &recovered.device_signing_seed,
+            &member_uuid,
+            &device_uuid,
+            &nonce,
+        );
+        let vk = VerifyingKey::from_bytes(&recovered.device_signing_pub).unwrap();
+        let msg = todoers_types::device_challenge_view(
+            todoers_types::DEVICE_CHALLENGE_VERSION,
+            &member_uuid,
+            &device_uuid,
+            &nonce,
+        );
+        assert!(vk.verify(&msg, &Signature::from_bytes(&sig)).is_ok());
+
+        // A wrong age identity cannot open the cache.
+        let other = age::x25519::Identity::generate();
+        assert!(
+            unlock_from_device_cache(
+                crypto::DeviceBackend::Age,
+                other.to_string().expose_secret(),
+                &blob
+            )
+            .is_err()
+        );
     }
 
     /// A login attempt with the wrong password must fail at client finish.

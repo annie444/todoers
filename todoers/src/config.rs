@@ -20,6 +20,30 @@ pub struct AppConfig {
     /// Base URL of the todoers server used for registration/login.
     #[serde(default = "default_server_url")]
     pub server_url: String,
+    /// Password-less device unlock via a local AGE/SSH key. Per-device (lives in
+    /// the local config), so each device can use a different key.
+    #[serde(default)]
+    pub device_unlock: DeviceUnlockConfig,
+}
+
+/// Per-device password-less unlock settings. When `enabled`, after a normal
+/// password login this device seals its keys to `recipient` and enrolls a trusted
+/// key with the server; subsequent launches unlock with `identity` and no password.
+#[derive(Clone, Debug, Deserialize, Default)]
+pub struct DeviceUnlockConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// `"age"` or `"ssh"`.
+    #[serde(default)]
+    pub backend: Option<String>,
+    /// Recipient to encrypt the cache to: an age recipient (`age1…`) or an
+    /// OpenSSH public key line (`ssh-ed25519 …`).
+    #[serde(default)]
+    pub recipient: Option<String>,
+    /// Path to the identity used to decrypt the cache: an age identity file or an
+    /// OpenSSH private key file.
+    #[serde(default)]
+    pub identity: Option<String>,
 }
 
 #[tracing::instrument]

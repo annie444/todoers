@@ -35,8 +35,9 @@ use crate::crypto::{
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
 
-/// How long a freshly minted session token stays valid.
-const SESSION_TTL: Duration = Duration::days(30);
+/// How long a freshly minted session token stays valid. Shared with the
+/// password-less device-login path (`routes::device`).
+pub(crate) const SESSION_TTL: Duration = Duration::days(30);
 
 /// The authenticated caller, resolved from a session token on every request.
 #[derive(Debug, Clone)]
@@ -266,7 +267,7 @@ pub async fn logout(State(state): State<AppState>, auth: AuthMember) -> AppResul
 /// `(token, token_hash)`: the `token` is sent to the client exactly once; only
 /// the `token_hash` is ever stored, so a leak of the `sessions` table can't be
 /// replayed as a credential.
-fn mint_session_token() -> (String, Vec<u8>) {
+pub(crate) fn mint_session_token() -> (String, Vec<u8>) {
     let mut token_bytes = [0u8; 32];
     let mut rng = OsRng;
     rng.fill_bytes(&mut token_bytes);

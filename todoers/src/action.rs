@@ -36,6 +36,10 @@ pub enum Action {
     /// Submit a completed registration form. The password is class-3 material:
     /// never log this variant verbatim (see `Display` below and `App::handle_actions`).
     UnlockModal,
+    /// Attempt a password-less unlock from the on-disk device cache (decrypt with
+    /// the configured local AGE/SSH key, then device-login for a fresh token).
+    /// Falls back to `UnlockModal` on any failure.
+    DeviceUnlock,
     Unlock {
         password: Zeroizing<String>,
     },
@@ -74,6 +78,7 @@ impl std::fmt::Display for Action {
             Action::StopCapture => write!(f, "Stop key capture"),
             Action::SubmitInput(text) => write!(f, "Submit {}", text),
             Action::UnlockModal => write!(f, "Unlock todoers"),
+            Action::DeviceUnlock => write!(f, "Device unlock"),
             Action::Unlock { .. } => write!(f, "Unlock keys"),
             Action::Register { username, .. } => write!(f, "Register {}", username),
             Action::Login { username, .. } => write!(f, "Login {}", username),

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            UPDATE account\n            SET device_id = ?, device_wrapped_keys = ?, updated_at = unixepoch()\n            WHERE id = 1\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "a465f45d28c738e0e9ca3f4f358e19e9f1bfb17cd98f27df2c95767a36144305"
+}

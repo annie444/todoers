@@ -42,6 +42,9 @@ pub struct App {
     errorbar: ErrorBar,
     acct_keys: Option<Zeroizing<UnlockedKeys>>,
     account_verified: bool,
+    /// Ensures the password-less device-unlock path is attempted at most once per
+    /// run (otherwise every tick would re-spawn the unlock task).
+    device_unlock_attempted: bool,
 }
 
 #[derive(Default, Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -118,6 +121,7 @@ impl App {
             account,
             errorbar: ErrorBar::new(),
             account_verified: false,
+            device_unlock_attempted: false,
         })
     }
 
@@ -177,11 +181,18 @@ impl App {
                     {
                         action_tx.send(Action::AuthChooser)?;
                     } else if self.account.is_some() && self.acct_keys.is_none() {
-                        // This should also be unreachable: if we have an account, we should have keys. Log a warning and prompt for auth just in case.
-                        warn!(
-                            "Have local account but no cryptographic keys; this should not happen. Prompting for authentication."
-                        );
-                        action_tx.send(Action::UnlockModal)?;
+                        // We have a local account but no in-memory keys (fresh
+                        // launch). If this device is set up for password-less
+                        // unlock, try the device cache first (once); otherwise — or
+                        // if that fails — fall back to the password prompt.
+                        if self.config.config.device_unlock.enabled
+                            && !self.device_unlock_attempted
+                        {
+                            self.device_unlock_attempted = true;
+                            action_tx.send(Action::DeviceUnlock)?;
+                        } else if !self.device_unlock_attempted {
+                            action_tx.send(Action::UnlockModal)?;
+                        }
                     } else if self.account.is_some() && self.acct_keys.is_some() {
                         self.account_verified = true;
                     }
@@ -329,6 +340,48 @@ impl App {
                         self.refresh_keys()?;
                         self.capturing = false;
                         self.modal = Some(modal);
+                    }
+                    Action::DeviceUnlock => {
+                        // Password-less unlock: decrypt the on-disk cache with the
+                        // configured local AGE/SSH key, then device-login for a
+                        // fresh token. On any failure, fall back to the password
+                        // prompt. Runs off the UI loop; result returns as actions.
+                        let tx = self.action_tx.clone();
+                        let db = self.db.clone();
+                        let base_url = self.config.config.server_url.clone();
+                        let du = self.config.config.device_unlock.clone();
+                        tokio::spawn(async move {
+                            let attempt = async {
+                                let (device_id, blob) = db
+                                    .load_device_cache()
+                                    .await?
+                                    .ok_or_else(|| anyhow::anyhow!("no device cache on this device"))?;
+                                let backend = crate::crypto::DeviceBackend::parse(
+                                    du.backend.as_deref().unwrap_or("age"),
+                                )?;
+                                let identity = du.identity.clone().ok_or_else(|| {
+                                    anyhow::anyhow!("no device-unlock identity configured")
+                                })?;
+                                crate::net::unlock_via_device(
+                                    &base_url, backend, &identity, device_id, blob,
+                                )
+                                .await
+                            }
+                            .await;
+                            match attempt {
+                                Ok(keys) => {
+                                    let _ = tx.send(Action::Keys(keys));
+                                    let _ = tx.send(Action::SetMode(Mode::Home));
+                                }
+                                Err(e) => {
+                                    error!(?e, "device unlock failed; prompting for password");
+                                    let _ = tx.send(Action::Error(format!(
+                                        "Device unlock failed: {e}"
+                                    )));
+                                    let _ = tx.send(Action::UnlockModal);
+                                }
+                            }
+                        });
                     }
                     Action::Register {
                         ref username,
@@ -580,6 +633,7 @@ impl App {
         let tx = self.action_tx.clone();
         let base_url = self.config.config.server_url.clone();
         let db = self.db.clone();
+        let du = self.config.config.device_unlock.clone();
         let username = username.clone();
         let password = password.clone();
         tokio::spawn(async move {
@@ -629,6 +683,54 @@ impl App {
                         let _ = tx.send(Action::Error(format!(
                             "Logged in, but account task panicked: {e}"
                         )));
+                    }
+                }
+            }
+            // If password-less unlock is enabled and this device isn't enrolled
+            // yet, seal the keys to the configured local AGE/SSH key and register a
+            // trusted key with the server. Best-effort: a failure here doesn't
+            // block the login — the user can still unlock with their password.
+            if du.enabled && !keys.token.is_empty() {
+                let already_enrolled = matches!(db.load_device_cache().await, Ok(Some(_)));
+                if !already_enrolled {
+                    match (du.backend.as_deref(), du.recipient.as_deref()) {
+                        (Some(backend), Some(recipient)) => {
+                            match crate::crypto::DeviceBackend::parse(backend) {
+                                Ok(be) => {
+                                    match crate::net::enroll_this_device(
+                                        &base_url, &keys.token, be, recipient, &keys, &username,
+                                    )
+                                    .await
+                                    {
+                                        Ok((device_id, blob)) => {
+                                            if let Err(e) =
+                                                db.save_device_cache(&device_id, &blob).await
+                                            {
+                                                let _ = tx.send(Action::Error(format!(
+                                                    "Logged in, but could not save device cache: {e}"
+                                                )));
+                                            }
+                                        }
+                                        Err(e) => {
+                                            let _ = tx.send(Action::Error(format!(
+                                                "Logged in, but device enrollment failed: {e}"
+                                            )));
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(Action::Error(format!(
+                                        "Device unlock misconfigured: {e}"
+                                    )));
+                                }
+                            }
+                        }
+                        _ => {
+                            let _ = tx.send(Action::Error(
+                                "device_unlock.enabled is set but backend/recipient are missing"
+                                    .to_string(),
+                            ));
+                        }
                     }
                 }
             }

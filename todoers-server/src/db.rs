@@ -9,7 +9,7 @@ use tracing::{error, info};
 use uuid::Uuid;
 
 use todoers_types::{
-    KeySlotDto, LoginDto, MemberDto, Role, SnapshotDto, StoredUpdateDto, UserPubkeysDto,
+    DeviceInfo, KeySlotDto, LoginDto, MemberDto, Role, SnapshotDto, StoredUpdateDto, UserPubkeysDto,
 };
 
 use crate::config::DbConfig;
@@ -634,6 +634,102 @@ impl Db {
         .fetch_optional(&self.pool)
         .await?;
         Ok(row)
+    }
+
+    // ── trusted device keys (password-less device login) ─────────────────────
+
+    /// Enroll (or re-enroll) a device's Ed25519 trusted key. Re-enrolling the same
+    /// `device_id` rotates the key and clears any prior revocation.
+    pub async fn enroll_trusted_device_key(
+        &self,
+        member_id: Uuid,
+        device_id: Uuid,
+        device_signing_pub: &[u8],
+        label: &str,
+    ) -> AppResult<()> {
+        sqlx::query!(
+            r#"
+            INSERT INTO trusted_device_keys (member_id, device_id, device_signing_pub, label)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (member_id, device_id) DO UPDATE SET
+                device_signing_pub = EXCLUDED.device_signing_pub,
+                label = EXCLUDED.label,
+                created_at = now(),
+                revoked_at = NULL
+            "#,
+            member_id,
+            device_id,
+            device_signing_pub,
+            label,
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The Ed25519 public key for an ACTIVE (non-revoked) enrolled device, used to
+    /// verify a device-login challenge. `None` if the device is unknown or revoked.
+    pub async fn fetch_active_device_pub(
+        &self,
+        member_id: Uuid,
+        device_id: Uuid,
+    ) -> AppResult<Option<Vec<u8>>> {
+        let row = sqlx::query_scalar!(
+            r#"
+            SELECT device_signing_pub
+            FROM trusted_device_keys
+            WHERE member_id = $1 AND device_id = $2 AND revoked_at IS NULL
+            "#,
+            member_id,
+            device_id,
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// Revoke a device: future device logins for it are rejected. Idempotent.
+    pub async fn revoke_trusted_device_key(
+        &self,
+        member_id: Uuid,
+        device_id: Uuid,
+    ) -> AppResult<()> {
+        sqlx::query!(
+            r#"
+            UPDATE trusted_device_keys
+            SET revoked_at = now()
+            WHERE member_id = $1 AND device_id = $2 AND revoked_at IS NULL
+            "#,
+            member_id,
+            device_id,
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// List a member's enrolled devices (active and revoked) for management UIs.
+    pub async fn list_trusted_device_keys(&self, member_id: Uuid) -> AppResult<Vec<DeviceInfo>> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT device_id, label, created_at, revoked_at
+            FROM trusted_device_keys
+            WHERE member_id = $1
+            ORDER BY created_at
+            "#,
+            member_id,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| DeviceInfo {
+                device_id: r.device_id,
+                label: r.label,
+                created_at: r.created_at.unix_timestamp(),
+                revoked: r.revoked_at.is_some(),
+            })
+            .collect())
     }
 
     pub async fn cleanup_expired_logins(&self) -> anyhow::Result<()> {

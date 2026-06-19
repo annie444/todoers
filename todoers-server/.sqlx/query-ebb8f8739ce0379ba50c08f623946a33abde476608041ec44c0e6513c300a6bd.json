@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT device_signing_pub\n            FROM trusted_device_keys\n            WHERE member_id = $1 AND device_id = $2 AND revoked_at IS NULL\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "device_signing_pub",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "trusted_device_keys",
+            "name": "device_signing_pub"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "ebb8f8739ce0379ba50c08f623946a33abde476608041ec44c0e6513c300a6bd"
+}

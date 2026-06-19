@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE account SET device_id = NULL, device_wrapped_keys = NULL WHERE id = 1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "d27d7ddd3629a5c4a5588ab70d01e8e807d9ba6671281a6208c448fc73b1b394"
+}

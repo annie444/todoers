@@ -2,7 +2,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::Request;
 use axum::response::Response;
-use axum::routing::{any, get, post};
+use axum::routing::{any, delete, get, post};
 use tower::ServiceBuilder;
 use tower_http::trace::TraceLayer;
 use tracing::Span;
@@ -10,6 +10,7 @@ use tracing::Span;
 use crate::state::AppState;
 
 mod auth;
+mod device;
 mod health;
 mod lists;
 mod snapshots;
@@ -48,6 +49,14 @@ pub async fn build_router(state: AppState) -> Router {
         .route("/v1/auth/login/start", post(auth::login_start))
         .route("/v1/auth/login/finish", post(auth::login_finish))
         .route("/v1/auth/logout", post(auth::logout))
+        // password-less device login (trusted device keys)
+        .route(
+            "/v1/auth/devices",
+            post(device::enroll).get(device::list_devices),
+        )
+        .route("/v1/auth/devices/{device_id}", delete(device::revoke))
+        .route("/v1/auth/device-login/start", post(device::login_start))
+        .route("/v1/auth/device-login/finish", post(device::login_finish))
         .layer(
             ServiceBuilder::new()
                 .layer(
