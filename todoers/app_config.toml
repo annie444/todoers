@@ -1,0 +1,27 @@
+# Base URL of the todoers server. Override in your own config.toml if needed.
+server_url = "http://127.0.0.1:8192"
+
+[keybindings.home]
+q = "quit"
+"?" = "help_modal"
+Ctrl-l = "login_modal"
+Ctrl-r = "register_modal"
+Ctrl-d = "quit"
+Ctrl-c = "quit"
+Ctrl-z = "suspend"
+
+[keybindings.register]
+"?" = "help_modal"
+Ctrl-l = "login_modal"
+Ctrl-d = "quit"
+Ctrl-c = "quit"
+Ctrl-z = "suspend"
+Esc = "stop_capture"
+
+[keybindings.login]
+"?" = "help_modal"
+Ctrl-r = "register_modal"
+Ctrl-d = "quit"
+Ctrl-c = "quit"
+Ctrl-z = "suspend"
+Esc = "stop_capture"

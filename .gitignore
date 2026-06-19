@@ -1,4 +1,7 @@
 /target
-/*.db
-/*.db-*
-
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+/.claude
+/dbs

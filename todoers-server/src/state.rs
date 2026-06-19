@@ -51,3 +51,19 @@ impl Hub {
         }
     }
 }
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+
+    impl AppState {
+        pub fn new_for_test(db: sqlx::PgPool) -> Self {
+            Self {
+                db: crate::db::Db::new_for_test(db),
+                hub: Hub::default(),
+                opaque: OpaqueServer::new_for_test(),
+                verify_signatures: true,
+            }
+        }
+    }
+}

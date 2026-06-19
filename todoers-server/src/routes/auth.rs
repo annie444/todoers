@@ -23,24 +23,29 @@ use time::{Duration, OffsetDateTime};
 use tracing::error;
 use uuid::Uuid;
 
-use todoers_types::{HmacSha256, MemberId, X25519Pub};
+use todoers_types::{
+    FinishRegisterRequest, FinishRegisterResponse, HmacSha256, LoginFinishRequest,
+    LoginFinishResponse, LoginStartRequest, LoginStartResponse, MemberId, StartRegisterRequest,
+    StartRegisterResponse,
+};
 
 use crate::crypto::{
     CredentialReq, Finalization, Login, PasswordFile, Registration, RegistrationReq, RegistrationUp,
 };
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
-use crate::wire::{
-    FinishRegisterRequest, FinishRegisterResponse, LoginFinishRequest, LoginFinishResponse,
-    LoginStartRequest, LoginStartResponse, StartRegisterRequest,
-};
 
 /// How long a freshly minted session token stays valid.
 const SESSION_TTL: Duration = Duration::days(30);
 
 /// The authenticated caller, resolved from a session token on every request.
-#[derive(Debug, Clone, Copy)]
-pub struct AuthMember(pub Uuid);
+#[derive(Debug, Clone)]
+pub struct AuthMember {
+    pub member_id: Uuid,
+    /// Hash of the bearer token this request authenticated with. Lets handlers
+    /// like logout revoke exactly this session (this device), not all of them.
+    pub token_hash: Vec<u8>,
+}
 
 impl FromRequestParts<AppState> for AuthMember {
     type Rejection = AppError;
@@ -67,7 +72,10 @@ impl FromRequestParts<AppState> for AuthMember {
             .lookup_session(&token_hash)
             .await?
             .ok_or(AppError::Unauthorized)?;
-        Ok(AuthMember(member_id))
+        Ok(AuthMember {
+            member_id,
+            token_hash,
+        })
     }
 }
 
@@ -76,36 +84,47 @@ impl FromRequestParts<AppState> for AuthMember {
 // derived from `identity_pub` (never trusted as a raw value), and it doubles as
 // OPAQUE's `credential_identifier` so login can reproduce it from the stored row.
 
+/// `POST /v1/auth/register/start`
 /// Step 1: respond to a RegistrationRequest. Returns the RegistrationResponse
 /// bytes for the client to feed into `ClientRegistration::finish`.
 pub async fn registration_start(
     State(state): State<AppState>,
     Json(req): Json<StartRegisterRequest>,
-) -> AppResult<Vec<u8>> {
-    let identity_pub = parse_x25519(&req.identity_pub)?;
-    let member_id = MemberId::from_identity_pub(&identity_pub);
+) -> AppResult<Json<StartRegisterResponse>> {
+    let member_id = MemberId::from_identity_pub(&req.identity_pub);
 
-    let registration_req = RegistrationReq::deserialize(&req.registration_req)?;
-    let result = Registration::start(state.opaque.get(), registration_req, member_id.as_bytes())?;
-    Ok(result.message.serialize().to_vec())
+    let registration_req =
+        RegistrationReq::deserialize(&req.registration_req).inspect_err(|e| {
+            error!(error = ?e, "failed to deserialize registration request");
+        })?;
+    let result = Registration::start(state.opaque.get(), registration_req, member_id.as_bytes())
+        .map_err(|e| {
+            error!(error = ?e, "registration start failed");
+            AppError::BadRequest("invalid registration request".into())
+        })?;
+    Ok(Json(StartRegisterResponse {
+        response: result.message.serialize().to_vec(),
+    }))
 }
 
+/// `POST /v1/auth/register/finish`
 /// Step 2: store the client's RegistrationUpload as the user's password file,
 /// alongside the public identity and escrowed (already-sealed) private keys.
 pub async fn registration_finish(
     State(state): State<AppState>,
     Json(req): Json<FinishRegisterRequest>,
 ) -> AppResult<Json<FinishRegisterResponse>> {
-    let identity_pub = parse_x25519(&req.identity_pub)?;
     if req.signing_pub.len() != 32 {
         return Err(AppError::BadRequest("signing_pub must be 32 bytes".into()));
     }
 
     // Re-derive the id from the uploaded key so a client can't forge a mismatch.
-    let member_id = MemberId::from_identity_pub(&identity_pub);
+    let member_id = MemberId::from_identity_pub(&req.identity_pub);
     let member_uuid = Uuid::from_bytes(member_id.0);
 
-    let upload = RegistrationUp::deserialize(&req.registration_up)?;
+    let upload = RegistrationUp::deserialize(&req.registration_up).inspect_err(|e| {
+        error!(error = ?e, "failed to deserialize registration upload");
+    })?;
     let opaque_record = Registration::finish(upload).serialize().to_vec();
 
     state
@@ -113,12 +132,15 @@ pub async fn registration_finish(
         .create_user(
             member_uuid,
             &req.username,
-            &req.identity_pub,
+            &req.identity_pub.0,
             &req.signing_pub,
             &req.wrapped_secret_keys,
             &opaque_record,
         )
-        .await?;
+        .await
+        .inspect_err(|e| {
+            error!(error = ?e, "failed to create user in database");
+        })?;
 
     Ok(Json(FinishRegisterResponse {
         member_id: member_uuid,
@@ -137,7 +159,9 @@ pub async fn login_start(
     Json(req): Json<LoginStartRequest>,
 ) -> AppResult<Json<LoginStartResponse>> {
     let mut rng = OsRng;
-    let credential_req = CredentialReq::deserialize(&req.credential_req)?;
+    let credential_req = CredentialReq::deserialize(&req.credential_req).inspect_err(|e| {
+        error!(error = ?e, "failed to deserialize credential request");
+    })?;
 
     let user = state.db.fetch_login_user(&req.username).await?;
 
@@ -229,26 +253,19 @@ pub async fn login_finish(
     }))
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
+// ── Logout ──────────────────────────────────────────────────────────────────
 
-fn parse_x25519(bytes: &[u8]) -> AppResult<X25519Pub> {
-    let arr: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| AppError::BadRequest("identity_pub must be 32 bytes".into()))?;
-    Ok(X25519Pub(arr))
+pub async fn logout(State(state): State<AppState>, auth: AuthMember) -> AppResult<()> {
+    state.db.delete_session(&auth.token_hash).await?;
+    Ok(())
 }
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
 
 /// Mint a fresh bearer token and the hash to persist for it. Returns
 /// `(token, token_hash)`: the `token` is sent to the client exactly once; only
 /// the `token_hash` is ever stored, so a leak of the `sessions` table can't be
 /// replayed as a credential.
-///
-/// LEARNING SPOT #2 — write the body:
-///   1. Draw >=16 bytes of cryptographic randomness (`rand_core::OsRng`).
-///   2. Encode them into the bearer string the client sends back (base64/hex).
-///   3. Hash the token (e.g. SHA-256 via the `sha2` crate) → `token_hash`.
-///
-/// Whatever hash you pick here MUST match `hash_token` below.
 fn mint_session_token() -> (String, Vec<u8>) {
     let mut token_bytes = [0u8; 32];
     let mut rng = OsRng;
@@ -260,8 +277,6 @@ fn mint_session_token() -> (String, Vec<u8>) {
 
 /// Hash a presented bearer token so the extractor can look it up by `token_hash`.
 /// MUST hash identically to step 3 of `mint_session_token`.
-///
-/// LEARNING SPOT #2 (cont.).
 fn hash_token(token: &str) -> AppResult<Vec<u8>> {
     let token_bytes = STANDARD.decode(token)?;
     Ok(Sha512::digest(token_bytes).to_vec())
@@ -269,13 +284,8 @@ fn hash_token(token: &str) -> AppResult<Vec<u8>> {
 
 /// Derive a stable, non-enumerable 16-byte `credential_identifier` for an unknown
 /// username, so `login/start` for a missing user is indistinguishable from a real
-/// one. Must be deterministic (same username → same bytes) and must NOT reveal
+/// one. Must be deterministic (same username -> same bytes) and must NOT reveal
 /// whether the user exists.
-///
-/// LEARNING SPOT #3 — write the body. A keyed hash works well: HMAC/keyed-BLAKE2
-/// of `username` under a server-held secret. The OPAQUE setup is a convenient
-/// secret source — `state.opaque.serialize()` returns stable server-only bytes
-/// you can use as (or derive) the key.
 fn placeholder_credential_id(state: &AppState, username: &str) -> [u8; 16] {
     let key = state.opaque.serialize();
     let mut username_id = [0u8; 16];
@@ -288,4 +298,188 @@ fn placeholder_credential_id(state: &AppState, username: &str) -> [u8; 16] {
         .into_bytes();
     username_id.copy_from_slice(&mac[..16]);
     username_id
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum_test::TestServer;
+
+    #[sqlx::test]
+    async fn test_placeholder_credential_id(db: sqlx::PgPool) {
+        let state = AppState::new_for_test(db);
+        let id1 = placeholder_credential_id(&state, "alice");
+        let id2 = placeholder_credential_id(&state, "bob");
+        let id3 = placeholder_credential_id(&state, "alice");
+        assert_eq!(id1, id3);
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn test_session_token_hashing() {
+        let (token, token_hash) = mint_session_token();
+        let computed_hash = hash_token(&token).expect("hashing minted token should succeed");
+        assert_eq!(token_hash, computed_hash);
+    }
+
+    #[sqlx::test(migrations = "db/migrations")]
+    async fn test_registration_flow(db: sqlx::PgPool) {
+        let state = AppState::new_for_test(db);
+        let app = TestServer::new(crate::routes::build_router(state).await);
+        let passwd = b"test-password";
+
+        let mut rng = OsRng;
+
+        let client_secret = x25519_dalek::EphemeralSecret::random_from_rng(rng);
+        let client_public = x25519_dalek::PublicKey::from(&client_secret);
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rng);
+
+        let client_registration_start = opaque_ke::ClientRegistration::<
+            todoers_types::SharedCipherSuite,
+        >::start(&mut rng, passwd)
+        .unwrap();
+
+        let response = app
+            .post("/v1/auth/register/start")
+            .json(&StartRegisterRequest {
+                identity_pub: todoers_types::X25519Pub(client_public.to_bytes()),
+                registration_req: client_registration_start.message.serialize().to_vec(), // This would be a real OPAQUE request in a full test
+            })
+            .await;
+
+        response.assert_status_ok();
+        response.assert_json(&serde_json::json!({
+            "response": axum_test::expect_json::string()
+        }));
+
+        let data = response.json::<StartRegisterResponse>();
+
+        let response =
+            opaque_ke::RegistrationResponse::<todoers_types::SharedCipherSuite>::deserialize(
+                &data.response,
+            )
+            .unwrap();
+        let client_registration_finish = client_registration_start
+            .state
+            .finish(&mut rng, passwd, response, Default::default())
+            .unwrap();
+
+        let response = app
+            .post("/v1/auth/register/finish")
+            .json(&FinishRegisterRequest {
+                username: "testuser".to_string(),
+                identity_pub: todoers_types::X25519Pub(client_public.to_bytes()),
+                signing_pub: signing_key.verifying_key().to_bytes(),
+                wrapped_secret_keys: vec![], // In a real test, this would be the client's encrypted
+                // private keys, but the server doesn't actually use them in this flow, so we can
+                // leave it empty.
+                registration_up: client_registration_finish.message.serialize().to_vec(),
+            })
+            .await;
+
+        response.assert_status_ok();
+        response.assert_json(&serde_json::json!({
+            "member_id": axum_test::expect_json::string()
+        }));
+    }
+
+    #[sqlx::test(migrations = "db/migrations")]
+    async fn test_login_round_trip(db: sqlx::PgPool) {
+        let state = AppState::new_for_test(db);
+        let server = TestServer::new(crate::routes::build_router(state).await);
+        let token =
+            crate::routes::testutil::register_and_login(&server, "alice", "pw-correct-horse").await;
+        assert!(!token.is_empty());
+    }
+
+    #[sqlx::test(migrations = "db/migrations")]
+    async fn test_authed_request_and_logout(db: sqlx::PgPool) {
+        use axum::http::StatusCode;
+        let state = AppState::new_for_test(db);
+        let server = TestServer::new(crate::routes::build_router(state).await);
+        let token = crate::routes::testutil::register_and_login(&server, "bob", "hunter2").await;
+
+        // A valid token authenticates.
+        let resp = server
+            .post("/v1/auth/logout")
+            .add_header(AUTHORIZATION, format!("Bearer {token}"))
+            .await;
+        resp.assert_status_ok();
+
+        // After logout the same token is rejected.
+        let resp = server
+            .post("/v1/auth/logout")
+            .add_header(AUTHORIZATION, format!("Bearer {token}"))
+            .await;
+        resp.assert_status(StatusCode::UNAUTHORIZED);
+    }
+
+    #[sqlx::test(migrations = "db/migrations")]
+    async fn test_logout_is_per_device(db: sqlx::PgPool) {
+        use axum::http::StatusCode;
+        let state = AppState::new_for_test(db);
+        let server = TestServer::new(crate::routes::build_router(state).await);
+
+        // Two sessions of the SAME user (two devices).
+        let token_a = crate::routes::testutil::register_and_login(&server, "dave", "pw").await;
+        let token_b = crate::routes::testutil::login(&server, "dave", "pw")
+            .await
+            .token;
+
+        // Log out device A only.
+        server
+            .post("/v1/auth/logout")
+            .add_header(AUTHORIZATION, format!("Bearer {token_a}"))
+            .await
+            .assert_status_ok();
+
+        // A is revoked…
+        let resp = server
+            .post("/v1/auth/logout")
+            .add_header(AUTHORIZATION, format!("Bearer {token_a}"))
+            .await;
+        resp.assert_status(StatusCode::UNAUTHORIZED);
+
+        // …but B is still valid.
+        server
+            .post("/v1/auth/logout")
+            .add_header(AUTHORIZATION, format!("Bearer {token_b}"))
+            .await
+            .assert_status_ok();
+    }
+
+    #[sqlx::test(migrations = "db/migrations")]
+    async fn test_bogus_token_rejected(db: sqlx::PgPool) {
+        use axum::http::StatusCode;
+        let state = AppState::new_for_test(db);
+        let server = TestServer::new(crate::routes::build_router(state).await);
+        // Valid base64 (so it reaches the session lookup) but no matching session.
+        let bogus = STANDARD.encode([0u8; 32]);
+        let resp = server
+            .post("/v1/auth/logout")
+            .add_header(AUTHORIZATION, format!("Bearer {bogus}"))
+            .await;
+        resp.assert_status(StatusCode::UNAUTHORIZED);
+    }
+
+    #[sqlx::test(migrations = "db/migrations")]
+    async fn test_login_unknown_user_is_enumeration_resistant(db: sqlx::PgPool) {
+        use todoers_types::{LoginStartRequest, LoginStartResponse, SharedCipherSuite};
+        let state = AppState::new_for_test(db);
+        let server = TestServer::new(crate::routes::build_router(state).await);
+
+        let login =
+            opaque_ke::ClientLogin::<SharedCipherSuite>::start(&mut OsRng, b"whatever").unwrap();
+        let resp = server
+            .post("/v1/auth/login/start")
+            .json(&LoginStartRequest {
+                username: "ghost-user".into(),
+                credential_req: login.message.serialize().to_vec(),
+            })
+            .await;
+        // A missing user yields a well-formed dummy response, not a 404.
+        resp.assert_status_ok();
+        let body: LoginStartResponse = resp.json();
+        assert!(!body.credential_response.is_empty());
+    }
 }

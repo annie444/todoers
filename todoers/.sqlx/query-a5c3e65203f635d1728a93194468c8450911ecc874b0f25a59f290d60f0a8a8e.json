@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            INSERT OR REPLACE INTO sequences\n                (name, current_value)\n            VALUES ('export_key', ?)\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "a5c3e65203f635d1728a93194468c8450911ecc874b0f25a59f290d60f0a8a8e"
+}

@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT current_epoch FROM lists WHERE list_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "current_epoch",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "lists",
+            "name": "current_epoch"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "b2f07ed6dd01c12f1f7fd676d72ac636f4ca79603c36b7142f856e2bc243f3a0"
+}

@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT u.signing_pub\n            FROM list_members m\n            JOIN users u ON u.member_id = m.member_id\n            WHERE m.list_id = $1 AND m.member_id = $2\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "signing_pub",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "users",
+            "name": "signing_pub"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "9eb969c4f2ec168cae76d9ea3d80765153445b3577e042cc839034d275f83650"
+}

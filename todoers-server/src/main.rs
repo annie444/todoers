@@ -1,6 +1,8 @@
 use anyhow::Context;
 use tokio::runtime::Builder;
-use tracing::info;
+use tokio::signal;
+use tokio_util::sync::CancellationToken;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 mod config;
@@ -9,7 +11,6 @@ mod db;
 mod error;
 mod routes;
 mod state;
-mod wire;
 mod workers;
 
 use crate::state::{AppState, Hub};
@@ -20,8 +21,16 @@ async fn body() -> anyhow::Result<()> {
     let verify_signatures = config.general.verify_signatures;
     let opaque = crypto::OpaqueServer::load_or_init(&config.general.key_file).await?;
 
+    let db_worker_token = CancellationToken::new();
+    let db_worker = workers::DbWorker::new(
+        pool.clone(),
+        config.database.cleanup_interval,
+        db_worker_token.child_token(),
+    );
+    let db_worker_handle = db_worker.start();
+
     let state = AppState {
-        db: pool,
+        db: pool.clone(),
         hub: Hub::default(),
         opaque,
         verify_signatures,
@@ -40,6 +49,11 @@ async fn body() -> anyhow::Result<()> {
         .await
         .context("server error")?;
 
+    db_worker_token.cancel();
+    if let Err(e) = db_worker_handle.await {
+        warn!(?e, "DB worker task failed");
+    }
+
     Ok(())
 }
 
@@ -55,7 +69,27 @@ fn main() -> anyhow::Result<()> {
         .block_on(body())
 }
 
+#[tracing::instrument]
 async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
-    tracing::info!("shutdown signal received");
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install signal handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
 }

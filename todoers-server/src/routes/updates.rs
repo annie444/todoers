@@ -7,9 +7,10 @@ use bytes::Bytes;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use uuid::Uuid;
 
+use todoers_types::{AppendResult, AppendUpdate, PullParams, StoredUpdateDto};
+
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
-use crate::wire::{self, AppendResult, AppendUpdate, PullParams, StoredUpdateDto};
 
 use super::auth::AuthMember;
 
@@ -28,7 +29,7 @@ pub async fn append_update(
         return Err(AppError::BadRequest("signature must be 64 bytes".into()));
     }
     // The caller may only write as themselves.
-    if body.author != auth.0 {
+    if body.author != auth.member_id {
         return Err(AppError::Unauthorized);
     }
 
@@ -93,7 +94,7 @@ fn verify_update_signature(
         .map_err(|_| AppError::InvalidSignature)?;
     let sig = Signature::from_bytes(&sig_bytes);
 
-    let view = wire::signing_view(
+    let view = todoers_types::signing_view(
         body.version,
         list_id,
         body.epoch,

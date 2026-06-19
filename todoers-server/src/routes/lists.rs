@@ -5,9 +5,12 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use uuid::Uuid;
 
+use todoers_types::{
+    AddMemberRequest, KeySlotDto, MetadataResponse, RemoveMemberRequest, Role, b64,
+};
+
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
-use crate::wire::{AddMemberRequest, KeySlotDto, MetadataResponse, RemoveMemberRequest, Role, b64};
 
 use super::auth::AuthMember;
 
@@ -30,7 +33,7 @@ pub async fn create_list(
     let list_id = Uuid::new_v4();
     state
         .db
-        .create_list(list_id, auth.0, &body.wrapped_dek)
+        .create_list(list_id, auth.member_id, &body.wrapped_dek)
         .await?;
     Ok((StatusCode::CREATED, Json(CreateListResponse { list_id })))
 }
@@ -97,6 +100,41 @@ pub async fn get_my_keys(
     Path(list_id): Path<Uuid>,
     auth: AuthMember,
 ) -> AppResult<Json<Vec<KeySlotDto>>> {
-    let slots = state.db.fetch_my_key_slots(list_id, auth.0).await?;
+    let slots = state.db.fetch_my_key_slots(list_id, auth.member_id).await?;
     Ok(Json(slots))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::{StatusCode, header::AUTHORIZATION};
+    use axum_test::TestServer;
+
+    use crate::routes::testutil::register_and_login;
+
+    #[sqlx::test(migrations = "db/migrations")]
+    async fn test_create_list_requires_auth(db: sqlx::PgPool) {
+        let state = AppState::new_for_test(db);
+        let server = TestServer::new(crate::routes::build_router(state).await);
+        // `AuthMember` runs before the body extractor, so a missing token is 401.
+        let resp = server
+            .post("/v1/lists")
+            .json(&serde_json::json!({ "wrapped_dek": "AAAA" }))
+            .await;
+        resp.assert_status(StatusCode::UNAUTHORIZED);
+    }
+
+    #[sqlx::test(migrations = "db/migrations")]
+    async fn test_create_list_authed(db: sqlx::PgPool) {
+        let state = AppState::new_for_test(db);
+        let server = TestServer::new(crate::routes::build_router(state).await);
+        let token = register_and_login(&server, "carol", "pw").await;
+
+        let resp = server
+            .post("/v1/lists")
+            .add_header(AUTHORIZATION, format!("Bearer {token}"))
+            .json(&serde_json::json!({ "wrapped_dek": "AAAA" }))
+            .await;
+        resp.assert_status(StatusCode::CREATED);
+    }
 }

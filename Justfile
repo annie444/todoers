@@ -7,6 +7,10 @@ todoers-db-password := "todoers"
 default:
     @just --list
 
+[group("Setup")]
+install-tools:
+    cargo install sqlx-cli --features postgres,sqlite,sqlx-toml
+
 [group("Database")]
 db-up:
     #!/usr/bin/env bash
@@ -51,3 +55,35 @@ db-logs:
     #!/usr/bin/env bash
     set -Eeuo pipefail
     podman logs todoers-db
+
+[group("Development")]
+check-sqlx:
+    cargo sqlx prepare --check --workspace -- --all-targets
+
+[group("Server")]
+run-server: db-up
+    cargo run -p todoers-server
+
+[group("Server")]
+setup-server: db-up
+    (cd todoers-server && cargo sqlx database setup)
+
+[group("Server")]
+prepare-server: db-up && setup-server
+    (cd todoers-server && cargo sqlx prepare -- --all-targets)
+
+[group("Server")]
+check-server: db-up && setup-server
+    (cd todoers-server && cargo sqlx prepare --check -- --all-targets)
+
+[group("TUI")]
+setup-tui:
+    (cd todoers && cargo sqlx database setup --sqlite-create-db-wal=true)
+
+[group("TUI")]
+prepare-tui: setup-tui
+    (cd todoers && cargo sqlx prepare --sqlite-create-db-wal=true -- --all-targets)
+
+[group("TUI")]
+check-tui: setup-tui
+    (cd todoers && cargo sqlx prepare --check --sqlite-create-db-wal=true -- --all-targets)

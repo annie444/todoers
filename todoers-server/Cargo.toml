@@ -19,6 +19,7 @@ sqlx = { workspace = true, features = [
   "uuid",
   "time",
   "postgres",
+  "sqlx-toml",
 ] }
 tokio = { workspace = true }
 axum = { workspace = true }
@@ -44,7 +45,19 @@ opaque-ke = { workspace = true }
 sha2 = { workspace = true }
 old_rand_core = { workspace = true }
 oldsha2 = { workspace = true }
-generic-array = { workspace = true }
 time = { workspace = true }
 directories = { workspace = true }
 hmac = { workspace = true }
+tokio-util = { workspace = true }
+humantime-serde = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+
+[dev-dependencies]
+axum-test = { workspace = true }
+http-body-util = { workspace = true }
+x25519-dalek = { workspace = true }
+
+[build-dependencies]
+vergen-gix = { workspace = true }
+anyhow = { workspace = true }

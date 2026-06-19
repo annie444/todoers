@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::LazyLock;
+use std::time::Duration;
 
 use config::Config as ConfigBuilder;
 use directories::{BaseDirs, ProjectDirs};
@@ -25,7 +26,7 @@ impl Config {
     pub async fn load() -> anyhow::Result<Self> {
         let mut config = ConfigBuilder::builder()
             .add_source(config::File::with_name("todoers").required(false))
-            .add_source(config::File::with_name("../todoers").required(false))
+            .add_source(config::File::with_name("todoers-server/todoers").required(false))
             .add_source(config::Environment::with_prefix("TODOERS").separator("__"));
         #[cfg(unix)]
         {
@@ -70,11 +71,20 @@ pub struct DbConfig {
     pub cert_path: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_path: Option<PathBuf>,
+    #[serde(
+        with = "humantime_serde",
+        default = "DbConfig::default_cleanup_interval"
+    )]
+    pub cleanup_interval: Duration,
 }
 
 impl DbConfig {
     pub fn default_database() -> String {
         "postgres".into()
+    }
+
+    pub fn default_cleanup_interval() -> Duration {
+        Duration::from_hours(1)
     }
 }
 
@@ -89,6 +99,7 @@ impl Default for DbConfig {
             ca_path: None,
             cert_path: None,
             key_path: None,
+            cleanup_interval: Self::default_cleanup_interval(),
         }
     }
 }

@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO key_slots (list_id, epoch, member_id, wrapped_dek) VALUES ($1, 1, $2, $3)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Bytea"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "d3a1f665b0796bc9431d426d2e99550f68ba63c387eae639d0fe272852bcbed1"
+}

@@ -141,4 +141,9 @@ CREATE TABLE IF NOT EXISTS todo_items (
 
 CREATE INDEX IF NOT EXISTS todo_items_by_list ON todo_items (list_id, order_key);
 
+CREATE TABLE sequences (
+    name TEXT PRIMARY KEY,
+    current_value BLOB NOT NULL
+), STRICT, WITHOUT ROWID;
+
 PRAGMA user_version = 1;

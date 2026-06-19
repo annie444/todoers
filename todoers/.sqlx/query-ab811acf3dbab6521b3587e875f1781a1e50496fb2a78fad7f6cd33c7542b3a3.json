@@ -1,0 +1,122 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            SELECT member_id, username, identity_pub, signing_pub,\n                wrapped_secret_keys, kdf_salt, kdf_mem_kib, kdf_iters, kdf_parallelism\n            FROM account WHERE id = 1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "name": "member_id",
+        "ordinal": 0,
+        "type_info": "Blob",
+        "origin": {
+          "Table": {
+            "table": "account",
+            "name": "member_id"
+          }
+        }
+      },
+      {
+        "name": "username",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "account",
+            "name": "username"
+          }
+        }
+      },
+      {
+        "name": "identity_pub",
+        "ordinal": 2,
+        "type_info": "Blob",
+        "origin": {
+          "Table": {
+            "table": "account",
+            "name": "identity_pub"
+          }
+        }
+      },
+      {
+        "name": "signing_pub",
+        "ordinal": 3,
+        "type_info": "Blob",
+        "origin": {
+          "Table": {
+            "table": "account",
+            "name": "signing_pub"
+          }
+        }
+      },
+      {
+        "name": "wrapped_secret_keys",
+        "ordinal": 4,
+        "type_info": "Blob",
+        "origin": {
+          "Table": {
+            "table": "account",
+            "name": "wrapped_secret_keys"
+          }
+        }
+      },
+      {
+        "name": "kdf_salt",
+        "ordinal": 5,
+        "type_info": "Blob",
+        "origin": {
+          "Table": {
+            "table": "account",
+            "name": "kdf_salt"
+          }
+        }
+      },
+      {
+        "name": "kdf_mem_kib",
+        "ordinal": 6,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "account",
+            "name": "kdf_mem_kib"
+          }
+        }
+      },
+      {
+        "name": "kdf_iters",
+        "ordinal": 7,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "account",
+            "name": "kdf_iters"
+          }
+        }
+      },
+      {
+        "name": "kdf_parallelism",
+        "ordinal": 8,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "account",
+            "name": "kdf_parallelism"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "ab811acf3dbab6521b3587e875f1781a1e50496fb2a78fad7f6cd33c7542b3a3"
+}

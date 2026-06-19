@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT identity_pub, signing_pub, wrapped_secret_keys\n            FROM users\n            WHERE member_id = $1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "identity_pub",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "users",
+            "name": "identity_pub"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "signing_pub",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "users",
+            "name": "signing_pub"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "wrapped_secret_keys",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "users",
+            "name": "wrapped_secret_keys"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "d28180518ae19904ac0c93fb6f5a59efacbe547a514c78c022bb9909abee2387"
+}

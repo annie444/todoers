@@ -10,20 +10,12 @@ license = "AGPL-3.0-or-later"
 
 [workspace.dependencies]
 # Database
-sqlx = { version = "0.9", features = [
-  "derive",
-  "tls-rustls-ring-native-roots",
-  "runtime-tokio",
-  "macros",
-  "migrate",
-  "regexp",
-  "uuid",
-  "time",
-] }
-
+sqlx = "0.9"
 
 # Async runtime
 futures-util = "0.3"
+tokio-util = "0.7"
+futures = "0.3"
 tokio = { version = "1.52", features = [
   "rt-multi-thread",
   "fs",
@@ -34,11 +26,20 @@ tokio = { version = "1.52", features = [
   "time",
   "signal",
   "sync",
+  "tracing",
 ] }
+console-subscriber = "0.5"
 
 # Web server
+axum-test = "20"
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.7", features = ["trace"] }
+http-body-util = "0.1"
+reqwest = { version = "0.13", default-features = false, features = [
+  "json",
+  "rustls",
+] }
 axum = { version = "0.8", features = [
-  "tracing",
   "tokio",
   "query",
   "original-uri",
@@ -50,9 +51,19 @@ axum = { version = "0.8", features = [
   "tracing",
 ] }
 
-# CLI
-clap = { version = "4.6", features = ["derive"] }
+# CLI / TUI
+clap = { version = "4.6", features = [
+  "derive",
+  "derive",
+  "wrap_help",
+  "unicode",
+  "string",
+  "unstable-styles",
+  "cargo",
+] }
 ratatui = { version = "0.30", features = ["all-widgets", "crossterm"] }
+crossterm = { version = "0.29", features = ["serde", "event-stream"] }
+unicode-width = "0.2"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -62,16 +73,21 @@ config = { version = "0.15", default-features = false, features = [
   "async",
   "toml",
   "convert-case",
+  "json5",
+  "json",
+  "yaml",
+  "ini",
 ] }
 serde_arrays = "0.2"
-postcard = "1.1"
+humantime-serde = "1.1"
 hex = { version = "0.4", features = ["serde"] }
 loro = "1.13"
-generic-array = "0.14"
+indexmap = { version = "2.14", features = ["serde", "std"] }
 
 # Crypto
 chacha20poly1305 = "0.10"
-ed25519-dalek = "2.2"
+ed25519-dalek = { version = "2.2", features = ["rand_core"] }
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 opaque-ke = { version = "4.0", features = [
   "ristretto255",
   "serde",
@@ -91,11 +107,15 @@ hmac = "0.13"
 
 # Logging
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "serde"] }
+tracing-error = "0.2"
 
 # Error Reporting
 anyhow = "1.0"
 thiserror = "2.0"
+better-panic = "0.3"
+signal-hook = "0.4"
+human-panic = "2.0"
 
 # Utilities
 bytes = "1.11"
@@ -108,9 +128,22 @@ time = { version = "0.3", features = [
   "local-offset",
   "std",
   "serde-human-readable",
-  "serde-well-known",
   "parsing",
   "serde",
   "macros",
 ] }
 directories = "6.0"
+nohash-hasher = "0.2"
+
+# Build
+vergen-gix = { version = "10.0", features = ["build", "cargo"] }
+pretty_assertions = "1.4"
+
+[profile.dev.package.sqlx-macros]
+opt-level = 3
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

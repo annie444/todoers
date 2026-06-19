@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO lists (list_id, current_epoch) VALUES ($1, 1)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "edbd4c23de02d7b113ac5a21f269705991d5aeb22a9be171231979242bceebcc"
+}

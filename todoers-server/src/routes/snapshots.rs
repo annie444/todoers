@@ -5,9 +5,10 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use uuid::Uuid;
 
+use todoers_types::{PutSnapshot, SnapshotDto};
+
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
-use crate::wire::{PutSnapshot, SnapshotDto};
 
 use super::auth::AuthMember;
 

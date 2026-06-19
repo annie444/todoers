@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE lists SET current_epoch = $1 WHERE list_id = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a5c1c686e479b7fcc23efa435282a16d61fe53628f3df1161c8b7a8fc14aaff4"
+}

@@ -1,0 +1,33 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO updates (list_id, epoch, author, nonce, ciphertext, signature)\n            VALUES ($1, $2, $3, $4, $5, $6)\n            ON CONFLICT (signature) DO NOTHING\n            RETURNING seq AS \"seq!\"\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "seq!",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "updates",
+            "name": "seq"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int8",
+        "Uuid",
+        "Bytea",
+        "Bytea",
+        "Bytea"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "a0a88f0432ec3a79456fded1bbb41251f6b76803f224e45ff1ab78ab7cf2fe8d"
+}

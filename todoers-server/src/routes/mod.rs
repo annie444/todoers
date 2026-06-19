@@ -1,5 +1,11 @@
 use axum::Router;
+use axum::body::Body;
+use axum::http::Request;
+use axum::response::Response;
 use axum::routing::{any, get, post};
+use tower::ServiceBuilder;
+use tower_http::trace::TraceLayer;
+use tracing::Span;
 
 use crate::state::AppState;
 
@@ -7,6 +13,8 @@ mod auth;
 mod health;
 mod lists;
 mod snapshots;
+#[cfg(test)]
+pub(crate) mod testutil;
 mod updates;
 mod users;
 mod ws;
@@ -39,5 +47,26 @@ pub async fn build_router(state: AppState) -> Router {
         .route("/v1/auth/register/finish", post(auth::registration_finish))
         .route("/v1/auth/login/start", post(auth::login_start))
         .route("/v1/auth/login/finish", post(auth::login_finish))
+        .route("/v1/auth/logout", post(auth::logout))
+        .layer(
+            ServiceBuilder::new()
+                .layer(
+                    TraceLayer::new_for_http()
+                        .make_span_with(|request: &Request<Body>| {
+                            tracing::info_span!(
+                                "http_request",
+                                method = %request.method(),
+                                uri = %request.uri(),
+                                status_code = tracing::field::Empty,
+                            )
+                        })
+                        .on_response(
+                            |response: &Response<Body>, latency: std::time::Duration, span: &Span| {
+                                span.record("status_code", response.status().as_u16());
+                                tracing::info!(parent: span, latency_ms = latency.as_millis(), "response");
+                            },
+                        ),
+                )
+        )
         .with_state(state)
 }

@@ -8,11 +8,14 @@ use time::{Duration, OffsetDateTime};
 use tracing::{error, info};
 use uuid::Uuid;
 
-use crate::config::DbConfig;
-use crate::error::{AppError, AppResult};
-use crate::wire::{
+use todoers_types::{
     KeySlotDto, LoginDto, MemberDto, Role, SnapshotDto, StoredUpdateDto, UserPubkeysDto,
 };
+
+use crate::config::DbConfig;
+use crate::error::{AppError, AppResult};
+
+pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("db/migrations");
 
 #[derive(Debug, Clone)]
 pub struct Db {
@@ -77,7 +80,7 @@ impl Db {
     }
 
     pub async fn migrate(&self) -> anyhow::Result<()> {
-        sqlx::migrate!("db/migrations").run(&self.pool).await?;
+        MIGRATOR.run(&self.pool).await?;
         Ok(())
     }
 
@@ -474,7 +477,7 @@ impl Db {
     ) -> AppResult<()> {
         sqlx::query!(
             r#"
-            INSERT INTO users
+            INSERT INTO public.users
                 (member_id, username, identity_pub, signing_pub, wrapped_secret_keys, opaque_record)
             VALUES ($1, $2, $3, $4, $5, $6)
             "#,
@@ -536,9 +539,9 @@ impl Db {
         let now = OffsetDateTime::now_utc();
         let member_id = sqlx::query_scalar!(
             r#"
-            SELECT member_id
-            FROM sessions
-            WHERE token_hash = $1 AND expires_at > $2
+            SELECT s.member_id
+            FROM sessions s
+            WHERE s.token_hash = $1 AND s.expires_at > $2
             "#,
             token_hash,
             now,
@@ -548,7 +551,8 @@ impl Db {
         Ok(member_id)
     }
 
-    /// Revoke a single session (logout).
+    /// Revoke exactly one session — the device whose bearer token hashes to
+    /// `token_hash` (per-device logout; other sessions of the member survive).
     pub async fn delete_session(&self, token_hash: &[u8]) -> AppResult<()> {
         sqlx::query!("DELETE FROM sessions WHERE token_hash = $1", token_hash)
             .execute(&self.pool)
@@ -642,5 +646,16 @@ impl Db {
         })
         .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+
+    impl Db {
+        pub fn new_for_test(db: PgPool) -> Self {
+            Db { pool: db }
+        }
     }
 }

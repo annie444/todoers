@@ -21,6 +21,8 @@ sqlx = { workspace = true, features = [
   "time",
 ] }
 base64 = { workspace = true }
+opaque-ke = { workspace = true }
+oldsha2 = { workspace = true }
 
 [features]
 default = ["sqlite"]

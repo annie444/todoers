@@ -29,13 +29,16 @@ $$;
 CREATE TABLE IF NOT EXISTS users (
     member_id           UUID PRIMARY KEY,
     username            TEXT NOT NULL UNIQUE,                       -- OPAQUE login lookup handle
-    identity_pub        BYTEA NOT NULL CHECK (octet_length(identity_pub) = 32),  -- X25519 DEKs sealed to this
-    signing_pub         BYTEA NOT NULL CHECK (octet_length(signing_pub) = 32),   -- Ed25519 verifies updates
+    identity_pub        BYTEA NOT NULL UNIQUE CHECK (octet_length(identity_pub) = 32),  -- X25519 DEKs sealed to this
+    signing_pub         BYTEA NOT NULL UNIQUE CHECK (octet_length(signing_pub) = 32),   -- Ed25519 verifies updates
     wrapped_secret_keys BYTEA NOT NULL,                            -- X25519+Ed25519 privs, sealed under master key
     opaque_record       BYTEA NOT NULL,                            -- OPAQUE server registration record
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS users_by_identity_pub ON users (identity_pub);
+CREATE UNIQUE INDEX IF NOT EXISTS users_by_username ON users (username);
 
 CREATE OR REPLACE TRIGGER users_set_updated_at BEFORE UPDATE ON users
     FOR EACH ROW EXECUTE FUNCTION moddatetime('updated_at');

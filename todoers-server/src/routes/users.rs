@@ -3,9 +3,10 @@
 use axum::Json;
 use axum::extract::{Path, State};
 
+use todoers_types::UserPubkeysDto;
+
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
-use crate::wire::UserPubkeysDto;
 
 use super::auth::AuthMember;
 
@@ -23,3 +24,6 @@ pub async fn get_user_pubkeys(
         .map(Json)
         .ok_or(AppError::NotFound)
 }
+
+
+

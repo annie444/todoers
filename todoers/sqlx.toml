@@ -1,0 +1,5 @@
+[common]
+database-url-var = "CLI_DATABASE_URL"
+
+[migrate]
+migrations-dir = "db/migrations"

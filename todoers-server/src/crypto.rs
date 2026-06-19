@@ -10,56 +10,22 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use old_rand_core::OsRng;
-use oldsha2::Sha512;
-use opaque_ke::argon2::Argon2;
-use opaque_ke::ciphersuite::CipherSuite;
-use opaque_ke::key_exchange::group::ristretto255::Ristretto255;
-use opaque_ke::key_exchange::tripledh::TripleDh;
 use opaque_ke::{
     CredentialFinalization, CredentialRequest, RegistrationRequest, RegistrationUpload,
     ServerLogin, ServerRegistration, ServerSetup,
 };
 use tokio::{fs, task};
 
-#[derive(Debug)]
-pub struct ServerCipherSuite;
+use todoers_types::SharedCipherSuite;
 
-impl CipherSuite for ServerCipherSuite {
-    type OprfCs = Ristretto255;
-    type KeyExchange = TripleDh<Ristretto255, Sha512>;
-    type Ksf = Argon2<'static>;
-}
-
-pub type Setup = ServerSetup<ServerCipherSuite>;
-pub type PasswordFile = ServerRegistration<ServerCipherSuite>;
-pub type Login = ServerLogin<ServerCipherSuite>;
-pub type Finalization = CredentialFinalization<ServerCipherSuite>;
-pub type RegistrationReq = RegistrationRequest<ServerCipherSuite>;
-pub type Registration = ServerRegistration<ServerCipherSuite>;
-pub type RegistrationUp = RegistrationUpload<ServerCipherSuite>;
-pub type CredentialReq = CredentialRequest<ServerCipherSuite>;
-
-// TODO: the b64 encoding is just for human convenience. Use bytes instead.
-//
-// macro_rules! impl_b64 {
-//     ($t:ty, $mod:ident) => {
-//         pub mod $mod {
-//             use base64::{Engine as _, engine::general_purpose::STANDARD};
-//             use serde::{Deserialize, Deserializer, Serializer};
-//
-//             pub fn serialize<S: Serializer>(data: &$t, s: S) -> Result<S::Ok, S::Error> {
-//                 let bytes = data.serialize().to_vec();
-//                 s.serialize_str(&STANDARD.encode(bytes))
-//             }
-//
-//             pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<$t, D::Error> {
-//                 let s = String::deserialize(d)?;
-//                 let data = STANDARD.decode(s).map_err(serde::de::Error::custom)?;
-//                 <$t>::deserialize(&data).map_err(serde::de::Error::custom)
-//             }
-//         }
-//     };
-// }
+pub type Setup = ServerSetup<SharedCipherSuite>;
+pub type PasswordFile = ServerRegistration<SharedCipherSuite>;
+pub type Login = ServerLogin<SharedCipherSuite>;
+pub type Finalization = CredentialFinalization<SharedCipherSuite>;
+pub type RegistrationReq = RegistrationRequest<SharedCipherSuite>;
+pub type Registration = ServerRegistration<SharedCipherSuite>;
+pub type RegistrationUp = RegistrationUpload<SharedCipherSuite>;
+pub type CredentialReq = CredentialRequest<SharedCipherSuite>;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
 pub struct OpaqueServer {
@@ -120,5 +86,40 @@ impl OpaqueServer {
 
     pub fn get(&self) -> &Setup {
         &self.inner
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+
+    impl OpaqueServer {
+        pub fn new_for_test() -> Self {
+            Self::load(&[
+                51, 97, 224, 171, 243, 182, 168, 86, 179, 61, 222, 62, 110, 165, 60, 179, 71, 191,
+                52, 45, 125, 91, 232, 253, 188, 136, 62, 41, 3, 147, 126, 20, 14, 108, 239, 115, 9,
+                230, 183, 118, 185, 154, 164, 221, 22, 180, 25, 173, 190, 242, 16, 21, 194, 206,
+                214, 219, 83, 13, 82, 244, 4, 114, 168, 199, 65, 236, 190, 242, 112, 8, 155, 18,
+                157, 6, 198, 42, 193, 97, 164, 202, 68, 89, 182, 20, 184, 98, 30, 199, 143, 82, 20,
+                14, 109, 160, 109, 14, 56, 56, 146, 156, 169, 138, 216, 77, 122, 144, 89, 239, 254,
+                83, 113, 87, 78, 160, 86, 46, 237, 241, 57, 135, 54, 111, 22, 175, 79, 73, 254, 96,
+            ])
+            .unwrap()
+        }
+    }
+
+    #[test]
+    fn serialize_round_trip() {
+        let server = OpaqueServer::generate();
+        let bytes = server.serialize();
+        let deserialized = OpaqueServer::load(&bytes).expect("deserialization failed");
+        assert_eq!(
+            server.get().keypair().private(),
+            deserialized.get().keypair().private()
+        );
+        assert_eq!(
+            server.get().keypair().public(),
+            deserialized.get().keypair().public()
+        );
     }
 }

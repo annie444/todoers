@@ -8,6 +8,11 @@
 //! or server-side verification will reject valid updates.
 
 use hmac::{Hmac, KeyInit, Mac};
+use oldsha2::Sha512;
+use opaque_ke::argon2::Argon2;
+use opaque_ke::ciphersuite::CipherSuite;
+use opaque_ke::key_exchange::group::ristretto255::Ristretto255;
+use opaque_ke::key_exchange::tripledh::TripleDh;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use uuid::Uuid;
@@ -16,13 +21,125 @@ use zeroize::Zeroize;
 pub type HmacSha256 = Hmac<Sha256>;
 pub const DEK_LEN: usize = 32;
 
+#[derive(Debug)]
+pub struct SharedCipherSuite;
+
+impl CipherSuite for SharedCipherSuite {
+    type OprfCs = Ristretto255;
+    type KeyExchange = TripleDh<Ristretto255, Sha512>;
+    type Ksf = Argon2<'static>;
+}
+
+/// base64 (standard) for `Vec<u8>` fields via `#[serde(with = "b64")]`.
+pub mod b64 {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        let s = String::deserialize(d)?;
+        STANDARD.decode(s).map_err(serde::de::Error::custom)
+    }
+}
+
+/// base64 (standard) for `[u8; 16]` fields via `#[serde(with = "b6416")]`.
+pub mod b6416 {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 16], D::Error> {
+        let s = String::deserialize(d)?;
+        let mut data = [0u8; 16];
+        let decoded = STANDARD.decode(s).map_err(serde::de::Error::custom)?;
+        data.copy_from_slice(&decoded);
+        Ok(data)
+    }
+}
+
+/// base64 (standard) for `[u8; 24]` fields via `#[serde(with = "b6424")]`.
+pub mod b6424 {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 24], D::Error> {
+        let s = String::deserialize(d)?;
+        let mut data = [0u8; 24];
+        let decoded = STANDARD.decode(s).map_err(serde::de::Error::custom)?;
+        data.copy_from_slice(&decoded);
+        Ok(data)
+    }
+}
+
+/// base64 (standard) for `[u8; 32]` fields via `#[serde(with = "b6432")]`.
+pub mod b6432 {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 32], D::Error> {
+        let s = String::deserialize(d)?;
+        let mut data = [0u8; 32];
+        let decoded = STANDARD.decode(s).map_err(serde::de::Error::custom)?;
+        data.copy_from_slice(&decoded);
+        Ok(data)
+    }
+}
+
+/// base64 (standard) for `[u8; 64]` fields via `#[serde(with = "b6464")]`.
+pub mod b6464 {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 64], D::Error> {
+        let s = String::deserialize(d)?;
+        let mut data = [0u8; 64];
+        let decoded = STANDARD.decode(s).map_err(serde::de::Error::custom)?;
+        data.copy_from_slice(&decoded);
+        Ok(data)
+    }
+}
+
 /// Random 16-byte list identifier.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct ListId(pub [u8; 16]);
+pub struct ListId(#[serde(with = "b6416")] pub [u8; 16]);
+
+impl From<Vec<u8>> for ListId {
+    fn from(bytes: Vec<u8>) -> Self {
+        let mut id = [0u8; 16];
+        id.copy_from_slice(&bytes);
+        Self(id)
+    }
+}
 
 /// Stable per-user id.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct MemberId(pub [u8; 16]);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default, Zeroize)]
+pub struct MemberId(#[serde(with = "b6416")] pub [u8; 16]);
+
+impl From<Vec<u8>> for MemberId {
+    fn from(bytes: Vec<u8>) -> Self {
+        let mut id = [0u8; 16];
+        id.copy_from_slice(&bytes);
+        Self(id)
+    }
+}
 
 impl MemberId {
     /// The raw 16 bytes — used directly as OPAQUE's `credential_identifier` on
@@ -32,28 +149,6 @@ impl MemberId {
     }
 
     /// Derive the stable member id from the X25519 identity public key.
-    ///
-    /// This is the canonical binding both sides rely on: the server computes it
-    /// itself from the uploaded `identity_pub` (so a client can never claim a
-    /// member id that doesn't match its key), and the client computes the same
-    /// value to address co-members. It MUST be:
-    ///   - a one-way hash of `identity_pub.0` (32 bytes in),
-    ///   - domain-separated (a fixed personalization/tag), so this digest can
-    ///     never collide with a hash computed for another purpose over the same
-    ///     key bytes,
-    ///   - truncated deterministically to the first 16 bytes.
-    ///
-    /// `sha2` is available in this crate (workspace dep). A sketch:
-    /// ```ignore
-    /// use sha2::{Digest, Sha256};
-    /// let digest = Sha256::new()
-    ///     .chain_update(b"todoers:member-id:v1")   // domain separation
-    ///     .chain_update(identity_pub.0)
-    ///     .finalize();
-    /// let mut id = [0u8; 16];
-    /// id.copy_from_slice(&digest[..16]);
-    /// MemberId(id)
-    /// ```
     pub fn from_identity_pub(identity_pub: &X25519Pub) -> Self {
         let mut id = [0u8; 16];
         let mac = HmacSha256::new_from_slice(b"todoers:member-id:identity:v0001")
@@ -68,12 +163,28 @@ impl MemberId {
 }
 
 /// X25519 public key — DEKs are sealed *to* this.
-#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct X25519Pub(pub [u8; 32]);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, Zeroize)]
+pub struct X25519Pub(#[serde(with = "b6432")] pub [u8; 32]);
+
+impl From<Vec<u8>> for X25519Pub {
+    fn from(bytes: Vec<u8>) -> Self {
+        let mut id = [0u8; 32];
+        id.copy_from_slice(&bytes);
+        Self(id)
+    }
+}
 
 /// Ed25519 public key — update signatures are verified against this.
-#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Ed25519Pub(pub [u8; 32]);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, Zeroize)]
+pub struct Ed25519Pub(#[serde(with = "b6432")] pub [u8; 32]);
+
+impl From<Vec<u8>> for Ed25519Pub {
+    fn from(bytes: Vec<u8>) -> Self {
+        let mut id = [0u8; 32];
+        id.copy_from_slice(&bytes);
+        Self(id)
+    }
+}
 
 /// DEK generation. Bumped on every membership-driven rotation. Each update
 /// records the epoch it was encrypted under so readers pick the right key.
@@ -83,6 +194,16 @@ pub type Epoch = u32;
 #[zeroize(drop)] // Automatically zeroes out when dropped
 pub struct Dek {
     inner: Box<[u8; 32]>,
+}
+
+impl From<Vec<u8>> for Dek {
+    fn from(bytes: Vec<u8>) -> Self {
+        let mut id = [0u8; 32];
+        id.copy_from_slice(&bytes);
+        Self {
+            inner: Box::new(id),
+        }
+    }
 }
 
 impl Dek {
@@ -145,11 +266,13 @@ pub struct UpdatePayload {
     pub epoch: Epoch,
     pub author: MemberId,
     /// Per-update random XChaCha20-Poly1305 nonce.
+    #[serde(with = "b6424")]
     pub nonce: [u8; 24],
     /// AEAD(DEK[epoch], nonce, plaintext = Loro binary update, aad = binding).
+    #[serde(with = "b64")]
     pub ciphertext: Vec<u8>,
     /// Ed25519 over `signing_view(&payload)` (encrypt-then-sign).
-    #[serde(with = "serde_arrays")]
+    #[serde(with = "b6464")]
     pub signature: [u8; 64],
 }
 
@@ -213,6 +336,7 @@ pub struct KeySlot {
     pub member: MemberId,
     /// Anonymous sealed box: only the holder of the matching X25519 secret
     /// can open it, and it carries no sender identity.
+    #[serde(with = "b64")]
     pub wrapped_dek: Vec<u8>,
 }
 
@@ -235,64 +359,53 @@ pub struct ListMetadata {
     pub encrypted_name: Option<Vec<u8>>,
 }
 
-/// base64 (standard) for `Vec<u8>` fields via `#[serde(with = "b64")]`.
-pub mod b64 {
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&STANDARD.encode(bytes))
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
-        let s = String::deserialize(d)?;
-        STANDARD.decode(s).map_err(serde::de::Error::custom)
-    }
-}
-
 // ── Users ───────────────────────────────────────────────────────────────────
 
 /// Step 1 of registration. The server derives `member_id` from `identity_pub`
 /// and uses it as OPAQUE's `credential_identifier`; no username is needed yet.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct StartRegisterRequest {
-    #[serde(with = "b64")]
-    pub identity_pub: Vec<u8>,
+    pub identity_pub: X25519Pub,
     #[serde(with = "b64")]
     pub registration_req: Vec<u8>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+pub struct StartRegisterResponse {
+    #[serde(with = "b64")]
+    pub response: Vec<u8>,
 }
 
 /// Step 2 of registration. Carries the OPAQUE upload plus the public identity
 /// the account is built around, and the user's private keys already sealed
 /// under the `export_key`-derived master key (server-escrowed, opaque to us).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct FinishRegisterRequest {
     pub username: String,
-    #[serde(with = "b64")]
-    pub identity_pub: Vec<u8>,
-    #[serde(with = "b64")]
-    pub signing_pub: Vec<u8>,
+    pub identity_pub: X25519Pub,
+    #[serde(with = "b6432")]
+    pub signing_pub: [u8; 32],
     #[serde(with = "b64")]
     pub wrapped_secret_keys: Vec<u8>,
     #[serde(with = "b64")]
     pub registration_up: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FinishRegisterResponse {
     pub member_id: Uuid,
 }
 
 /// Step 1 of login. `username` is the public lookup handle; the server maps it
 /// to the stored `opaque_record` + `member_id` (the `credential_identifier`).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LoginStartRequest {
     pub username: String,
     #[serde(with = "b64")]
     pub credential_req: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoginStartResponse {
     /// Echoed back on finish so the server can recover the stashed OPAQUE state.
     pub login_id: Uuid,
@@ -301,7 +414,7 @@ pub struct LoginStartResponse {
 }
 
 /// Step 2 of login.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LoginFinishRequest {
     pub login_id: Uuid,
     #[serde(with = "b64")]
@@ -311,7 +424,7 @@ pub struct LoginFinishRequest {
 /// On success: the bearer token plus everything a fresh device needs to
 /// rehydrate its keys from escrow (unwrap `wrapped_secret_keys` with the
 /// `export_key`-derived master key the client just recomputed locally).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoginFinishResponse {
     pub token: String,
     pub member_id: Uuid,
@@ -327,7 +440,7 @@ pub struct LoginFinishResponse {
 
 /// Body of `POST /lists/{list_id}/updates`. `seq` is NOT present — the server
 /// assigns it. `list_id` comes from the path, not the body.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AppendUpdate {
     pub version: u8,
     pub epoch: u32,
@@ -340,13 +453,13 @@ pub struct AppendUpdate {
     pub signature: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppendResult {
     pub seq: i64,
 }
 
 /// One row returned from `GET /lists/{list_id}/updates?after=N`.
-#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct StoredUpdateDto {
     pub seq: i64,
     pub epoch: i64,
@@ -359,7 +472,7 @@ pub struct StoredUpdateDto {
     pub signature: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PullParams {
     #[serde(default)]
     pub after: i64,
@@ -373,7 +486,7 @@ fn default_limit() -> i64 {
 
 // ── Snapshots ───────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct SnapshotDto {
     pub epoch: i64,
     pub covers_seq: i64,
@@ -385,7 +498,7 @@ pub struct SnapshotDto {
     pub signature: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PutSnapshot {
     pub epoch: i64,
     pub covers_seq: i64,
@@ -399,7 +512,7 @@ pub struct PutSnapshot {
 
 // ── Lists / members / keys ──────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct MemberDto {
     pub member_id: Uuid,
     #[serde(with = "b64")]
@@ -409,14 +522,14 @@ pub struct MemberDto {
     pub role: Role,
 }
 
-#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct KeySlotDto {
     pub epoch: i64,
     #[serde(with = "b64")]
     pub wrapped_dek: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetadataResponse {
     pub list_id: Uuid,
     pub current_epoch: i64,
@@ -424,7 +537,7 @@ pub struct MetadataResponse {
     pub members: Vec<MemberDto>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AddMemberRequest {
     pub member_id: Uuid,
     pub role: Role,
@@ -435,7 +548,7 @@ pub struct AddMemberRequest {
     pub epoch: i64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RemoveMemberRequest {
     pub remove_member_id: Uuid,
     /// The current-epoch DEK, sealed to this member's identity_pub by an owner
@@ -445,7 +558,7 @@ pub struct RemoveMemberRequest {
     pub epoch: i64,
 }
 
-#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct UserPubkeysDto {
     pub member_id: Uuid,
     #[serde(with = "b64")]
@@ -454,8 +567,9 @@ pub struct UserPubkeysDto {
     pub signing_pub: Vec<u8>,
 }
 
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone, Deserialize, Serialize, sqlx::FromRow)]
 pub struct LoginDto {
+    #[serde(with = "b64")]
     pub state: Vec<u8>,
     /// The member this login is for; `None` only on the unknown-user path.
     pub member_id: Option<Uuid>,
