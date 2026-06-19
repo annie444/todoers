@@ -19,6 +19,23 @@ Three-crate Cargo workspace (edition 2024):
 - **`todoers-server`** — Axum + PostgreSQL (sqlx). Stateless blind relay + OPAQUE auth.
 - **`todoers`** — the client: ratatui TUI, local-first SQLite store, OPAQUE client, all crypto.
 
+## Component deep-dives — when to reference each
+
+The sections below are a high-level map. Each major component has a dedicated
+architecture outline; read the relevant one **before** working in that area, and
+keep it updated when the architecture changes:
+
+- **When working on encryption, key escrow, OPAQUE auth, the signing/AEAD byte
+  layout, DEKs/epochs, or membership rotation, reference the architecture outline
+  in [ENCRYPTION.md](./ENCRYPTION.md).** (Spans `todoers-types/src/lib.rs`,
+  `todoers/src/crypto.rs`, `todoers/src/auth.rs`, and `todoers-server/src/crypto.rs`.)
+- **When working on the server — HTTP/WebSocket endpoints, routing, the
+  `AuthMember` extractor, the update log/snapshots, or real-time fanout — reference
+  the architecture outline in [API.md](./API.md).** (Covers `todoers-server`.)
+- **When working on the TUI client — the event loop, the `Component` trait,
+  actions, modes, modals, input capture, or off-loop networked work — reference the
+  architecture outline in [TUI.md](./TUI.md).** (Covers the `todoers` client.)
+
 ## Build & run
 
 The two crates differ in build requirements — this matters constantly:
