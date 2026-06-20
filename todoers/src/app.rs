@@ -15,6 +15,7 @@ use crate::components::{
     Button, Captures, Component, ErrorBar, Help, Home, Keys, Login, Modal, Prompt, Register, Unlock,
 };
 use crate::config::Config;
+use crate::crypto::DeviceBackend;
 use crate::db::Db;
 use crate::tui::{Event, Tui};
 
@@ -185,8 +186,7 @@ impl App {
                         // launch). If this device is set up for password-less
                         // unlock, try the device cache first (once); otherwise — or
                         // if that fails — fall back to the password prompt.
-                        if self.config.config.device_unlock.enabled
-                            && !self.device_unlock_attempted
+                        if self.config.config.device_unlock.enabled && !self.device_unlock_attempted
                         {
                             self.device_unlock_attempted = true;
                             action_tx.send(Action::DeviceUnlock)?;
@@ -352,13 +352,11 @@ impl App {
                         let du = self.config.config.device_unlock.clone();
                         tokio::spawn(async move {
                             let attempt = async {
-                                let (device_id, blob) = db
-                                    .load_device_cache()
-                                    .await?
-                                    .ok_or_else(|| anyhow::anyhow!("no device cache on this device"))?;
-                                let backend = crate::crypto::DeviceBackend::parse(
-                                    du.backend.as_deref().unwrap_or("age"),
-                                )?;
+                                let (device_id, blob) =
+                                    db.load_device_cache().await?.ok_or_else(|| {
+                                        anyhow::anyhow!("no device cache on this device")
+                                    })?;
+                                let backend = du.backend.unwrap_or(DeviceBackend::Age);
                                 let identity = du.identity.clone().ok_or_else(|| {
                                     anyhow::anyhow!("no device-unlock identity configured")
                                 })?;
@@ -375,9 +373,8 @@ impl App {
                                 }
                                 Err(e) => {
                                     error!(?e, "device unlock failed; prompting for password");
-                                    let _ = tx.send(Action::Error(format!(
-                                        "Device unlock failed: {e}"
-                                    )));
+                                    let _ = tx
+                                        .send(Action::Error(format!("Device unlock failed: {e}")));
                                     let _ = tx.send(Action::UnlockModal);
                                 }
                             }
@@ -693,38 +690,30 @@ impl App {
             if du.enabled && !keys.token.is_empty() {
                 let already_enrolled = matches!(db.load_device_cache().await, Ok(Some(_)));
                 if !already_enrolled {
-                    match (du.backend.as_deref(), du.recipient.as_deref()) {
-                        (Some(backend), Some(recipient)) => {
-                            match crate::crypto::DeviceBackend::parse(backend) {
-                                Ok(be) => {
-                                    match crate::net::enroll_this_device(
-                                        &base_url, &keys.token, be, recipient, &keys, &username,
-                                    )
-                                    .await
-                                    {
-                                        Ok((device_id, blob)) => {
-                                            if let Err(e) =
-                                                db.save_device_cache(&device_id, &blob).await
-                                            {
-                                                let _ = tx.send(Action::Error(format!(
-                                                    "Logged in, but could not save device cache: {e}"
-                                                )));
-                                            }
-                                        }
-                                        Err(e) => {
-                                            let _ = tx.send(Action::Error(format!(
-                                                "Logged in, but device enrollment failed: {e}"
-                                            )));
-                                        }
-                                    }
-                                }
-                                Err(e) => {
+                    match (du.backend, du.recipient.as_deref()) {
+                        (Some(backend), Some(recipient)) => match crate::net::enroll_this_device(
+                            &base_url,
+                            &keys.token,
+                            backend,
+                            recipient,
+                            &keys,
+                            &username,
+                        )
+                        .await
+                        {
+                            Ok((device_id, blob)) => {
+                                if let Err(e) = db.save_device_cache(&device_id, &blob).await {
                                     let _ = tx.send(Action::Error(format!(
-                                        "Device unlock misconfigured: {e}"
+                                        "Logged in, but could not save device cache: {e}"
                                     )));
                                 }
                             }
-                        }
+                            Err(e) => {
+                                let _ = tx.send(Action::Error(format!(
+                                    "Logged in, but device enrollment failed: {e}"
+                                )));
+                            }
+                        },
                         _ => {
                             let _ = tx.send(Action::Error(
                                 "device_unlock.enabled is set but backend/recipient are missing"

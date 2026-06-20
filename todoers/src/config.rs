@@ -7,7 +7,7 @@ use ratatui::style::{Color, Modifier, Style};
 use serde::{Deserialize, de::Deserializer};
 use tracing::{debug, error};
 
-use crate::{action::Action, app::Mode};
+use crate::{action::Action, app::Mode, crypto::DeviceBackend};
 
 const CONFIG: &str = include_str!("../app_config.toml");
 
@@ -35,7 +35,7 @@ pub struct DeviceUnlockConfig {
     pub enabled: bool,
     /// `"age"` or `"ssh"`.
     #[serde(default)]
-    pub backend: Option<String>,
+    pub backend: Option<DeviceBackend>,
     /// Recipient to encrypt the cache to: an age recipient (`age1…`) or an
     /// OpenSSH public key line (`ssh-ed25519 …`).
     #[serde(default)]

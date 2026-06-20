@@ -1,13 +1,14 @@
 //! Wire + key schema for a zero-knowledge, shareable todo list.
 
-use argon2::{Algorithm, Argon2, Params, Version};
-use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce, aead::Aead};
-use dryoc::dryocbox::{DryocBox, KeyPair, PublicKey};
 use std::io::{Read, Write};
 use std::str::FromStr;
 
+use argon2::{Algorithm, Argon2, Params, Version};
+use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce, aead::Aead};
+use dryoc::dryocbox::{DryocBox, KeyPair, PublicKey};
 use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
 use old_rand_core::{OsRng, RngCore};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use zeroize::Zeroize;
@@ -268,26 +269,13 @@ pub fn unwrap_secret_keys(master: &[u8; 32], blob: &[u8]) -> AppResult<([u8; 32]
 // ---------------------------------------------------------------------------
 
 /// Which kind of local key protects the on-disk key cache.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum DeviceBackend {
-    /// Native age recipient (`age1…`) / identity (`AGE-SECRET-KEY-…`).
+    /// Native age recipient (`age1...`) / identity (`AGE-SECRET-KEY-…`).
     Age,
-    /// OpenSSH key (`ssh-ed25519 …` recipient, OpenSSH private key identity).
+    /// OpenSSH key (`ssh-ed25519 ...` recipient, OpenSSH private key identity).
     Ssh,
-}
-
-impl DeviceBackend {
-    /// Parse the backend name from config (`"age"` / `"ssh"`).
-    #[tracing::instrument]
-    pub fn parse(s: &str) -> AppResult<Self> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "age" => Ok(Self::Age),
-            "ssh" => Ok(Self::Ssh),
-            other => Err(AppError::DeviceVault(format!(
-                "unknown device-unlock backend {other:?}; expected \"age\" or \"ssh\""
-            ))),
-        }
-    }
 }
 
 /// Encrypt `plaintext` to a local AGE/SSH `recipient`, returning an age file.

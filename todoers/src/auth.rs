@@ -435,8 +435,7 @@ pub fn unlock_from_device_cache(
     blob: &[u8],
 ) -> AppResult<Zeroizing<DeviceCachePayload>> {
     let mut json = crypto::device_open(backend, identity_contents, blob)?;
-    let payload: DeviceCachePayload =
-        serde_json::from_slice(&json).map_err(|_| AppError::Aead)?;
+    let payload: DeviceCachePayload = serde_json::from_slice(&json).map_err(|_| AppError::Aead)?;
     json.zeroize();
     Ok(Zeroizing::new(payload))
 }
