@@ -94,13 +94,10 @@ opaque-ke = { version = "4.0", features = [
   "std",
   "argon2",
 ] }
-argon2 = "0.5.3"
+argon2 = "0.5"
 subtle = "2"
 getrandom = "0.4"
 dryoc = "0.8"
-# Local-key encryption of the on-disk key cache (password-less device unlock).
-# The `ssh` feature lets us encrypt to / decrypt with OpenSSH keys as well as
-# native age recipients.
 age = { version = "0.11", features = ["ssh", "armor"] }
 sha2 = "0.11"
 oldsha2 = { package = "sha2", version = "0.10" }
