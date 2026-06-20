@@ -303,6 +303,7 @@ impl App {
                     Action::Tick => {
                         self.last_tick_key_events.drain(..);
                     }
+                    Action::ToggleSidebar => {}
                     Action::Quit => self.should_quit = true,
                     Action::Suspend => self.should_suspend = true,
                     Action::Resume => self.should_suspend = false,

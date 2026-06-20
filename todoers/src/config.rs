@@ -331,7 +331,7 @@ pub fn key_event_to_string(key_event: &KeyEvent) -> String {
 
 #[tracing::instrument]
 pub fn parse_key_sequence(raw: &str) -> anyhow::Result<Vec<KeyEvent>, String> {
-    let sequences = raw.split(' ').collect::<Vec<_>>();
+    let sequences = raw.split('+').collect::<Vec<_>>();
 
     sequences.into_iter().map(parse_key_event).collect()
 }

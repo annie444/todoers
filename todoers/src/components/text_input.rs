@@ -1,5 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{prelude::*, widgets::*};
+use ratatui_textarea::TextArea;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::debug;
 use unicode_width::UnicodeWidthStr;
@@ -24,6 +25,9 @@ pub struct TextInput {
     mask: bool,
     /// Shown as the bordered block's title.
     label: String,
+    /// The actual text area widget, which we use for its built-in
+    /// horizontal scrolling and cursor placement logic.
+    text_area: TextArea,
 }
 
 /// A normalized editing intent, decoupled from raw key events.

@@ -52,6 +52,7 @@ pub enum Action {
         password: Zeroizing<String>,
     },
     Keys(Zeroizing<UnlockedKeys>),
+    ToggleSidebar,
 }
 
 impl std::fmt::Display for Action {
@@ -80,6 +81,7 @@ impl std::fmt::Display for Action {
             Action::UnlockModal => write!(f, "Unlock todoers"),
             Action::DeviceUnlock => write!(f, "Device unlock"),
             Action::Unlock { .. } => write!(f, "Unlock keys"),
+            Action::ToggleSidebar => write!(f, "Toggle sidebar"),
             Action::Register { username, .. } => write!(f, "Register {}", username),
             Action::Login { username, .. } => write!(f, "Login {}", username),
             Action::Keys(_) => write!(f, "Cryptographic keys"),
