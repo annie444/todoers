@@ -128,7 +128,7 @@ impl App {
 
     #[tracing::instrument(skip(self))]
     pub async fn run(&mut self) -> anyhow::Result<()> {
-        let mut tui = Tui::new()?.mouse(true);
+        let mut tui = Tui::new()?.mouse(true).paste(true);
         tui.enter()?;
         let component = if let Some(comp) = self.modes.get_mut(&self.mode) {
             comp

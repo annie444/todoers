@@ -7,6 +7,7 @@ use unicode_width::UnicodeWidthStr;
 use super::{Captures, Component};
 use crate::action::Action;
 use crate::config::Config;
+use crate::tui::Event;
 
 /// A single-line text input.
 #[derive(Default)]
@@ -32,9 +33,11 @@ pub struct TextInput {
 /// variant is produced by `map_key` and consumed by `apply`.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Edit {
+enum Edit<'a> {
     /// Insert a character at the cursor.
     Insert(char),
+    /// Insert a string at the cursor (for paste events).
+    String(&'a str),
     /// Delete the character before the cursor (Backspace).
     DeleteBack,
     /// Delete the character at the cursor (Delete).
@@ -117,7 +120,7 @@ impl TextInput {
 
     /// Translate a key event into an editing intent, or `None` to ignore it.
     #[tracing::instrument]
-    fn map_key(key: KeyEvent) -> Option<Edit> {
+    fn map_key<'a>(key: KeyEvent) -> Option<Edit<'a>> {
         match key.code {
             KeyCode::Char(c)
                 if !key
@@ -147,6 +150,11 @@ impl TextInput {
                 let at = self.byte_at(self.cursor);
                 self.text.insert(at, c);
                 self.cursor += 1;
+            }
+            Edit::String(s) => {
+                let at = self.byte_at(self.cursor);
+                self.text.insert_str(at, &s);
+                self.cursor += s.chars().count();
             }
             Edit::DeleteBack => {
                 if self.cursor > 0 {
@@ -191,6 +199,17 @@ impl Component for TextInput {
     fn register_config_handler(&mut self, config: Config) -> anyhow::Result<()> {
         self.config = config;
         Ok(())
+    }
+
+    #[tracing::instrument(skip(self))]
+    fn handle_events(&mut self, event: Option<Event>) -> anyhow::Result<Option<Action>> {
+        let action = match event {
+            Some(Event::Key(key_event)) => self.handle_key_event(key_event)?,
+            Some(Event::Mouse(mouse_event)) => self.handle_mouse_event(mouse_event)?,
+            Some(Event::Paste(text)) => self.apply(Edit::String(&text)),
+            _ => None,
+        };
+        Ok(action)
     }
 
     #[tracing::instrument(skip(self))]
