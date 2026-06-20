@@ -55,6 +55,10 @@ human-panic = { workspace = true }
 better-panic = { workspace = true }
 console-subscriber = { workspace = true }
 indexmap = { workspace = true }
+ratatui-image = { workspace = true }
+ratatui-textarea = { workspace = true }
+tachyonfx = { workspace = true }
+tui-widgets = { workspace = true }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }
