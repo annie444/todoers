@@ -69,11 +69,11 @@ setup-server: db-up
     (cd todoers-server && cargo sqlx database setup)
 
 [group("Server")]
-prepare-server: db-up && setup-server
+prepare-server: db-up setup-server
     (cd todoers-server && cargo sqlx prepare -- --all-targets)
 
 [group("Server")]
-check-server: db-up && setup-server
+check-server: db-up setup-server
     (cd todoers-server && cargo sqlx prepare --check -- --all-targets)
 
 [group("TUI")]

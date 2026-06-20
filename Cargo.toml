@@ -94,10 +94,11 @@ opaque-ke = { version = "4.0", features = [
   "std",
   "argon2",
 ] }
-argon2 = "0.5.3"
+argon2 = "0.5"
 subtle = "2"
 getrandom = "0.4"
 dryoc = "0.8"
+age = { version = "0.11", features = ["ssh", "armor"] }
 sha2 = "0.11"
 oldsha2 = { package = "sha2", version = "0.10" }
 old_rand_core = { package = "rand_core", version = "0.6" }

@@ -23,6 +23,10 @@ pub enum AppError {
     /// Argon2id / key-derivation failure.
     #[error("key derivation error")]
     Kdf,
+    /// AGE/SSH local-key vault failure (bad recipient/identity, decrypt failed).
+    /// The message is safe to surface — it never contains secret material.
+    #[error("device key vault error: {0}")]
+    DeviceVault(String),
 }
 
 #[tracing::instrument]

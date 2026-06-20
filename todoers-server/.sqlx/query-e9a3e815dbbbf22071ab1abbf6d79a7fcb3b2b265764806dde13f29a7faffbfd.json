@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO trusted_device_keys (member_id, device_id, device_signing_pub, label)\n            VALUES ($1, $2, $3, $4)\n            ON CONFLICT (member_id, device_id) DO UPDATE SET\n                device_signing_pub = EXCLUDED.device_signing_pub,\n                label = EXCLUDED.label,\n                created_at = now(),\n                revoked_at = NULL\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Bytea",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e9a3e815dbbbf22071ab1abbf6d79a7fcb3b2b265764806dde13f29a7faffbfd"
+}

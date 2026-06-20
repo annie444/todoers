@@ -9,7 +9,7 @@ use tracing::{error, info};
 use uuid::Uuid;
 
 use todoers_types::{
-    KeySlotDto, LoginDto, MemberDto, Role, SnapshotDto, StoredUpdateDto, UserPubkeysDto,
+    DeviceInfo, KeySlotDto, LoginDto, MemberDto, Role, SnapshotDto, StoredUpdateDto, UserPubkeysDto,
 };
 
 use crate::config::DbConfig;
@@ -36,6 +36,15 @@ pub struct UserKeysRow {
     pub identity_pub: Vec<u8>,
     pub signing_pub: Vec<u8>,
     pub wrapped_secret_keys: Vec<u8>,
+}
+
+/// A resolved session: which member, which device minted it (`None` = password
+/// login), and when — the last two drive step-up auth for sensitive operations.
+#[derive(Debug, Clone)]
+pub struct SessionRow {
+    pub member_id: Uuid,
+    pub device_id: Option<Uuid>,
+    pub created_at: OffsetDateTime,
 }
 
 impl Db {
@@ -512,34 +521,39 @@ impl Db {
     }
 
     /// Record a freshly minted session. `token_hash` is the hash of the bearer
-    /// token (the token itself never touches the DB).
+    /// token (the token itself never touches the DB). `device_id` is `None` for a
+    /// password login and `Some(..)` for a password-less device login.
     pub async fn create_session(
         &self,
         member_id: Uuid,
         token_hash: &[u8],
         expires_at: OffsetDateTime,
+        device_id: Option<Uuid>,
     ) -> AppResult<()> {
         sqlx::query!(
             r#"
-            INSERT INTO sessions (token_hash, member_id, expires_at)
-            VALUES ($1, $2, $3)
+            INSERT INTO sessions (token_hash, member_id, expires_at, device_id)
+            VALUES ($1, $2, $3, $4)
             "#,
             token_hash,
             member_id,
             expires_at,
+            device_id,
         )
         .execute(&self.pool)
         .await?;
         Ok(())
     }
 
-    /// Resolve a presented token hash to its member, enforcing expiry. Used by
-    /// the `AuthMember` extractor on every authenticated request.
-    pub async fn lookup_session(&self, token_hash: &[u8]) -> AppResult<Option<Uuid>> {
+    /// Resolve a presented token hash to its session, enforcing expiry. Used by
+    /// the `AuthMember` extractor on every authenticated request; the device tag
+    /// and creation time drive step-up auth.
+    pub async fn lookup_session(&self, token_hash: &[u8]) -> AppResult<Option<SessionRow>> {
         let now = OffsetDateTime::now_utc();
-        let member_id = sqlx::query_scalar!(
+        let row = sqlx::query_as!(
+            SessionRow,
             r#"
-            SELECT s.member_id
+            SELECT s.member_id, s.device_id, s.created_at
             FROM sessions s
             WHERE s.token_hash = $1 AND s.expires_at > $2
             "#,
@@ -548,7 +562,7 @@ impl Db {
         )
         .fetch_optional(&self.pool)
         .await?;
-        Ok(member_id)
+        Ok(row)
     }
 
     /// Revoke exactly one session — the device whose bearer token hashes to
@@ -634,6 +648,116 @@ impl Db {
         .fetch_optional(&self.pool)
         .await?;
         Ok(row)
+    }
+
+    // ── trusted device keys (password-less device login) ─────────────────────
+
+    /// Enroll (or re-enroll) a device's Ed25519 trusted key. Re-enrolling the same
+    /// `device_id` rotates the key and clears any prior revocation.
+    pub async fn enroll_trusted_device_key(
+        &self,
+        member_id: Uuid,
+        device_id: Uuid,
+        device_signing_pub: &[u8],
+        label: &str,
+    ) -> AppResult<()> {
+        sqlx::query!(
+            r#"
+            INSERT INTO trusted_device_keys (member_id, device_id, device_signing_pub, label)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (member_id, device_id) DO UPDATE SET
+                device_signing_pub = EXCLUDED.device_signing_pub,
+                label = EXCLUDED.label,
+                created_at = now(),
+                revoked_at = NULL
+            "#,
+            member_id,
+            device_id,
+            device_signing_pub,
+            label,
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The Ed25519 public key for an ACTIVE (non-revoked) enrolled device, used to
+    /// verify a device-login challenge. `None` if the device is unknown or revoked.
+    pub async fn fetch_active_device_pub(
+        &self,
+        member_id: Uuid,
+        device_id: Uuid,
+    ) -> AppResult<Option<Vec<u8>>> {
+        let row = sqlx::query_scalar!(
+            r#"
+            SELECT device_signing_pub
+            FROM trusted_device_keys
+            WHERE member_id = $1 AND device_id = $2 AND revoked_at IS NULL
+            "#,
+            member_id,
+            device_id,
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// Revoke a device: future device logins for it are rejected AND any live
+    /// sessions it minted are deleted, so a lost/compromised device loses access
+    /// immediately rather than at token expiry. Idempotent.
+    pub async fn revoke_trusted_device_key(
+        &self,
+        member_id: Uuid,
+        device_id: Uuid,
+    ) -> AppResult<()> {
+        self.safe_transaction(async move |tx| {
+            sqlx::query!(
+                r#"
+                UPDATE trusted_device_keys
+                SET revoked_at = now()
+                WHERE member_id = $1 AND device_id = $2 AND revoked_at IS NULL
+                "#,
+                member_id,
+                device_id,
+            )
+            .execute(&mut *tx)
+            .await?;
+
+            // Kill any sessions this device minted (per-device session tagging).
+            sqlx::query!(
+                "DELETE FROM sessions WHERE member_id = $1 AND device_id = $2",
+                member_id,
+                device_id,
+            )
+            .execute(&mut *tx)
+            .await?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// List a member's enrolled devices (active and revoked) for management UIs.
+    pub async fn list_trusted_device_keys(&self, member_id: Uuid) -> AppResult<Vec<DeviceInfo>> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT device_id, label, created_at, revoked_at
+            FROM trusted_device_keys
+            WHERE member_id = $1
+            ORDER BY created_at
+            "#,
+            member_id,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| DeviceInfo {
+                device_id: r.device_id,
+                label: r.label,
+                created_at: r.created_at.unix_timestamp(),
+                revoked: r.revoked_at.is_some(),
+            })
+            .collect())
     }
 
     pub async fn cleanup_expired_logins(&self) -> anyhow::Result<()> {

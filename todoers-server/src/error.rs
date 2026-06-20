@@ -17,6 +17,11 @@ pub enum AppError {
     #[error("unauthorized")]
     Unauthorized,
 
+    /// A sensitive operation (enroll/revoke a trusted device key) requires a
+    /// recent password login, not a device-minted or stale session.
+    #[error("recent password authentication required")]
+    StepUpRequired,
+
     /// The update's Ed25519 signature did not verify against the author's
     /// known signing key (also implies non-membership when verification is on).
     #[error("invalid signature")]
@@ -44,6 +49,7 @@ impl IntoResponse for AppError {
                 (StatusCode::BAD_REQUEST, self.to_string())
             }
             AppError::Unauthorized => (StatusCode::UNAUTHORIZED, self.to_string()),
+            AppError::StepUpRequired => (StatusCode::FORBIDDEN, self.to_string()),
             AppError::InvalidSignature => (StatusCode::BAD_REQUEST, self.to_string()),
             AppError::Opaque(e) => {
                 error!(error = %e, "cryptographic protocol error");

@@ -102,6 +102,59 @@ impl Db {
 
         Ok(account.map(Zeroizing::new))
     }
+
+    // ── device unlock cache (class-1 sealed blob; see migration 0002) ────────────
+
+    /// Store this device's sealed key cache + its server-side device id.
+    #[tracing::instrument(skip(self, blob))]
+    pub async fn save_device_cache(
+        &self,
+        device_id: &[u8; 16],
+        blob: &[u8],
+    ) -> anyhow::Result<()> {
+        sqlx::query!(
+            r#"
+            UPDATE account
+            SET device_id = ?, device_wrapped_keys = ?, updated_at = unixepoch()
+            WHERE id = 1
+            "#,
+            device_id.as_slice(),
+            blob,
+        )
+        .execute(&*self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Load the device cache (`device_id`, sealed blob), if this device has
+    /// enrolled for password-less unlock.
+    #[tracing::instrument(skip(self))]
+    pub async fn load_device_cache(&self) -> anyhow::Result<Option<([u8; 16], Vec<u8>)>> {
+        let row = sqlx::query!(
+            "SELECT device_id, device_wrapped_keys FROM account WHERE id = 1"
+        )
+        .fetch_optional(&*self.pool)
+        .await?;
+        Ok(row.and_then(|r| match (r.device_id, r.device_wrapped_keys) {
+            (Some(id), Some(blob)) if id.len() == 16 => {
+                let mut device_id = [0u8; 16];
+                device_id.copy_from_slice(&id);
+                Some((device_id, blob))
+            }
+            _ => None,
+        }))
+    }
+
+    /// Forget the device cache (e.g. after revocation or a backend change).
+    #[tracing::instrument(skip(self))]
+    pub async fn clear_device_cache(&self) -> anyhow::Result<()> {
+        sqlx::query!(
+            "UPDATE account SET device_id = NULL, device_wrapped_keys = NULL WHERE id = 1"
+        )
+        .execute(&*self.pool)
+        .await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
