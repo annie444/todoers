@@ -120,6 +120,7 @@ x-wing = { version = "0.1.0-rc", features = ["zeroize", "getrandom"] }
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "serde"] }
+tracing-appender = "0.2"
 tracing-error = "0.2"
 
 # Error Reporting

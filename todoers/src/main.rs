@@ -26,7 +26,7 @@ use crate::db::Db;
 #[tracing::instrument]
 async fn body() -> anyhow::Result<()> {
     crate::error::init()?;
-    crate::logging::init()?;
+    let _log_guard = crate::logging::init()?;
 
     let args = Cli::parse();
     if let Some(subcommand) = args.subcommand {
