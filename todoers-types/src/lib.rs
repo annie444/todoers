@@ -118,7 +118,7 @@ pub mod b6464 {
 }
 
 /// Random 16-byte list identifier.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ListId(#[serde(with = "b6416")] pub [u8; 16]);
 
 impl From<Vec<u8>> for ListId {
@@ -319,7 +319,7 @@ impl std::fmt::Display for Role {
 }
 
 /// Public identity of one collaborator. None of this is secret.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Member {
     pub id: MemberId,
     pub identity_pub: X25519Pub, // seal DEKs to this

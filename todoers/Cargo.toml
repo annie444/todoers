@@ -60,6 +60,8 @@ tachyonfx = { workspace = true }
 tui-widgets = { workspace = true }
 x-wing = { workspace = true }
 hex = { workspace = true }
+loro = { workspace = true }
+time = { workspace = true }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }

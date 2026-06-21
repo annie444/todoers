@@ -426,6 +426,16 @@ impl TextInput {
         self.text_area.lines().join("")
     }
 
+    /// Replace the contents (e.g. to pre-fill an edit/rename form). Resets the
+    /// buffer to the given single-line value with the cursor at the end.
+    #[tracing::instrument(skip(self))]
+    pub fn set_value(&mut self, value: &str) {
+        let mut ta = build_textarea(self.mask);
+        ta.insert_str(value);
+        self.text_area = ta;
+        self.vim = VimState::default();
+    }
+
     /// Clear the buffer and reset Vim state (used when capture (re)starts).
     fn reset(&mut self) {
         self.text_area = build_textarea(self.mask);

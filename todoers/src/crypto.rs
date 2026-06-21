@@ -120,6 +120,15 @@ pub fn verify_and_decrypt(
 // Provided by `dryoc` (dryocbox sealed).
 // ---------------------------------------------------------------------------
 
+/// Generate a fresh random 32-byte Data Encryption Key for a new list (or for a
+/// DEK rotation on member removal). Class-3 material: never written in the clear.
+#[tracing::instrument]
+pub fn generate_dek() -> [u8; 32] {
+    let mut dek = [0u8; 32];
+    OsRng.fill_bytes(&mut dek);
+    dek
+}
+
 /// Seal a DEK to a member's X25519 public key (anonymous; no sender key needed).
 #[tracing::instrument]
 pub fn seal_to(dek: &[u8; 32], recipient: &X25519Pub) -> Vec<u8> {

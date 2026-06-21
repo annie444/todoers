@@ -1,4 +1,6 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use crossterm::event::{KeyEvent, KeyModifiers};
 use nohash_hasher::BuildNoHashHasher;
@@ -11,14 +13,16 @@ use tokio::time::Duration;
 use tracing::{debug, error, info, warn};
 use zeroize::Zeroizing;
 
-use crate::action::Action;
+use crate::action::{Action, DeleteTarget};
 use crate::auth::{AccountRow, UnlockedKeys};
 use crate::components::{
-    Button, Captures, Component, EditorMode, ErrorBar, Help, Home, Keys, Login, Modal, Prompt,
-    Register, Unlock,
+    Button, Captures, Component, EditorMode, ErrorBar, Help, Home, Keys, ListForm, Login, Modal,
+    Prompt, Register, TodoForm, Unlock,
 };
 use crate::config::Config;
 use crate::db::Db;
+use crate::session::Session;
+use crate::store::{SharedView, Store, ViewModel};
 use crate::tui::{Event, Tui};
 
 pub struct App {
@@ -48,6 +52,10 @@ pub struct App {
     /// Ensures the password-less device-unlock path is attempted at most once per
     /// run (otherwise every tick would re-spawn the unlock task).
     device_unlock_attempted: bool,
+    /// The list/todo data layer, built once keys are unlocked.
+    store: Option<Store>,
+    /// Render-side snapshot shared with the workspace component.
+    view: SharedView,
 }
 
 #[derive(Default, Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -103,9 +111,10 @@ impl App {
         acct_keys: Option<Zeroizing<UnlockedKeys>>,
     ) -> anyhow::Result<Self> {
         let (action_tx, action_rx) = mpsc::unbounded_channel();
+        let view: SharedView = Rc::new(RefCell::new(ViewModel::default()));
         let mut modes: HashMap<Mode, Box<dyn Component>, BuildNoHashHasher<u8>> =
             HashMap::with_capacity_and_hasher(1, BuildNoHashHasher::default());
-        modes.insert(Mode::Home, Box::new(Home::new()));
+        modes.insert(Mode::Home, Box::new(Home::new(view.clone())));
         Ok(Self {
             modes,
             mode: Mode::default(),
@@ -125,7 +134,29 @@ impl App {
             errorbar: ErrorBar::new(),
             account_verified: false,
             device_unlock_attempted: false,
+            store: None,
+            view,
         })
+    }
+
+    /// Build the data layer once keys are unlocked: a [`Session`] (with its DEK
+    /// map rehydrated from the cached key slots) wrapped in a [`Store`], then
+    /// load the sidebar + initial view. Idempotent — no-op if already built or
+    /// if keys aren't available yet.
+    #[tracing::instrument(skip(self))]
+    async fn init_session(&mut self) -> anyhow::Result<()> {
+        if self.store.is_some() {
+            return Ok(());
+        }
+        let Some(keys) = self.acct_keys.as_ref() else {
+            return Ok(());
+        };
+        let mut session = Session::new(keys);
+        session.rehydrate(&self.db).await?;
+        let store = Store::new(self.db.clone(), session);
+        store.refresh_view(&self.view).await?;
+        self.store = Some(store);
+        Ok(())
     }
 
     #[tracing::instrument(skip(self))]
@@ -150,7 +181,7 @@ impl App {
         let action_tx = self.action_tx.clone();
         loop {
             self.handle_events(&mut tui).await?;
-            self.handle_actions(&mut tui)?;
+            self.handle_actions(&mut tui).await?;
             if self.should_suspend {
                 tui.suspend()?;
                 action_tx.send(Action::Resume)?;
@@ -196,6 +227,9 @@ impl App {
                             action_tx.send(Action::UnlockModal)?;
                         }
                     } else if self.account.is_some() && self.acct_keys.is_some() {
+                        // Keys are in memory — stand up the data layer and load
+                        // the workspace before marking the account verified.
+                        self.init_session().await?;
                         self.account_verified = true;
                     }
                 }
@@ -287,7 +321,7 @@ impl App {
     }
 
     #[tracing::instrument(skip(self, tui))]
-    fn handle_actions(&mut self, tui: &mut Tui) -> anyhow::Result<()> {
+    async fn handle_actions(&mut self, tui: &mut Tui) -> anyhow::Result<()> {
         match self.action_rx.try_recv() {
             Ok(action) => {
                 // Never debug-print `Register` verbatim: it carries the password.
@@ -506,6 +540,165 @@ impl App {
                         self.capturing = false;
                         self.handle_switch_mode(self.prev_mode, tui)?;
                     }
+                    Action::OpenView(target) => {
+                        if let Some(store) = self.store.as_ref()
+                            && let Err(e) = store.open_view(&self.view, target).await
+                        {
+                            error!(?e, "failed to open view");
+                            self.errorbar
+                                .show_error(format!("Could not open list: {e:#}"), Duration::from_secs(5));
+                        }
+                    }
+                    Action::RefreshLists => {
+                        if let Some(store) = self.store.as_ref()
+                            && let Err(e) = store.refresh_view(&self.view).await
+                        {
+                            error!(?e, "failed to refresh lists");
+                        }
+                    }
+                    Action::NewListModal => {
+                        self.open_form_modal("New List", Box::new(ListForm::create()), tui)?;
+                    }
+                    Action::RenameListModal { list_id, ref name } => {
+                        self.open_form_modal(
+                            "Rename List",
+                            Box::new(ListForm::rename(list_id, name)),
+                            tui,
+                        )?;
+                    }
+                    Action::AddTodoModal(list_id) => {
+                        self.open_form_modal("Add Todo", Box::new(TodoForm::add(list_id)), tui)?;
+                    }
+                    Action::EditTodoModal {
+                        list_id,
+                        ref item_id,
+                    } => {
+                        let item = match self.store.as_mut() {
+                            Some(store) => store.full_item(list_id, item_id).await?,
+                            None => None,
+                        };
+                        if let Some(item) = item {
+                            self.open_form_modal(
+                                "Edit Todo",
+                                Box::new(TodoForm::edit(list_id, &item)),
+                                tui,
+                            )?;
+                        }
+                    }
+                    Action::CreateList { ref name } => {
+                        if let Some(store) = self.store.as_mut() {
+                            match store.create_list(name).await {
+                                Ok(id) => {
+                                    self.view.borrow_mut().current =
+                                        Some(crate::model::ViewTarget::List(id));
+                                }
+                                Err(e) => self.errorbar.show_error(
+                                    format!("Could not create list: {e:#}"),
+                                    Duration::from_secs(5),
+                                ),
+                            }
+                        }
+                        self.refresh_view().await;
+                        self.action_tx.send(Action::CloseModal)?;
+                    }
+                    Action::RenameList { list_id, ref name } => {
+                        if let Some(store) = self.store.as_mut()
+                            && let Err(e) = store.rename_list(list_id, name).await
+                        {
+                            self.errorbar.show_error(
+                                format!("Could not rename list: {e:#}"),
+                                Duration::from_secs(5),
+                            );
+                        }
+                        self.refresh_view().await;
+                        self.action_tx.send(Action::CloseModal)?;
+                    }
+                    Action::SaveTodo {
+                        list_id,
+                        ref item_id,
+                        ref input,
+                    } => {
+                        if let Some(store) = self.store.as_mut() {
+                            let res = match item_id {
+                                Some(id) => store.edit_todo(list_id, id, input).await,
+                                None => store.add_todo(list_id, input).await.map(|_| ()),
+                            };
+                            if let Err(e) = res {
+                                self.errorbar.show_error(
+                                    format!("Could not save todo: {e:#}"),
+                                    Duration::from_secs(5),
+                                );
+                            }
+                        }
+                        self.refresh_view().await;
+                        self.action_tx.send(Action::CloseModal)?;
+                    }
+                    Action::ToggleDone {
+                        list_id,
+                        ref item_id,
+                    } => {
+                        if let Some(store) = self.store.as_mut()
+                            && let Err(e) = store.toggle_done(list_id, item_id).await
+                        {
+                            error!(?e, "toggle failed");
+                        }
+                        self.refresh_view().await;
+                    }
+                    Action::ConfirmDelete(ref target) => {
+                        let (msg, del) = match target.clone() {
+                            DeleteTarget::List(id) => (
+                                "Delete this list and all of its todos? This cannot be undone."
+                                    .to_string(),
+                                Action::DeleteList(id),
+                            ),
+                            DeleteTarget::Todo { list_id, item_id } => (
+                                "Delete this todo?".to_string(),
+                                Action::DeleteTodo { list_id, item_id },
+                            ),
+                        };
+                        let mut modal = Modal::new(
+                            "Confirm Delete",
+                            Box::new(Prompt::new(msg)),
+                            vec![
+                                Button::new("Delete", del),
+                                Button::new("Cancel", Action::CloseModal),
+                            ],
+                            Action::CloseModal,
+                        );
+                        modal.register_action_handler(self.action_tx.clone())?;
+                        modal.register_config_handler(self.config.clone())?;
+                        modal.init(tui.size()?)?;
+                        self.modal = Some(modal);
+                    }
+                    Action::DeleteList(list_id) => {
+                        if let Some(store) = self.store.as_mut()
+                            && let Err(e) = store.delete_list(list_id).await
+                        {
+                            error!(?e, "delete list failed");
+                        }
+                        // If we deleted the open list, fall back to All Tasks.
+                        {
+                            let mut v = self.view.borrow_mut();
+                            if v.current == Some(crate::model::ViewTarget::List(list_id)) {
+                                v.current =
+                                    Some(crate::model::ViewTarget::Meta(crate::model::MetaList::AllTasks));
+                            }
+                        }
+                        self.refresh_view().await;
+                        self.action_tx.send(Action::CloseModal)?;
+                    }
+                    Action::DeleteTodo {
+                        list_id,
+                        ref item_id,
+                    } => {
+                        if let Some(store) = self.store.as_mut()
+                            && let Err(e) = store.delete_todo(list_id, item_id).await
+                        {
+                            error!(?e, "delete todo failed");
+                        }
+                        self.refresh_view().await;
+                        self.action_tx.send(Action::CloseModal)?;
+                    }
                 }
                 // Forward the action to the modal while it is open, otherwise to
                 // the active mode component — never both, so the background mode
@@ -534,6 +727,31 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    /// Open a capturing form modal whose Cancel/Esc returns to the workspace.
+    fn open_form_modal(
+        &mut self,
+        title: &str,
+        body: Box<dyn Component>,
+        tui: &mut Tui,
+    ) -> anyhow::Result<()> {
+        let mut modal = Modal::form(title, body, Action::CloseModal);
+        modal.register_action_handler(self.action_tx.clone())?;
+        modal.register_config_handler(self.config.clone())?;
+        modal.init(tui.size()?)?;
+        self.modal = Some(modal);
+        self.action_tx.send(Action::StartCapture)?;
+        Ok(())
+    }
+
+    /// Reload the sidebar + current view after a store mutation.
+    async fn refresh_view(&mut self) {
+        if let Some(store) = self.store.as_ref()
+            && let Err(e) = store.refresh_view(&self.view).await
+        {
+            error!(?e, "failed to refresh view");
+        }
     }
 
     #[tracing::instrument(skip(self, tui))]

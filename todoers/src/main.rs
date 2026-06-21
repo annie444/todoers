@@ -10,8 +10,12 @@ mod config;
 mod crypto;
 mod db;
 mod error;
+mod list_doc;
 mod logging;
+mod model;
 mod net;
+mod session;
+mod store;
 mod tui;
 
 use crate::app::App;

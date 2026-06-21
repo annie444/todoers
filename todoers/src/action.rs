@@ -1,8 +1,18 @@
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
+use todoers_types::ListId;
+
 use crate::app::Mode;
 use crate::auth::UnlockedKeys;
+use crate::model::{TodoItemInput, ViewTarget};
+
+/// What a [`Action::ConfirmDelete`] is about to delete.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DeleteTarget {
+    List(ListId),
+    Todo { list_id: ListId, item_id: String },
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -52,6 +62,38 @@ pub enum Action {
     },
     Keys(Zeroizing<UnlockedKeys>),
     ToggleSidebar,
+    /// Open a list or meta-list in the main pane (loads its items into the view).
+    OpenView(ViewTarget),
+    /// Reload the sidebar list summaries (and the current view) from the store.
+    RefreshLists,
+
+    // ── list/todo CRUD (Phase 4) ────────────────────────────────────────────
+    /// Open the "new list" form modal.
+    NewListModal,
+    /// Create a list with the given name (emitted by the list form).
+    CreateList { name: String },
+    /// Open the rename form for an existing list, pre-filled with its name.
+    RenameListModal { list_id: ListId, name: String },
+    /// Rename a list (emitted by the list form in rename mode).
+    RenameList { list_id: ListId, name: String },
+    /// Open the "add todo" form for a list.
+    AddTodoModal(ListId),
+    /// Open the "edit todo" form for an item (App loads the full item first).
+    EditTodoModal { list_id: ListId, item_id: String },
+    /// Create (`item_id` None) or update (`item_id` Some) a todo from the form.
+    SaveTodo {
+        list_id: ListId,
+        item_id: Option<String>,
+        input: TodoItemInput,
+    },
+    /// Toggle an item's done state in place.
+    ToggleDone { list_id: ListId, item_id: String },
+    /// Open a confirm dialog before a destructive delete.
+    ConfirmDelete(DeleteTarget),
+    /// Delete a whole list (after confirmation).
+    DeleteList(ListId),
+    /// Delete a single todo (after confirmation).
+    DeleteTodo { list_id: ListId, item_id: String },
 }
 
 impl std::fmt::Display for Action {
@@ -83,6 +125,19 @@ impl std::fmt::Display for Action {
             Action::Register { username, .. } => write!(f, "Register {}", username),
             Action::Login { username, .. } => write!(f, "Login {}", username),
             Action::Keys(_) => write!(f, "Cryptographic keys"),
+            Action::OpenView(target) => write!(f, "Open view {target:?}"),
+            Action::RefreshLists => write!(f, "Refresh lists"),
+            Action::NewListModal => write!(f, "New list"),
+            Action::CreateList { name } => write!(f, "Create list {name}"),
+            Action::RenameListModal { name, .. } => write!(f, "Rename list {name}"),
+            Action::RenameList { name, .. } => write!(f, "Rename list {name}"),
+            Action::AddTodoModal(_) => write!(f, "Add todo"),
+            Action::EditTodoModal { item_id, .. } => write!(f, "Edit todo {item_id}"),
+            Action::SaveTodo { input, .. } => write!(f, "Save todo {}", input.title),
+            Action::ToggleDone { item_id, .. } => write!(f, "Toggle done {item_id}"),
+            Action::ConfirmDelete(target) => write!(f, "Confirm delete {target:?}"),
+            Action::DeleteList(_) => write!(f, "Delete list"),
+            Action::DeleteTodo { item_id, .. } => write!(f, "Delete todo {item_id}"),
         }
     }
 }
