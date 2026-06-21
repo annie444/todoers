@@ -242,6 +242,8 @@ impl Home {
         }
         self.active_pane = 1;
         self.focus = Focus::Pane;
+        // Tell the worker the pane count changed so it snapshots both panes.
+        self.send(Action::RefreshLists);
     }
 
     fn close_pane(&mut self) {
@@ -256,6 +258,8 @@ impl Home {
         drop(v);
         self.pane_sel = [self.pane_sel[keep], 0];
         self.active_pane = 0;
+        // Tell the worker the pane count changed so it snapshots the kept pane.
+        self.send(Action::RefreshLists);
     }
 
     fn cycle_pane(&mut self) {
