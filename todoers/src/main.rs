@@ -16,6 +16,7 @@ mod model;
 mod net;
 mod session;
 mod store;
+mod store_worker;
 mod tui;
 
 use crate::app::App;
