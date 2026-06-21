@@ -44,7 +44,7 @@ pub fn init() -> anyhow::Result<()> {
             .with_default_env()
             .server_addr(ServerAddr::Tcp(SocketAddr::V4(SocketAddrV4::new(
                 Ipv4Addr::new(127, 0, 0, 1),
-                6669,
+                6699,
             ))))
             .spawn();
         tracing_subscriber::registry()

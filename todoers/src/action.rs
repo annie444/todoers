@@ -63,7 +63,10 @@ pub enum Action {
     Keys(Zeroizing<UnlockedKeys>),
     ToggleSidebar,
     /// Open a list or meta-list in pane `pane` (loads its items into the view).
-    OpenView { target: ViewTarget, pane: usize },
+    OpenView {
+        target: ViewTarget,
+        pane: usize,
+    },
     /// Reload the sidebar list summaries (and the current view) from the store.
     RefreshLists,
 
@@ -71,15 +74,26 @@ pub enum Action {
     /// Open the "new list" form modal.
     NewListModal,
     /// Create a list with the given name (emitted by the list form).
-    CreateList { name: String },
+    CreateList {
+        name: String,
+    },
     /// Open the rename form for an existing list, pre-filled with its name.
-    RenameListModal { list_id: ListId, name: String },
+    RenameListModal {
+        list_id: ListId,
+        name: String,
+    },
     /// Rename a list (emitted by the list form in rename mode).
-    RenameList { list_id: ListId, name: String },
+    RenameList {
+        list_id: ListId,
+        name: String,
+    },
     /// Open the "add todo" form for a list.
     AddTodoModal(ListId),
     /// Open the "edit todo" form for an item (App loads the full item first).
-    EditTodoModal { list_id: ListId, item_id: String },
+    EditTodoModal {
+        list_id: ListId,
+        item_id: String,
+    },
     /// Create (`item_id` None) or update (`item_id` Some) a todo from the form.
     SaveTodo {
         list_id: ListId,
@@ -87,25 +101,40 @@ pub enum Action {
         input: TodoItemInput,
     },
     /// Toggle an item's done state in place.
-    ToggleDone { list_id: ListId, item_id: String },
+    ToggleDone {
+        list_id: ListId,
+        item_id: String,
+    },
     /// Open a confirm dialog before a destructive delete.
     ConfirmDelete(DeleteTarget),
     /// Delete a whole list (after confirmation).
     DeleteList(ListId),
     /// Delete a single todo (after confirmation).
-    DeleteTodo { list_id: ListId, item_id: String },
+    DeleteTodo {
+        list_id: ListId,
+        item_id: String,
+    },
 
     // ── sharing / membership (Phase 5) ──────────────────────────────────────
     /// Open the "share list" form (add a member by username).
     ShareModal(ListId),
     /// Resolve a username to keys and add them to a list (emitted by the form).
-    ShareList { list_id: ListId, username: String },
+    ShareList {
+        list_id: ListId,
+        username: String,
+    },
     /// A resolved collaborator to seal the DEK to (from the pubkey lookup task).
-    AddResolvedMember { list_id: ListId, member: Member },
+    AddResolvedMember {
+        list_id: ListId,
+        member: Member,
+    },
     /// Open the members list for a list (view + unshare).
     MembersModal(ListId),
     /// Remove a member, rotating the list's DEK/epoch locally.
-    Unshare { list_id: ListId, member_id: MemberId },
+    Unshare {
+        list_id: ListId,
+        member_id: MemberId,
+    },
 
     /// Cycle the active sort mode (tasks in the pane + sidebar aggregates).
     CycleSort,

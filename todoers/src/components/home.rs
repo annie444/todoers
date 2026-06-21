@@ -399,7 +399,10 @@ impl Home {
             Some(dir) => {
                 let chunks = Layout::new(
                     dir,
-                    [Constraint::Percentage(ratio), Constraint::Percentage(100 - ratio)],
+                    [
+                        Constraint::Percentage(ratio),
+                        Constraint::Percentage(100 - ratio),
+                    ],
                 )
                 .split(area);
                 self.draw_pane(frame, chunks[0], 0);
@@ -497,7 +500,8 @@ impl Component for Home {
     fn draw(&mut self, frame: &mut Frame, area: Rect) -> anyhow::Result<()> {
         if self.sidebar_visible {
             let [sidebar, panes] =
-                Layout::horizontal([Constraint::Length(28), Constraint::Fill(1)]).areas(area);
+                Layout::horizontal([Constraint::Percentage(18), Constraint::Percentage(82)])
+                    .areas(area);
             self.draw_sidebar(frame, sidebar);
             self.draw_panes(frame, panes);
         } else {
