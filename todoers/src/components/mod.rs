@@ -7,6 +7,8 @@ use crate::{action::Action, config::Config, tui::Event};
 
 mod button;
 mod errorbar;
+#[cfg(debug_assertions)]
+mod fps;
 mod help;
 mod home;
 mod keys;
@@ -23,6 +25,8 @@ mod unlock;
 
 pub use button::Button;
 pub use errorbar::ErrorBar;
+#[cfg(debug_assertions)]
+pub use fps::FpsCounter;
 pub use help::Help;
 pub use home::Home;
 pub use keys::Keys;

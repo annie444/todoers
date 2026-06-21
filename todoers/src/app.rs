@@ -15,6 +15,8 @@ use zeroize::Zeroizing;
 
 use crate::action::{Action, DeleteTarget};
 use crate::auth::{AccountRow, UnlockedKeys};
+#[cfg(debug_assertions)]
+use crate::components::FpsCounter;
 use crate::components::{
     Button, Captures, Component, EditorMode, ErrorBar, Help, Home, Keys, ListForm, Login, Members,
     Modal, Prompt, Register, ShareForm, TodoForm, Unlock,
@@ -70,6 +72,8 @@ pub struct App {
     )>,
     /// Render-side snapshot shared with the workspace component.
     view: SharedView,
+    #[cfg(debug_assertions)]
+    fps: FpsCounter,
 }
 
 #[derive(Default, Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -195,6 +199,8 @@ impl App {
             pending_edit: None,
             pending_members: None,
             view,
+            #[cfg(debug_assertions)]
+            fps: FpsCounter::new(),
         })
     }
 
@@ -909,9 +915,14 @@ impl App {
                 self.modes.get_mut(&Mode::default()).unwrap()
             };
             if let Some(action) = component.update(action.clone())? {
-                self.action_tx.send(action)?
+                #[cfg(debug_assertions)]
+                self.action_tx.send(action.clone())?;
+                #[cfg(not(debug_assertions))]
+                self.action_tx.send(action)?;
             };
         }
+        #[cfg(debug_assertions)]
+        self.fps.update(action)?;
         Ok(())
     }
 
@@ -995,6 +1006,14 @@ impl App {
                 self.keys.placement(),
             ])
             .areas(frame.area());
+            #[cfg(debug_assertions)]
+            {
+                use crate::components::FpsCounter;
+                let [_, fpsvert] =
+                    Layout::vertical([Constraint::Fill(1), Constraint::Length(15)]).areas(body);
+                let [_] = Layout::horizontal([Constraint::Fill(1), Constraint::Length(10)])
+                    .areas(fpsvert);
+            }
             let component = if let Some(comp) = self.modes.get_mut(&self.mode) {
                 comp
             } else if let Some(comp) = self.modes.get_mut(&self.prev_mode) {
