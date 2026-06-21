@@ -336,6 +336,27 @@ impl Store {
         Ok(())
     }
 
+    /// Compute a [`ViewSnapshot`](crate::store_worker::ViewSnapshot) for the given
+    /// pane targets + sort. Unlike [`refresh_view`](Self::refresh_view) this returns
+    /// plain `Send` data instead of mutating a `SharedView`, so the off-loop
+    /// store-worker can hand results back to the UI task.
+    pub async fn snapshot_for(
+        &self,
+        targets: &[Option<ViewTarget>],
+        sort: crate::model::SortMode,
+    ) -> anyhow::Result<crate::store_worker::ViewSnapshot> {
+        let mut lists = self.list_summaries().await?;
+        sort_summaries(&mut lists, sort);
+        let mut panes = Vec::with_capacity(targets.len());
+        for t in targets {
+            panes.push(match t {
+                Some(target) => self.load_view(*target, sort).await?,
+                None => Vec::new(),
+            });
+        }
+        Ok(crate::store_worker::ViewSnapshot { lists, panes })
+    }
+
     /// Point a pane at a new view target and reload its items.
     #[tracing::instrument(skip(self, view))]
     pub async fn open_view(
