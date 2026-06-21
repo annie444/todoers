@@ -232,7 +232,10 @@ impl App {
         if let Some(tx) = &self.cmd_tx {
             let v = self.view.borrow();
             let targets = v.panes.iter().map(|p| p.target).collect();
-            let _ = tx.send(StoreCommand::SetView { targets, sort: v.sort });
+            let _ = tx.send(StoreCommand::SetView {
+                targets,
+                sort: v.sort,
+            });
         }
     }
 

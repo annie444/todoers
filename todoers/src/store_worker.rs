@@ -89,7 +89,10 @@ pub async fn run_store_worker(mut store: Store, mut cmd_rx: CommandRx, out: Work
         // Returns true if the command changed list/todo state (snapshot needed).
         let result: anyhow::Result<bool> = async {
             match cmd {
-                StoreCommand::SetView { targets: t, sort: s } => {
+                StoreCommand::SetView {
+                    targets: t,
+                    sort: s,
+                } => {
                     targets = t;
                     sort = s;
                     Ok(true)
@@ -117,7 +120,11 @@ pub async fn run_store_worker(mut store: Store, mut cmd_rx: CommandRx, out: Work
                     store.add_todo(list_id, &input).await?;
                     Ok(true)
                 }
-                StoreCommand::EditTodo { list_id, item_id, input } => {
+                StoreCommand::EditTodo {
+                    list_id,
+                    item_id,
+                    input,
+                } => {
                     store.edit_todo(list_id, &item_id, &input).await?;
                     Ok(true)
                 }
@@ -216,7 +223,9 @@ mod tests {
         assert!(s0.lists.is_empty());
 
         cmd_tx
-            .send(StoreCommand::CreateList { name: "Groceries".into() })
+            .send(StoreCommand::CreateList {
+                name: "Groceries".into(),
+            })
             .unwrap();
         let WorkerMsg::Snapshot(s1) = out_rx.recv().await.unwrap() else {
             panic!("expected snapshot");
@@ -228,7 +237,10 @@ mod tests {
         cmd_tx
             .send(StoreCommand::AddTodo {
                 list_id,
-                input: TodoItemInput { title: "milk".into(), ..Default::default() },
+                input: TodoItemInput {
+                    title: "milk".into(),
+                    ..Default::default()
+                },
             })
             .unwrap();
         let WorkerMsg::Snapshot(s2) = out_rx.recv().await.unwrap() else {
