@@ -1,0 +1,62 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT member_id as 'id!', identity_pub, signing_pub, role FROM list_members WHERE list_id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!",
+        "ordinal": 0,
+        "type_info": "Blob",
+        "origin": {
+          "Table": {
+            "table": "list_members",
+            "name": "member_id"
+          }
+        }
+      },
+      {
+        "name": "identity_pub",
+        "ordinal": 1,
+        "type_info": "Blob",
+        "origin": {
+          "Table": {
+            "table": "list_members",
+            "name": "identity_pub"
+          }
+        }
+      },
+      {
+        "name": "signing_pub",
+        "ordinal": 2,
+        "type_info": "Blob",
+        "origin": {
+          "Table": {
+            "table": "list_members",
+            "name": "signing_pub"
+          }
+        }
+      },
+      {
+        "name": "role",
+        "ordinal": 3,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "list_members",
+            "name": "role"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "11405fe45add5655d409575ef4683391d17e858cf8aca48aa16554daf0157ada"
+}

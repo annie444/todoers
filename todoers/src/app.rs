@@ -24,6 +24,7 @@ use crate::components::{
 use crate::config::Config;
 use crate::db::Db;
 use crate::model::{MetaList, ViewTarget};
+use crate::net;
 use crate::session::Session;
 use crate::store::{SharedView, Store, ViewModel};
 use crate::store_worker::{CommandTx, StoreCommand, WorkerMsg, WorkerRx, run_store_worker};
@@ -216,15 +217,34 @@ impl App {
         let Some(keys) = self.acct_keys.as_ref() else {
             return Ok(());
         };
+        let base_url = self.config.config.server_url.clone();
+        let token = keys.token.clone();
+
         let mut session = Session::new(keys);
         session.rehydrate(&self.db).await?;
-        let store = Store::new(self.db.clone(), session);
+        let mut store = Store::new(self.db.clone(), session);
 
         // The store owns `Send` state (keys + Loro docs), so it can run on its
         // own task; the UI talks to it only over channels and never blocks.
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (out_tx, out_rx) = mpsc::unbounded_channel();
+        // The sync engine: a key-free sibling task that does all server I/O. The
+        // store produces server-bound material and pushes it here over `sync_tx`.
+        let (sync_tx, sync_rx) = mpsc::unbounded_channel();
+
+        store.set_sync_tx(sync_tx.clone());
         tokio::spawn(run_store_worker(store, cmd_rx, out_tx));
+        tokio::spawn(crate::sync::run_sync(
+            base_url,
+            token,
+            self.db.clone(),
+            cmd_tx.clone(),
+            sync_tx.clone(),
+            sync_rx,
+        ));
+        // Discover lists we belong to, pull their logs, and go live.
+        let _ = sync_tx.send(crate::sync::SyncCommand::InitialSync);
+
         self.cmd_tx = Some(cmd_tx);
         self.worker_rx = Some(out_rx);
 
@@ -250,6 +270,22 @@ impl App {
     fn store_cmd(&self, cmd: StoreCommand) {
         if let Some(tx) = &self.cmd_tx {
             let _ = tx.send(cmd);
+        }
+    }
+
+    /// Best-effort server logout on exit: revoke this device's session so the
+    /// bearer token can't be replayed. Non-fatal — we're quitting either way,
+    /// and an offline exit simply lets the session expire server-side.
+    async fn logout_best_effort(&self) {
+        let Some(keys) = self.acct_keys.as_ref() else {
+            return;
+        };
+        if keys.token.is_empty() {
+            return;
+        }
+        let base = self.config.config.server_url.clone();
+        if let Err(e) = crate::net::auth::logout(&base, &keys.token).await {
+            tracing::warn!(error = ?e, "logout on exit failed");
         }
     }
 
@@ -303,6 +339,7 @@ impl App {
                 tui.enter()?;
             } else if self.should_quit {
                 tui.stop()?;
+                self.logout_best_effort().await;
                 break;
             }
         }
@@ -444,6 +481,8 @@ impl App {
             self.dispatch_action(action, tui)?;
         }
         if should_render {
+            #[cfg(debug_assertions)]
+            self.fps.update(Action::Render)?;
             self.render(tui)?;
         }
         Ok(())
@@ -557,7 +596,7 @@ impl App {
                         let identity = du.identity.clone().ok_or_else(|| {
                             anyhow::anyhow!("no device-unlock identity configured")
                         })?;
-                        crate::net::unlock_via_device(&base_url, &identity, device_id, blob).await
+                        net::auth::unlock_via_device(&base_url, &identity, device_id, blob).await
                     }
                     .await;
                     match attempt {
@@ -585,7 +624,7 @@ impl App {
                 let username = username.clone();
                 let password = password.clone();
                 tokio::spawn(async move {
-                    match crate::net::register(&base_url, &username, &password).await {
+                    match net::auth::register(&base_url, &username, &password).await {
                         Ok(account) => match db.save_account(&account).await {
                             Ok(()) => {
                                 let _ = tx.send(Action::StopCapture);
@@ -837,7 +876,7 @@ impl App {
                     .unwrap_or_default();
                 let username = username.clone();
                 tokio::spawn(async move {
-                    match crate::net::lookup_pubkeys(&base_url, &token, &username).await {
+                    match net::auth::lookup_pubkeys(&base_url, &token, &username).await {
                         Ok(dto) => match resolved_member(dto) {
                             Ok(member) => {
                                 let _ = tx.send(Action::AddResolvedMember { list_id, member });
@@ -1006,14 +1045,7 @@ impl App {
                 self.keys.placement(),
             ])
             .areas(frame.area());
-            #[cfg(debug_assertions)]
-            {
-                use crate::components::FpsCounter;
-                let [_, fpsvert] =
-                    Layout::vertical([Constraint::Fill(1), Constraint::Length(15)]).areas(body);
-                let [_] = Layout::horizontal([Constraint::Fill(1), Constraint::Length(10)])
-                    .areas(fpsvert);
-            }
+
             let component = if let Some(comp) = self.modes.get_mut(&self.mode) {
                 comp
             } else if let Some(comp) = self.modes.get_mut(&self.prev_mode) {
@@ -1036,21 +1068,18 @@ impl App {
                     .action_tx
                     .send(Action::Error(format!("Failed to draw modal: {:?}", err)));
             }
-
             if let Err(err) = self.errorbar.draw(frame, errorbar) {
                 let _ = self.action_tx.send(Action::Error(format!(
                     "Failed to draw error bar: {:?}",
                     err
                 )));
             }
-
             if let Err(err) = self.keys.draw(frame, footer) {
                 let _ = self.action_tx.send(Action::Error(format!(
                     "Failed to draw key bindings: {:?}",
                     err
                 )));
             }
-
             // Lualine-style Vim mode indicator: classic `-- MODE --`, dimmed, on
             // the right of the footer's top rule line. Only shown for Vim fields.
             if let Some(mode) = editor_mode {
@@ -1061,6 +1090,13 @@ impl App {
                     Paragraph::new(label).style(Style::default().fg(Color::DarkGray)),
                     rect,
                 );
+            }
+
+            #[cfg(debug_assertions)]
+            {
+                let [fps, _] =
+                    Layout::vertical([Constraint::Length(2), Constraint::Fill(1)]).areas(body);
+                let _ = self.fps.draw(frame, fps);
             }
         })?;
         Ok(())
@@ -1087,7 +1123,7 @@ impl App {
                 }
             };
             let keys =
-                match crate::net::login(&base_url, &username, &password, account.as_ref()).await {
+                match net::auth::login(&base_url, &username, &password, account.as_ref()).await {
                     Ok(keys) => keys,
                     Err(e) => {
                         let _ = tx.send(Action::Error(format!("Login failed: {e}")));
@@ -1133,7 +1169,7 @@ impl App {
                 let already_enrolled = matches!(db.load_device_cache().await, Ok(Some(_)));
                 if !already_enrolled {
                     match du.recipient.as_deref() {
-                        Some(recipient) => match crate::net::enroll_this_device(
+                        Some(recipient) => match net::auth::enroll_this_device(
                             &base_url,
                             &keys.token,
                             recipient,

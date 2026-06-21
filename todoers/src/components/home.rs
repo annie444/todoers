@@ -6,7 +6,7 @@ use todoers_types::ListId;
 
 use super::{Captures, Component};
 use crate::action::{Action, DeleteTarget};
-use crate::config::Config;
+use crate::config::{Config, IconType};
 use crate::model::{MetaList, Priority, ViewTarget};
 use crate::store::SharedView;
 
@@ -82,7 +82,7 @@ impl Home {
             command_tx: None,
             config: Config::default(),
             view,
-            icon: ListIcon::utf(),
+            icon: ListIcon::nf(),
             focus: Focus::default(),
             sidebar_visible: true,
             sidebar_idx: 0,
@@ -456,6 +456,11 @@ impl Component for Home {
     #[tracing::instrument(skip(self, config))]
     fn register_config_handler(&mut self, config: Config) -> anyhow::Result<()> {
         self.config = config;
+        self.icon = match self.config.config.icon_type {
+            IconType::NerdFonts => ListIcon::nf(),
+            IconType::Emojis => ListIcon::utf(),
+            IconType::Basic => ListIcon::basic(),
+        };
         Ok(())
     }
 

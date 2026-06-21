@@ -7,6 +7,8 @@
 //! The `signing_view` here MUST match the client's canonical encoding exactly,
 //! or server-side verification will reject valid updates.
 
+use std::str::FromStr;
+
 use hmac::{Hmac, KeyInit, Mac};
 use oldsha2::Sha512;
 use opaque_ke::argon2::Argon2;
@@ -188,7 +190,7 @@ impl From<Vec<u8>> for Ed25519Pub {
 
 /// DEK generation. Bumped on every membership-driven rotation. Each update
 /// records the epoch it was encrypted under so readers pick the right key.
-pub type Epoch = u32;
+pub type Epoch = i64;
 
 #[derive(Zeroize, Clone, PartialEq, Eq)]
 #[zeroize(drop)] // Automatically zeroes out when dropped
@@ -301,6 +303,25 @@ pub struct StoredUpdate {
 pub enum Role {
     Owner,
     Member,
+}
+
+impl From<String> for Role {
+    fn from(s: String) -> Self {
+        match s.as_str() {
+            "owner" => Role::Owner,
+            _ => Role::Member,
+        }
+    }
+}
+
+impl FromStr for Role {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "owner" => Ok(Role::Owner),
+            _ => Ok(Role::Member),
+        }
+    }
 }
 
 impl Role {
@@ -524,7 +545,7 @@ pub struct DeviceLoginFinishResponse {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AppendUpdate {
     pub version: u8,
-    pub epoch: u32,
+    pub epoch: Epoch,
     pub author: Uuid,
     #[serde(with = "b64")]
     pub nonce: Vec<u8>,
@@ -543,7 +564,7 @@ pub struct AppendResult {
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct StoredUpdateDto {
     pub seq: i64,
-    pub epoch: i64,
+    pub epoch: Epoch,
     pub author: Uuid,
     #[serde(with = "b64")]
     pub nonce: Vec<u8>,
@@ -569,7 +590,7 @@ fn default_limit() -> i64 {
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct SnapshotDto {
-    pub epoch: i64,
+    pub epoch: Epoch,
     pub covers_seq: i64,
     #[serde(with = "b64")]
     pub nonce: Vec<u8>,
@@ -581,7 +602,7 @@ pub struct SnapshotDto {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PutSnapshot {
-    pub epoch: i64,
+    pub epoch: Epoch,
     pub covers_seq: i64,
     #[serde(with = "b64")]
     pub nonce: Vec<u8>,
@@ -592,6 +613,26 @@ pub struct PutSnapshot {
 }
 
 // ── Lists / members / keys ──────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateListRequest {
+    /// Client-chosen list id (opaque 16 bytes). The client mints it so a list
+    /// created offline keeps a stable id and can be uploaded idempotently later;
+    /// the server adopts it rather than assigning its own.
+    pub list_id: Uuid,
+    #[serde(with = "b64")]
+    pub wrapped_dek: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListIdDto {
+    pub list_id: Uuid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListIdsDto {
+    pub list_ids: Vec<Uuid>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct MemberDto {
@@ -605,7 +646,7 @@ pub struct MemberDto {
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct KeySlotDto {
-    pub epoch: i64,
+    pub epoch: Epoch,
     #[serde(with = "b64")]
     pub wrapped_dek: Vec<u8>,
 }
@@ -613,7 +654,7 @@ pub struct KeySlotDto {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetadataResponse {
     pub list_id: Uuid,
-    pub current_epoch: i64,
+    pub current_epoch: Epoch,
     pub snapshot: Option<SnapshotDto>,
     pub members: Vec<MemberDto>,
 }
@@ -626,17 +667,27 @@ pub struct AddMemberRequest {
     /// client. The server stores it blind.
     #[serde(with = "b64")]
     pub wrapped_dek: Vec<u8>,
-    pub epoch: i64,
+    pub epoch: Epoch,
+}
+
+/// One remaining member's copy of the post-rotation DEK, sealed to *their own*
+/// identity_pub. A removal ships one of these per surviving member so each can
+/// open the new epoch's DEK (a single blob can only be opened by its recipient).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct KeySlotEntry {
+    pub member_id: Uuid,
+    #[serde(with = "b64")]
+    pub wrapped_dek: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RemoveMemberRequest {
     pub remove_member_id: Uuid,
-    /// The current-epoch DEK, sealed to this member's identity_pub by an owner
-    /// client. The server stores it blind.
-    #[serde(with = "b64")]
-    pub wrapped_dek: Vec<u8>,
-    pub epoch: i64,
+    /// The pre-rotation epoch the client read; the server rotates to `epoch + 1`.
+    pub epoch: Epoch,
+    /// The fresh DEK sealed individually to each *remaining* member. The server
+    /// stores them blind under the new epoch and drops the removed member's slots.
+    pub new_slots: Vec<KeySlotEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -659,7 +710,7 @@ pub struct LoginDto {
 // ── Canonical signing view (must mirror the client) ─────────────────────────
 
 /// AAD = version ‖ list_id(16) ‖ epoch_le(4) ‖ author(16) ‖ nonce(24).
-pub fn aead_aad(version: u8, list_id: &Uuid, epoch: u32, author: &Uuid, nonce: &[u8]) -> Vec<u8> {
+pub fn aead_aad(version: u8, list_id: &Uuid, epoch: Epoch, author: &Uuid, nonce: &[u8]) -> Vec<u8> {
     let mut v = Vec::with_capacity(1 + 16 + 4 + 16 + nonce.len());
     v.push(version);
     v.extend_from_slice(list_id.as_bytes());
@@ -695,7 +746,7 @@ pub fn device_challenge_view(
 pub fn signing_view(
     version: u8,
     list_id: &Uuid,
-    epoch: u32,
+    epoch: Epoch,
     author: &Uuid,
     nonce: &[u8],
     ciphertext: &[u8],

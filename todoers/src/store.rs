@@ -22,7 +22,7 @@ use ratatui::layout::Direction;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use todoers_types::{ListId, Member, MemberId, Role};
+use todoers_types::{Ed25519Pub, Epoch, ListId, Member, MemberId, Role, X25519Pub};
 
 use crate::crypto;
 use crate::db::Db;
@@ -88,6 +88,10 @@ pub struct Store {
     /// Open documents, keyed by list. Kept across edits so version vectors stay
     /// continuous and we avoid re-importing the snapshot every mutation.
     docs: HashMap<ListId, TodoDoc>,
+    /// Channel to the sync engine. The store produces all server-bound material
+    /// (sealed DEKs, signed updates) and hands it here; the sync task does the
+    /// I/O. `None` in tests / before the sync task is wired.
+    sync_tx: Option<crate::sync::SyncTx>,
 }
 
 impl Store {
@@ -96,6 +100,20 @@ impl Store {
             db,
             session,
             docs: HashMap::new(),
+            sync_tx: None,
+        }
+    }
+
+    /// Attach the sync engine so mutations are pushed to the server. Call once,
+    /// right after the sync task is spawned.
+    pub fn set_sync_tx(&mut self, tx: crate::sync::SyncTx) {
+        self.sync_tx = Some(tx);
+    }
+
+    /// Emit a sync command (no-op when offline / unwired).
+    fn sync(&self, cmd: crate::sync::SyncCommand) {
+        if let Some(tx) = &self.sync_tx {
+            let _ = tx.send(cmd);
         }
     }
 
@@ -123,6 +141,13 @@ impl Store {
         let wrapped = crypto::seal_to(&dek, &self.session.identity_pub());
         self.db.save_key_slot(list_id, epoch, &wrapped).await?;
         self.session.insert_dek(list_id, epoch, dek);
+
+        // Create the list server-side under our client-minted id (local-first:
+        // the row already exists locally even if this upload is deferred).
+        self.sync(crate::sync::SyncCommand::CreateList {
+            list_id,
+            wrapped_dek: wrapped,
+        });
 
         self.db
             .add_member_row(
@@ -174,7 +199,7 @@ impl Store {
                     .collect();
                 ListSummary {
                     id: l.list_id,
-                    name: l.name,
+                    name: l.name.unwrap_or_default(),
                     role: l.role,
                     open_count: open.len(),
                     next_due: open.iter().filter_map(|i| i.due).min(),
@@ -375,24 +400,45 @@ impl Store {
         self.db.list_members(list_id).await
     }
 
-    // ── membership (local-side; server delivery is Phase 8) ────────────────────
+    // ── membership ─────────────────────────────────────────────────────────────
 
-    /// Add a collaborator locally: record their membership and seal the current
-    /// DEK to them. The sealed DEK upload + server membership call land in the
-    /// sync phase; here we keep the local mirror consistent.
+    /// Add a collaborator: record their membership, seal the *current* DEK to
+    /// their identity_pub, and hand the seated request to the sync engine. No
+    /// rotation — new members only ever see updates from now on.
     #[tracing::instrument(skip(self))]
     pub async fn add_member_local(
         &mut self,
         list_id: ListId,
         member: Member,
     ) -> anyhow::Result<()> {
+        let epoch = self
+            .db
+            .list_epoch(list_id)
+            .await?
+            .context("add_member: unknown list")?;
+        let dek = self
+            .session
+            .dek(list_id, epoch)
+            .context("add_member: no DEK for current epoch")?;
+        let wrapped = crypto::seal_to(&dek, &member.identity_pub);
+
         self.db.add_member_row(list_id, &member).await?;
+        self.sync(crate::sync::SyncCommand::AddMember {
+            list_id,
+            body: Box::new(todoers_types::AddMemberRequest {
+                member_id: Uuid::from_bytes(member.id.0),
+                role: member.role,
+                wrapped_dek: wrapped,
+                epoch: epoch as i64,
+            }),
+        });
         Ok(())
     }
 
-    /// Remove a collaborator locally and **rotate**: a fresh DEK under a bumped
-    /// epoch, sealed to ourselves (re-sealing to remaining members + server
-    /// notification is Phase 8). Future updates write under the new epoch.
+    /// Remove a collaborator and **rotate**: a fresh DEK under a bumped epoch,
+    /// sealed individually to every *remaining* member (a sealed box opens only
+    /// for its recipient), then hand the request to the sync engine. Future
+    /// updates write under the new epoch.
     #[tracing::instrument(skip(self))]
     pub async fn remove_member_local(
         &mut self,
@@ -406,11 +452,167 @@ impl Store {
             .context("remove_member: unknown list")?;
         let new_epoch = current + 1;
         let new_dek = crypto::generate_dek();
-        let wrapped = crypto::seal_to(&new_dek, &self.session.identity_pub());
-        self.db.save_key_slot(list_id, new_epoch, &wrapped).await?;
+
+        // The members who remain after this removal each need the new DEK sealed
+        // to their own key. (We include ourselves; we are not the one removed.)
+        let remaining: Vec<Member> = self
+            .db
+            .list_members(list_id)
+            .await?
+            .into_iter()
+            .filter(|m| m.id != member_id)
+            .collect();
+        let new_slots: Vec<todoers_types::KeySlotEntry> = remaining
+            .iter()
+            .map(|m| todoers_types::KeySlotEntry {
+                member_id: Uuid::from_bytes(m.id.0),
+                wrapped_dek: crypto::seal_to(&new_dek, &m.identity_pub),
+            })
+            .collect();
+
+        // Persist our own new slot locally + rotate the in-memory DEK map.
+        let my_wrapped = crypto::seal_to(&new_dek, &self.session.identity_pub());
+        self.db
+            .save_key_slot(list_id, new_epoch, &my_wrapped)
+            .await?;
         self.session.insert_dek(list_id, new_epoch, new_dek);
         self.db.set_epoch(list_id, new_epoch).await?;
         self.db.remove_member_row(list_id, member_id).await?;
+
+        self.sync(crate::sync::SyncCommand::RemoveMember {
+            list_id,
+            body: Box::new(todoers_types::RemoveMemberRequest {
+                remove_member_id: Uuid::from_bytes(member_id.0),
+                epoch: current as i64,
+                new_slots,
+            }),
+        });
+        Ok(())
+    }
+
+    // ── inbound sync (server → local) ──────────────────────────────────────────
+
+    /// Verify + decrypt one pulled/streamed update and merge it into the doc.
+    /// Returns whether local state changed (so the worker knows to re-snapshot).
+    /// Bad input from the untrusted relay is logged and skipped, never fatal.
+    #[tracing::instrument(skip(self, dto))]
+    pub async fn apply_remote_update(
+        &mut self,
+        list_id: ListId,
+        dto: todoers_types::StoredUpdateDto,
+    ) -> anyhow::Result<bool> {
+        let epoch = dto.epoch as Epoch;
+        let author = MemberId(dto.author.into_bytes());
+
+        // Our own appends come back on the WS/pull too — already merged, skip.
+        if author == self.session.member_id() {
+            self.db.set_applied_through_seq(list_id, dto.seq).await?;
+            return Ok(false);
+        }
+
+        let Some(dek) = self.session.dek(list_id, epoch) else {
+            tracing::warn!(?list_id, epoch, "no DEK for update epoch; skipping");
+            return Ok(false);
+        };
+        let Some(author_pub) = self
+            .db
+            .list_members(list_id)
+            .await?
+            .into_iter()
+            .find(|m| m.id == author)
+            .map(|m| m.signing_pub)
+        else {
+            tracing::warn!(?author, "unknown update author; skipping");
+            return Ok(false);
+        };
+
+        let nonce: [u8; 24] = match dto.nonce.as_slice().try_into() {
+            Ok(n) => n,
+            Err(_) => return Ok(false),
+        };
+        let signature: [u8; 64] = match dto.signature.as_slice().try_into() {
+            Ok(s) => s,
+            Err(_) => return Ok(false),
+        };
+        let payload = todoers_types::UpdatePayload {
+            version: UPDATE_VERSION,
+            list_id,
+            epoch,
+            author,
+            nonce,
+            ciphertext: dto.ciphertext,
+            signature,
+        };
+
+        let loro = match crypto::verify_and_decrypt(&payload, list_id, &author_pub, &dek) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::warn!(error = ?e, "update failed verify/decrypt; skipping");
+                return Ok(false);
+            }
+        };
+
+        self.ensure_doc(list_id).await?;
+        let doc = self.docs.get(&list_id).expect("ensured");
+        doc.import(&loro)?;
+        self.rebuild_read_model(list_id).await?;
+        self.db.set_applied_through_seq(list_id, dto.seq).await?;
+        Ok(true)
+    }
+
+    /// Seed a list discovered from the server: its membership directory, our
+    /// cached wrapped DEKs, and metadata. Rehydrates the in-memory DEK map so
+    /// subsequent `apply_remote_update`s can decrypt.
+    #[tracing::instrument(skip(self, meta, keys))]
+    pub async fn ingest_remote_list(
+        &mut self,
+        meta: todoers_types::MetadataResponse,
+        keys: Vec<todoers_types::KeySlotDto>,
+    ) -> anyhow::Result<()> {
+        let list_id = ListId(meta.list_id.into_bytes());
+        let me = self.session.member_id();
+        let my_role = meta
+            .members
+            .iter()
+            .find(|m| m.member_id.into_bytes() == me.0)
+            .map(|m| m.role)
+            .unwrap_or(Role::Member);
+
+        self.db
+            .upsert_list_meta(list_id, my_role, meta.current_epoch as Epoch)
+            .await?;
+
+        for m in &meta.members {
+            self.db
+                .add_member_row(
+                    list_id,
+                    &Member {
+                        id: MemberId(m.member_id.into_bytes()),
+                        identity_pub: X25519Pub(to_32_vec(&m.identity_pub)?),
+                        signing_pub: Ed25519Pub(to_32_vec(&m.signing_pub)?),
+                        role: m.role,
+                    },
+                )
+                .await?;
+        }
+        for slot in &keys {
+            self.db
+                .save_key_slot(list_id, slot.epoch as Epoch, &slot.wrapped_dek)
+                .await?;
+        }
+        // Load the (possibly new) wrapped DEKs into the in-memory map.
+        self.session.rehydrate(&self.db).await?;
+        Ok(())
+    }
+
+    /// Re-derive the SQLite read model + persist the snapshot from the live doc.
+    /// The write half of `persist` without producing/enqueuing a new update —
+    /// used after merging a *remote* change (which we must not re-sign/-upload).
+    async fn rebuild_read_model(&self, list_id: ListId) -> anyhow::Result<()> {
+        let doc = self.docs.get(&list_id).context("rebuild: doc not open")?;
+        let snap = doc.export_snapshot()?;
+        self.db.save_document(list_id, &snap).await?;
+        self.db.replace_todo_items(list_id, &doc.items()).await?;
         Ok(())
     }
 
@@ -476,6 +678,8 @@ impl Store {
             self.db
                 .enqueue_outbound(list_id, epoch, &bytes, &payload.signature)
                 .await?;
+            // Nudge the sync engine to drain the queue for this list.
+            self.sync(crate::sync::SyncCommand::Push(list_id));
         }
 
         let snap = doc.export_snapshot()?;
@@ -488,6 +692,13 @@ impl Store {
 /// Whether an item belongs in a meta-list view as of `now`.
 fn in_meta(meta: MetaList, it: &TodoItem, now: OffsetDateTime) -> bool {
     meta.contains(it.due, now)
+}
+
+/// Length-check a wire pubkey (Vec<u8>) into a fixed 32-byte array.
+fn to_32_vec(bytes: &[u8]) -> anyhow::Result<[u8; 32]> {
+    bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("expected 32-byte key, got {}", bytes.len()))
 }
 
 /// Sort sidebar list summaries by the active mode, using per-list aggregates for
@@ -725,5 +936,112 @@ mod tests {
 
         // A write after rotation still succeeds (DEK for epoch 2 is present).
         store.add_todo(list, &input("post-rotation")).await.unwrap();
+    }
+
+    /// A migrated, single-connection in-memory pool for a second "device".
+    async fn fresh_pool() -> Pool<Sqlite> {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("db/migrations").run(&pool).await.unwrap();
+        pool
+    }
+
+    #[sqlx::test(migrations = "db/migrations")]
+    async fn remote_updates_apply_on_a_second_device(db: Pool<Sqlite>) {
+        // Author A produces updates on their device.
+        let mut a = store_with(db);
+        let list = a.create_list("Shared").await.unwrap();
+        a.add_todo(list, &input("buy milk")).await.unwrap();
+
+        // The exact envelopes the server would relay, in edit order.
+        let rows = a.db.take_outbound(list, 100).await.unwrap();
+        assert!(rows.len() >= 2, "expected title + add_todo updates");
+
+        // Capture A's public identity + the list DEK to seed receiver B.
+        let a_member = Member {
+            id: a.session.member_id(),
+            identity_pub: a.session.identity_pub(),
+            signing_pub: a.session.signing_pub(),
+            role: Role::Owner,
+        };
+        let epoch = a.db.list_epoch(list).await.unwrap().unwrap();
+        let dek = a.session.dek(list, epoch).unwrap();
+
+        // Receiver B on a separate device/db: a member who holds the DEK and
+        // knows A's signing key, but has never seen the list contents.
+        let mut b = store_with(fresh_pool().await);
+        b.db.upsert_list_meta(list, Role::Member, epoch)
+            .await
+            .unwrap();
+        b.db.add_member_row(list, &a_member).await.unwrap();
+        b.session_mut().insert_dek(list, epoch, dek);
+
+        // Apply each relayed update in seq order; B should reconstruct the item.
+        for (i, row) in rows.iter().enumerate() {
+            let payload: todoers_types::UpdatePayload =
+                serde_json::from_slice(&row.payload).unwrap();
+            let dto = todoers_types::StoredUpdateDto {
+                seq: (i + 1) as i64,
+                epoch: payload.epoch,
+                author: Uuid::from_bytes(payload.author.0),
+                nonce: payload.nonce.to_vec(),
+                ciphertext: payload.ciphertext.clone(),
+                signature: payload.signature.to_vec(),
+            };
+            b.apply_remote_update(list, dto).await.unwrap();
+        }
+
+        let items = b.db.load_todo_items(list).await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].title, "buy milk");
+        assert_eq!(
+            b.db.applied_through_seq(list).await.unwrap(),
+            rows.len() as i64
+        );
+    }
+
+    #[sqlx::test(migrations = "db/migrations")]
+    async fn remote_update_with_bad_signature_is_skipped(db: Pool<Sqlite>) {
+        let mut a = store_with(db);
+        let list = a.create_list("Shared").await.unwrap();
+        a.add_todo(list, &input("buy milk")).await.unwrap();
+        let rows = a.db.take_outbound(list, 100).await.unwrap();
+
+        let a_member = Member {
+            id: a.session.member_id(),
+            identity_pub: a.session.identity_pub(),
+            signing_pub: a.session.signing_pub(),
+            role: Role::Owner,
+        };
+        let epoch = a.db.list_epoch(list).await.unwrap().unwrap();
+        let dek = a.session.dek(list, epoch).unwrap();
+
+        let mut b = store_with(fresh_pool().await);
+        b.db.upsert_list_meta(list, Role::Member, epoch)
+            .await
+            .unwrap();
+        b.db.add_member_row(list, &a_member).await.unwrap();
+        b.session_mut().insert_dek(list, epoch, dek);
+
+        // Tamper with the signature: the blind relay can corrupt bytes, and a
+        // forged update must be rejected (skipped), never merged or fatal.
+        let payload: todoers_types::UpdatePayload =
+            serde_json::from_slice(&rows[0].payload).unwrap();
+        let mut bad_sig = payload.signature.to_vec();
+        bad_sig[0] ^= 0xff;
+        let dto = todoers_types::StoredUpdateDto {
+            seq: 1,
+            epoch: payload.epoch,
+            author: Uuid::from_bytes(payload.author.0),
+            nonce: payload.nonce.to_vec(),
+            ciphertext: payload.ciphertext.clone(),
+            signature: bad_sig,
+        };
+        let changed = b.apply_remote_update(list, dto).await.unwrap();
+        assert!(!changed, "tampered update must not change state");
+        assert!(b.db.load_todo_items(list).await.unwrap().is_empty());
     }
 }

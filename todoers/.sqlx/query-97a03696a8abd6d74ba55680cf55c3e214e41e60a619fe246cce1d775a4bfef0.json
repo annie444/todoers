@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT loro_snapshot FROM documents WHERE list_id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "loro_snapshot",
+        "ordinal": 0,
+        "type_info": "Blob",
+        "origin": {
+          "Table": {
+            "table": "documents",
+            "name": "loro_snapshot"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "97a03696a8abd6d74ba55680cf55c3e214e41e60a619fe246cce1d775a4bfef0"
+}

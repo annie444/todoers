@@ -17,6 +17,9 @@ pub enum AppError {
     #[error("unauthorized")]
     Unauthorized,
 
+    #[error("forbidden: {0}")]
+    Forbidden(String),
+
     /// A sensitive operation (enroll/revoke a trusted device key) requires a
     /// recent password login, not a device-minted or stale session.
     #[error("recent password authentication required")]
@@ -49,6 +52,10 @@ impl IntoResponse for AppError {
                 (StatusCode::BAD_REQUEST, self.to_string())
             }
             AppError::Unauthorized => (StatusCode::UNAUTHORIZED, self.to_string()),
+            AppError::Forbidden(e) => {
+                error!(error = %e, "forbidden");
+                (StatusCode::FORBIDDEN, self.to_string())
+            }
             AppError::StepUpRequired => (StatusCode::FORBIDDEN, self.to_string()),
             AppError::InvalidSignature => (StatusCode::BAD_REQUEST, self.to_string()),
             AppError::Opaque(e) => {

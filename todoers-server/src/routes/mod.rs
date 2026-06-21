@@ -24,7 +24,7 @@ pub async fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(health::healthz))
         // control plane
-        .route("/v1/lists", post(lists::create_list))
+        .route("/v1/lists", post(lists::create_list).get(lists::fetch_lists))
         .route("/v1/lists/{list_id}", get(lists::get_metadata))
         .route(
             "/v1/lists/{list_id}/members",

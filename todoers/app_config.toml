@@ -1,5 +1,6 @@
 # Base URL of the todoers server. Override in your own config.toml if needed.
 server_url = "http://127.0.0.1:8192"
+icon_theme = "nerd-fonts"
 
 # Text-field editing style: "emacs" (default) or "vim". Emacs gives the usual
 # terminal readline motions (Ctrl-A/E/F/B/K/W, Alt-F/B, arrows); Vim gives a

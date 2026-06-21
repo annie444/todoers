@@ -5,10 +5,12 @@
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use futures_util::{SinkExt, StreamExt};
+use tokio::sync::broadcast::error::RecvError;
 use uuid::Uuid;
 
+use crate::error::AppError;
 use crate::state::AppState;
 
 use super::auth::AuthMember;
@@ -19,11 +21,15 @@ pub async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
     Path(list_id): Path<Uuid>,
-    // Auth required to attach to a list's stream. (Stub for now; a real impl
-    // would also confirm this member belongs to `list_id`.)
-    _auth: AuthMember,
+    auth: AuthMember,
 ) -> Response {
-    ws.on_upgrade(move |socket| handle_socket(socket, state, list_id))
+    // A valid token is not enough: only members of THIS list may attach to its
+    // stream, otherwise any authenticated user could tap any list's fanout.
+    match state.db.member_role(list_id, auth.member_id).await {
+        Ok(Some(_)) => ws.on_upgrade(move |socket| handle_socket(socket, state, list_id)),
+        Ok(None) => AppError::Forbidden("not a member of this list".into()).into_response(),
+        Err(e) => e.into_response(),
+    }
 }
 
 async fn handle_socket(socket: WebSocket, state: AppState, list_id: Uuid) {
@@ -42,11 +48,11 @@ async fn handle_socket(socket: WebSocket, state: AppState, list_id: Uuid) {
                 }
                 // Lagged past the ring buffer: drop the stream and let the
                 // client reconcile via pull. Closing is the honest signal.
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                Err(RecvError::Lagged(_)) => {
                     let _ = sink.send(Message::Close(None)).await;
                     break;
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                Err(RecvError::Closed) => break,
             }
         }
     });

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            INSERT INTO list_members (list_id, member_id, identity_pub, signing_pub, role)\n            VALUES (?, ?, ?, ?, ?)\n            ON CONFLICT(list_id, member_id) DO UPDATE SET\n                identity_pub = excluded.identity_pub,\n                signing_pub = excluded.signing_pub,\n                role = excluded.role\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 5
+    },
+    "nullable": []
+  },
+  "hash": "2f1c9690783beb047fdaecaa2437f859640b65005f59aa7d8897a2e9a4a6f84a"
+}

@@ -69,6 +69,35 @@ pub struct Subtask {
     pub done: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubtaskRow {
+    pub item_id: String,
+    /// Stable id (a Loro container/item id).
+    pub id: String,
+    pub title: String,
+    pub done: bool,
+}
+
+impl From<SubtaskRow> for Subtask {
+    fn from(row: SubtaskRow) -> Self {
+        Self {
+            id: row.id,
+            title: row.title,
+            done: row.done,
+        }
+    }
+}
+
+impl From<&SubtaskRow> for Subtask {
+    fn from(row: &SubtaskRow) -> Self {
+        Self {
+            id: row.id.clone(),
+            title: row.title.clone(),
+            done: row.done,
+        }
+    }
+}
+
 /// A todo item as read out of the Loro document (the full record).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TodoItem {
@@ -85,6 +114,54 @@ pub struct TodoItem {
     pub subtasks: Vec<Subtask>,
     /// Fractional position key for the MovableList ordering.
     pub order_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TodoItemRow {
+    pub id: String,
+    pub title: String,
+    pub notes: String,
+    pub due_at: Option<i64>,
+    pub priority: i64,
+    pub done: bool,
+    pub tags: String, // raw JSON text
+    pub order_key: String,
+}
+
+impl From<(TodoItemRow, Vec<Subtask>)> for TodoItem {
+    fn from((row, subtasks): (TodoItemRow, Vec<Subtask>)) -> Self {
+        Self {
+            id: row.id,
+            title: row.title,
+            notes: row.notes,
+            due: row
+                .due_at
+                .map(|ts| OffsetDateTime::from_unix_timestamp(ts).unwrap()),
+            priority: Priority::from_rank(row.priority),
+            done: row.done,
+            tags: serde_json::from_str(&row.tags).unwrap_or_default(),
+            order_key: row.order_key,
+            subtasks,
+        }
+    }
+}
+
+impl From<(TodoItemRow, Vec<SubtaskRow>)> for TodoItem {
+    fn from((row, subtasks): (TodoItemRow, Vec<SubtaskRow>)) -> Self {
+        Self {
+            id: row.id,
+            title: row.title,
+            notes: row.notes,
+            due: row
+                .due_at
+                .map(|ts| OffsetDateTime::from_unix_timestamp(ts).unwrap()),
+            priority: Priority::from_rank(row.priority),
+            done: row.done,
+            tags: serde_json::from_str(&row.tags).unwrap_or_default(),
+            order_key: row.order_key,
+            subtasks: subtasks.into_iter().map(Into::into).collect(),
+        }
+    }
 }
 
 /// The user-supplied fields when creating or editing a todo. Excludes machine

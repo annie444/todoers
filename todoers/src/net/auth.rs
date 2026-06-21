@@ -239,6 +239,22 @@ pub async fn enroll_device(
     Ok(())
 }
 
+/// Revoke this device's session server-side (per-device logout). The caller
+/// should also drop the in-memory token afterward.
+#[tracing::instrument(skip(token))]
+pub async fn logout(base_url: &str, token: &str) -> anyhow::Result<()> {
+    let base = base_url.trim_end_matches('/');
+    Client::new()
+        .post(format!("{base}/v1/auth/logout"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .context("logout request failed")?
+        .error_for_status()
+        .context("logout rejected by server")?;
+    Ok(())
+}
+
 /// List this account's enrolled devices.
 #[tracing::instrument(skip(token))]
 pub async fn list_devices(base_url: &str, token: &str) -> anyhow::Result<Vec<DeviceInfo>> {

@@ -1,0 +1,50 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            SELECT list_id, local_id, payload FROM outbound\n            WHERE list_id = ? AND status = 'pending'\n            ORDER BY local_id\n            LIMIT ?\n            ",
+  "describe": {
+    "columns": [
+      {
+        "name": "list_id",
+        "ordinal": 0,
+        "type_info": "Blob",
+        "origin": {
+          "Table": {
+            "table": "outbound",
+            "name": "list_id"
+          }
+        }
+      },
+      {
+        "name": "local_id",
+        "ordinal": 1,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "outbound",
+            "name": "local_id"
+          }
+        }
+      },
+      {
+        "name": "payload",
+        "ordinal": 2,
+        "type_info": "Blob",
+        "origin": {
+          "Table": {
+            "table": "outbound",
+            "name": "payload"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "34d549f7735aeaa18eb7486613d34b0492985abdcbbb6ceff7373b7eeaa565a2"
+}

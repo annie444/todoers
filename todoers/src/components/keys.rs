@@ -1,4 +1,3 @@
-use crossterm::event::KeyModifiers;
 use indexmap::IndexMap;
 use ratatui::layout::Flex;
 use ratatui::{prelude::*, widgets::*};
@@ -8,7 +7,7 @@ use tracing::warn;
 use super::{Captures, Component};
 use crate::action::Action;
 use crate::app::Mode;
-use crate::config::{ActionConfig, Config};
+use crate::config::{ActionConfig, Config, key_event_to_string};
 use crate::tui::Event;
 
 #[derive(Default)]
@@ -59,32 +58,10 @@ impl Component for Keys {
                     && *show
                 {
                     for key in keys {
-                        let mut key_str = String::new();
-                        if !key.modifiers.is_empty() {
-                            if key.modifiers.contains(KeyModifiers::CONTROL) {
-                                key_str.push_str("Ctrl+");
-                            }
-                            if key.modifiers.contains(KeyModifiers::ALT) {
-                                key_str.push_str("Alt+");
-                            }
-                            if key.modifiers.contains(KeyModifiers::SHIFT) {
-                                key_str.push_str("Shift+");
-                            }
-                            if key.modifiers.contains(KeyModifiers::SUPER) {
-                                key_str.push_str("Super+");
-                            }
-                            if key.modifiers.contains(KeyModifiers::META) {
-                                key_str.push_str("Meta+");
-                            }
-                            if key.modifiers.contains(KeyModifiers::HYPER) {
-                                key_str.push_str("Hyper+");
-                            }
-                        }
-                        key_str.push_str(&format!("{}", key.code));
                         key_strs
                             .entry(action.to_string())
                             .or_default()
-                            .push(key_str);
+                            .push(key_event_to_string(key));
                     }
                 }
             }

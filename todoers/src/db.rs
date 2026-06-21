@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -13,14 +14,14 @@ use todoers_types::{Ed25519Pub, Epoch, ListId, Member, MemberId, Role, X25519Pub
 
 use crate::auth::{AccountRow, NewAccount};
 use crate::config::get_data_dir;
-use crate::model::{Priority, TodoItem};
+use crate::model::{Priority, Subtask, SubtaskRow, TodoItem, TodoItemRow};
 
 /// A list row as stored locally (the sidebar's per-list basics, before
 /// aggregates like open-count are computed from the read model).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ListRow {
     pub list_id: ListId,
-    pub name: String,
+    pub name: Option<String>,
     pub role: Role,
     pub current_epoch: Epoch,
 }
@@ -34,11 +35,14 @@ pub struct KeySlotRow {
     pub wrapped_dek: Vec<u8>,
 }
 
-fn parse_role(s: &str) -> Role {
-    match s {
-        "owner" => Role::Owner,
-        _ => Role::Member,
-    }
+/// A pending outbound update claimed by the uploader. `payload` is the exact
+/// `serde_json(UpdatePayload)` bytes to POST; `local_id` is the queue rowid used
+/// to ack (delete) or release (requeue) the row afterward.
+#[derive(Debug, Clone)]
+pub struct OutboundRow {
+    pub local_id: i64,
+    pub list_id: ListId,
+    pub payload: Vec<u8>,
 }
 
 fn list_id_from(bytes: Vec<u8>) -> ListId {
@@ -201,7 +205,7 @@ impl Db {
         current_epoch: Epoch,
         name: &str,
     ) -> anyhow::Result<()> {
-        sqlx::query(
+        sqlx::query!(
             r#"
             INSERT INTO lists (list_id, role, current_epoch, name_plaintext)
             VALUES (?, ?, ?, ?)
@@ -211,11 +215,11 @@ impl Db {
                 name_plaintext = excluded.name_plaintext,
                 updated_at = unixepoch()
             "#,
+            list_id.0.as_slice(),
+            role.as_str(),
+            current_epoch,
+            name,
         )
-        .bind(list_id.0.as_slice())
-        .bind(role.as_str())
-        .bind(current_epoch)
-        .bind(name)
         .execute(&*self.pool)
         .await?;
         Ok(())
@@ -224,43 +228,36 @@ impl Db {
     /// All locally-known lists (sidebar basics).
     #[tracing::instrument(skip(self))]
     pub async fn list_lists(&self) -> anyhow::Result<Vec<ListRow>> {
-        let rows = sqlx::query(
-            "SELECT list_id, role, current_epoch, name_plaintext FROM lists ORDER BY name_plaintext",
+        let rows = sqlx::query_as!(
+            ListRow,
+            "SELECT list_id, role, current_epoch, name_plaintext AS name FROM lists ORDER BY name_plaintext",
         )
         .fetch_all(&*self.pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| ListRow {
-                list_id: list_id_from(r.get::<Vec<u8>, _>("list_id")),
-                name: r
-                    .get::<Option<String>, _>("name_plaintext")
-                    .unwrap_or_default(),
-                role: parse_role(&r.get::<String, _>("role")),
-                current_epoch: r.get::<i64, _>("current_epoch") as Epoch,
-            })
-            .collect())
+        Ok(rows)
     }
 
     /// The current DEK epoch a list writes new updates under.
     #[tracing::instrument(skip(self))]
     pub async fn list_epoch(&self, list_id: ListId) -> anyhow::Result<Option<Epoch>> {
-        let row = sqlx::query("SELECT current_epoch FROM lists WHERE list_id = ?")
-            .bind(list_id.0.as_slice())
-            .fetch_optional(&*self.pool)
-            .await?;
-        Ok(row.map(|r| r.get::<i64, _>("current_epoch") as Epoch))
+        let row = sqlx::query_scalar!(
+            "SELECT current_epoch FROM lists WHERE list_id = ?",
+            list_id.0.as_slice()
+        )
+        .fetch_optional(&*self.pool)
+        .await?;
+        Ok(row)
     }
 
     /// Bump (or set) a list's current DEK epoch — used after a membership
     /// rotation so subsequent updates are written under the new epoch.
     #[tracing::instrument(skip(self))]
     pub async fn set_epoch(&self, list_id: ListId, epoch: Epoch) -> anyhow::Result<()> {
-        sqlx::query(
+        sqlx::query!(
             "UPDATE lists SET current_epoch = ?, updated_at = unixepoch() WHERE list_id = ?",
+            epoch,
+            list_id.0.as_slice()
         )
-        .bind(epoch)
-        .bind(list_id.0.as_slice())
         .execute(&*self.pool)
         .await?;
         Ok(())
@@ -268,11 +265,11 @@ impl Db {
 
     #[tracing::instrument(skip(self))]
     pub async fn rename_list(&self, list_id: ListId, name: &str) -> anyhow::Result<()> {
-        sqlx::query(
+        sqlx::query!(
             "UPDATE lists SET name_plaintext = ?, updated_at = unixepoch() WHERE list_id = ?",
+            name,
+            list_id.0.as_slice()
         )
-        .bind(name)
-        .bind(list_id.0.as_slice())
         .execute(&*self.pool)
         .await?;
         Ok(())
@@ -282,8 +279,7 @@ impl Db {
     /// outbound, todo_items) via the schema's `ON DELETE CASCADE`.
     #[tracing::instrument(skip(self))]
     pub async fn delete_list(&self, list_id: ListId) -> anyhow::Result<()> {
-        sqlx::query("DELETE FROM lists WHERE list_id = ?")
-            .bind(list_id.0.as_slice())
+        sqlx::query!("DELETE FROM lists WHERE list_id = ?", list_id.0.as_slice())
             .execute(&*self.pool)
             .await?;
         Ok(())
@@ -293,16 +289,18 @@ impl Db {
 
     #[tracing::instrument(skip(self))]
     pub async fn load_document(&self, list_id: ListId) -> anyhow::Result<Option<Vec<u8>>> {
-        let row = sqlx::query("SELECT loro_snapshot FROM documents WHERE list_id = ?")
-            .bind(list_id.0.as_slice())
-            .fetch_optional(&*self.pool)
-            .await?;
-        Ok(row.map(|r| r.get::<Vec<u8>, _>("loro_snapshot")))
+        let row = sqlx::query_scalar!(
+            "SELECT loro_snapshot FROM documents WHERE list_id = ?",
+            list_id.0.as_slice()
+        )
+        .fetch_optional(&*self.pool)
+        .await?;
+        Ok(row)
     }
 
     #[tracing::instrument(skip(self, snapshot))]
     pub async fn save_document(&self, list_id: ListId, snapshot: &[u8]) -> anyhow::Result<()> {
-        sqlx::query(
+        sqlx::query!(
             r#"
             INSERT INTO documents (list_id, loro_snapshot)
             VALUES (?, ?)
@@ -310,9 +308,9 @@ impl Db {
                 loro_snapshot = excluded.loro_snapshot,
                 updated_at = unixepoch()
             "#,
+            list_id.0.as_slice(),
+            snapshot,
         )
-        .bind(list_id.0.as_slice())
-        .bind(snapshot)
         .execute(&*self.pool)
         .await?;
         Ok(())
@@ -330,28 +328,30 @@ impl Db {
         items: &[TodoItem],
     ) -> anyhow::Result<()> {
         let mut txn = self.pool.begin().await?;
-        sqlx::query("DELETE FROM todo_items WHERE list_id = ?")
-            .bind(list_id.0.as_slice())
-            .execute(&mut *txn)
-            .await?;
+        sqlx::query!(
+            "DELETE FROM todo_items WHERE list_id = ?",
+            list_id.0.as_slice()
+        )
+        .execute(&mut *txn)
+        .await?;
         for it in items {
             let tags = serde_json::to_string(&it.tags).unwrap_or_else(|_| "[]".into());
-            sqlx::query(
+            sqlx::query!(
                 r#"
                 INSERT INTO todo_items
                     (list_id, item_id, text, done, order_key, due_at, priority, notes, tags)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 "#,
+                list_id.0.as_slice(),
+                &it.id,
+                &it.title,
+                it.done as i64,
+                &it.order_key,
+                it.due.map(|d| d.unix_timestamp()),
+                it.priority.rank(),
+                &it.notes,
+                tags
             )
-            .bind(list_id.0.as_slice())
-            .bind(&it.id)
-            .bind(&it.title)
-            .bind(it.done as i64)
-            .bind(&it.order_key)
-            .bind(it.due.map(|d| d.unix_timestamp()))
-            .bind(it.priority.rank())
-            .bind(&it.notes)
-            .bind(tags)
             .execute(&mut *txn)
             .await?;
         }
@@ -363,14 +363,63 @@ impl Db {
     /// full item from the doc for editing).
     #[tracing::instrument(skip(self))]
     pub async fn load_todo_items(&self, list_id: ListId) -> anyhow::Result<Vec<TodoItem>> {
-        let rows = sqlx::query(
-            "SELECT item_id, text, done, order_key, due_at, priority, notes, tags \
-             FROM todo_items WHERE list_id = ? ORDER BY order_key",
+        let item_rows = sqlx::query_as!(
+            TodoItemRow,
+            r#"
+            SELECT
+                item_id   AS "id!",
+                text      AS "title!",
+                notes     AS "notes!",
+                due_at    AS "due_at: i64",
+                priority  AS "priority!: i64",
+                done      AS "done!: bool",
+                tags      AS "tags!",
+                order_key AS "order_key!"
+            FROM todo_items
+            WHERE list_id = ?
+            ORDER BY order_key"#,
+            list_id.0.as_slice()
         )
-        .bind(list_id.0.as_slice())
         .fetch_all(&*self.pool)
         .await?;
-        Ok(rows.iter().map(row_to_item).collect())
+        let subtask_rows = sqlx::query_as!(
+            SubtaskRow,
+            r#"
+            SELECT item_id AS "item_id!", id AS "id!", title AS "title!", done AS "done!: bool"
+            FROM subtasks
+            WHERE list_id = ?
+            "#,
+            list_id.0.as_slice()
+        )
+        .fetch_all(&*self.pool)
+        .await?;
+        let mut by_item: HashMap<String, Vec<Subtask>> = HashMap::new();
+        for r in subtask_rows {
+            by_item.entry(r.item_id.clone()).or_default().push(r.into());
+        }
+
+        let items = item_rows
+            .into_iter()
+            .map(|r| {
+                let subtasks = by_item.remove(&r.id).unwrap_or_default();
+                Ok::<_, anyhow::Error>(TodoItem {
+                    subtasks,
+                    due: r
+                        .due_at
+                        .map(OffsetDateTime::from_unix_timestamp)
+                        .transpose()?,
+                    priority: Priority::from_rank(r.priority),
+                    tags: serde_json::from_str(&r.tags)?,
+                    id: r.id,
+                    title: r.title,
+                    notes: r.notes,
+                    done: r.done,
+                    order_key: r.order_key,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(items)
     }
 
     /// Load every list's read-model items (for the meta-list aggregate views),
@@ -393,26 +442,19 @@ impl Db {
 
     #[tracing::instrument(skip(self))]
     pub async fn list_members(&self, list_id: ListId) -> anyhow::Result<Vec<Member>> {
-        let rows = sqlx::query(
-            "SELECT member_id, identity_pub, signing_pub, role FROM list_members WHERE list_id = ?",
+        let rows = sqlx::query_as!(
+            Member,
+            "SELECT member_id as 'id!', identity_pub, signing_pub, role FROM list_members WHERE list_id = ?",
+            list_id.0.as_slice(),
         )
-        .bind(list_id.0.as_slice())
         .fetch_all(&*self.pool)
         .await?;
-        Ok(rows
-            .iter()
-            .map(|r| Member {
-                id: MemberId(to_16(r.get::<Vec<u8>, _>("member_id"))),
-                identity_pub: X25519Pub(to_32(r.get::<Vec<u8>, _>("identity_pub"))),
-                signing_pub: Ed25519Pub(to_32(r.get::<Vec<u8>, _>("signing_pub"))),
-                role: parse_role(&r.get::<String, _>("role")),
-            })
-            .collect())
+        Ok(rows)
     }
 
     #[tracing::instrument(skip(self))]
     pub async fn add_member_row(&self, list_id: ListId, member: &Member) -> anyhow::Result<()> {
-        sqlx::query(
+        sqlx::query!(
             r#"
             INSERT INTO list_members (list_id, member_id, identity_pub, signing_pub, role)
             VALUES (?, ?, ?, ?, ?)
@@ -421,12 +463,12 @@ impl Db {
                 signing_pub = excluded.signing_pub,
                 role = excluded.role
             "#,
+            list_id.0.as_slice(),
+            member.id.0.as_slice(),
+            member.identity_pub.0.as_slice(),
+            member.signing_pub.0.as_slice(),
+            member.role.as_str()
         )
-        .bind(list_id.0.as_slice())
-        .bind(member.id.0.as_slice())
-        .bind(member.identity_pub.0.as_slice())
-        .bind(member.signing_pub.0.as_slice())
-        .bind(member.role.as_str())
         .execute(&*self.pool)
         .await?;
         Ok(())
@@ -438,11 +480,13 @@ impl Db {
         list_id: ListId,
         member_id: MemberId,
     ) -> anyhow::Result<()> {
-        sqlx::query("DELETE FROM list_members WHERE list_id = ? AND member_id = ?")
-            .bind(list_id.0.as_slice())
-            .bind(member_id.0.as_slice())
-            .execute(&*self.pool)
-            .await?;
+        sqlx::query!(
+            "DELETE FROM list_members WHERE list_id = ? AND member_id = ?",
+            list_id.0.as_slice(),
+            member_id.0.as_slice()
+        )
+        .execute(&*self.pool)
+        .await?;
         Ok(())
     }
 
@@ -455,16 +499,16 @@ impl Db {
         epoch: Epoch,
         wrapped_dek: &[u8],
     ) -> anyhow::Result<()> {
-        sqlx::query(
+        sqlx::query!(
             r#"
             INSERT INTO key_slots (list_id, epoch, wrapped_dek)
             VALUES (?, ?, ?)
             ON CONFLICT(list_id, epoch) DO UPDATE SET wrapped_dek = excluded.wrapped_dek
             "#,
+            list_id.0.as_slice(),
+            epoch,
+            wrapped_dek
         )
-        .bind(list_id.0.as_slice())
-        .bind(epoch)
-        .bind(wrapped_dek)
         .execute(&*self.pool)
         .await?;
         Ok(())
@@ -498,17 +542,17 @@ impl Db {
         payload: &[u8],
         signature: &[u8; 64],
     ) -> anyhow::Result<()> {
-        sqlx::query(
+        sqlx::query!(
             r#"
             INSERT INTO outbound (list_id, epoch, payload, signature)
             VALUES (?, ?, ?, ?)
             ON CONFLICT(signature) DO NOTHING
             "#,
+            list_id.0.as_slice(),
+            epoch,
+            payload,
+            signature.as_slice()
         )
-        .bind(list_id.0.as_slice())
-        .bind(epoch)
-        .bind(payload)
-        .bind(signature.as_slice())
         .execute(&*self.pool)
         .await?;
         Ok(())
@@ -517,11 +561,140 @@ impl Db {
     /// Count pending outbound rows for a list (used by tests / a future uploader).
     #[tracing::instrument(skip(self))]
     pub async fn outbound_count(&self, list_id: ListId) -> anyhow::Result<i64> {
-        let row = sqlx::query("SELECT COUNT(*) AS n FROM outbound WHERE list_id = ?")
-            .bind(list_id.0.as_slice())
-            .fetch_one(&*self.pool)
+        let row = sqlx::query_scalar!(
+            "SELECT COUNT(*) FROM outbound WHERE list_id = ?",
+            list_id.0.as_slice()
+        )
+        .fetch_one(&*self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// Claim up to `limit` pending rows for upload, flipping them to `inflight`
+    /// (and bumping `attempts`) in one transaction so a second drain won't
+    /// double-send them. Returned in local edit order (`local_id` ascending).
+    #[tracing::instrument(skip(self))]
+    pub async fn take_outbound(
+        &self,
+        list_id: ListId,
+        limit: i64,
+    ) -> anyhow::Result<Vec<OutboundRow>> {
+        let mut txn = self.pool.begin().await?;
+        let rows = sqlx::query_as!(
+            OutboundRow,
+            r#"
+            SELECT list_id, local_id, payload FROM outbound
+            WHERE list_id = ? AND status = 'pending'
+            ORDER BY local_id
+            LIMIT ?
+            "#,
+            list_id.0.as_slice(),
+            limit
+        )
+        .fetch_all(&mut *txn)
+        .await?;
+
+        for row in &rows {
+            sqlx::query!(
+                "UPDATE outbound SET status = 'inflight', attempts = attempts + 1, \
+                 last_attempt_at = unixepoch() WHERE local_id = ?",
+                row.local_id
+            )
+            .execute(&mut *txn)
             .await?;
-        Ok(row.get::<i64, _>("n"))
+        }
+        txn.commit().await?;
+        Ok(rows)
+    }
+
+    /// The server acked the append (assigned a seq) — drop the row.
+    #[tracing::instrument(skip(self))]
+    pub async fn ack_outbound(&self, local_id: i64) -> anyhow::Result<()> {
+        sqlx::query!("DELETE FROM outbound WHERE local_id = ?", local_id)
+            .execute(&*self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// The upload failed — return the row to `pending` so a later drain retries.
+    #[tracing::instrument(skip(self))]
+    pub async fn release_outbound(&self, local_id: i64) -> anyhow::Result<()> {
+        sqlx::query!(
+            "UPDATE outbound SET status = 'pending' WHERE local_id = ?",
+            local_id
+        )
+        .execute(&*self.pool)
+        .await?;
+        Ok(())
+    }
+
+    // ── sync cursors (against the server's global seq) ─────────────────────────
+
+    /// The last server `seq` merged into this list's doc (0 if never synced).
+    #[tracing::instrument(skip(self))]
+    pub async fn applied_through_seq(&self, list_id: ListId) -> anyhow::Result<i64> {
+        let row = sqlx::query_scalar!(
+            "SELECT applied_through_seq FROM lists WHERE list_id = ?",
+            list_id.0.as_slice()
+        )
+        .fetch_optional(&*self.pool)
+        .await?;
+        Ok(row.unwrap_or(0))
+    }
+
+    /// Advance the applied-through cursor and stamp `last_synced_at`. Monotonic:
+    /// never moves backward, so out-of-order WS/pull merges can't rewind it.
+    #[tracing::instrument(skip(self))]
+    pub async fn set_applied_through_seq(&self, list_id: ListId, seq: i64) -> anyhow::Result<()> {
+        sqlx::query!(
+            "UPDATE lists SET applied_through_seq = MAX(applied_through_seq, ?), \
+             last_synced_at = unixepoch(), updated_at = unixepoch() WHERE list_id = ?",
+            seq,
+            list_id.0.as_slice()
+        )
+        .execute(&*self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Record the server's compaction high-water mark (the snapshot's `covers_seq`).
+    #[tracing::instrument(skip(self))]
+    pub async fn set_server_snapshot_seq(&self, list_id: ListId, seq: i64) -> anyhow::Result<()> {
+        sqlx::query!(
+            "UPDATE lists SET server_snapshot_seq = ?, updated_at = unixepoch() WHERE list_id = ?",
+            seq,
+            list_id.0.as_slice()
+        )
+        .execute(&*self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Insert/refresh a list's metadata discovered from the server WITHOUT
+    /// clobbering a locally-decrypted name (which the blind server never holds).
+    #[tracing::instrument(skip(self))]
+    pub async fn upsert_list_meta(
+        &self,
+        list_id: ListId,
+        role: Role,
+        current_epoch: Epoch,
+    ) -> anyhow::Result<()> {
+        sqlx::query!(
+            r#"
+            INSERT INTO lists (list_id, role, current_epoch)
+            VALUES (?, ?, ?)
+            ON CONFLICT(list_id) DO UPDATE SET
+                role = excluded.role,
+                current_epoch = excluded.current_epoch,
+                updated_at = unixepoch()
+            "#,
+            list_id.0.as_slice(),
+            role.as_str(),
+            current_epoch
+        )
+        .execute(&*self.pool)
+        .await?;
+        Ok(())
     }
 }
 
@@ -533,18 +706,6 @@ impl Db {
             pool: Arc::new(pool),
         }
     }
-}
-
-fn to_16(v: Vec<u8>) -> [u8; 16] {
-    let mut a = [0u8; 16];
-    a.copy_from_slice(&v);
-    a
-}
-
-fn to_32(v: Vec<u8>) -> [u8; 32] {
-    let mut a = [0u8; 32];
-    a.copy_from_slice(&v);
-    a
 }
 
 /// Map a `todo_items` row to a [`TodoItem`] (subtasks are not in the read model).

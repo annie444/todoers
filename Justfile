@@ -61,7 +61,7 @@ check-sqlx:
     cargo sqlx prepare --check --workspace -- --all-targets
 
 [group("Server")]
-run-server: db-up
+run-server: setup-server
     cargo run -p todoers-server
 
 [group("Server")]
@@ -77,6 +77,11 @@ check-server: db-up setup-server
     (cd todoers-server && cargo sqlx prepare --check -- --all-targets)
 
 [group("TUI")]
+run-tui: setup-tui
+    just run-server >server.log 2>&1 &
+    cargo run -p todoers
+
+[group("TUI")]
 setup-tui:
     (cd todoers && cargo sqlx database setup --sqlite-create-db-wal=true)
 
@@ -87,3 +92,11 @@ prepare-tui: setup-tui
 [group("TUI")]
 check-tui: setup-tui
     (cd todoers && cargo sqlx prepare --check --sqlite-create-db-wal=true -- --all-targets)
+
+[group("Workspace")]
+[parallel]
+prepare: prepare-server prepare-tui
+
+[group("Workspace")]
+[parallel]
+setup: setup-server setup-tui

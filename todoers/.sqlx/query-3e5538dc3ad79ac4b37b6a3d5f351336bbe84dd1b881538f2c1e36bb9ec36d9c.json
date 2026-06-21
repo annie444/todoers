@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE lists SET applied_through_seq = MAX(applied_through_seq, ?), last_synced_at = unixepoch(), updated_at = unixepoch() WHERE list_id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "3e5538dc3ad79ac4b37b6a3d5f351336bbe84dd1b881538f2c1e36bb9ec36d9c"
+}

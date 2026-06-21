@@ -5,7 +5,7 @@
 
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
-use todoers_types::{ListId, Member, MemberId};
+use todoers_types::{KeySlotDto, ListId, MetadataResponse, Member, MemberId, StoredUpdateDto};
 
 use crate::model::{ListSummary, SortMode, TodoItem, TodoItemInput, ViewTarget};
 use crate::store::Store;
@@ -56,6 +56,18 @@ pub enum StoreCommand {
         item_id: String,
     },
     FetchMembers(ListId),
+    /// Server → local: verify/decrypt/merge a batch of pulled or streamed
+    /// updates (from the sync engine).
+    ApplyRemote {
+        list_id: ListId,
+        updates: Vec<StoredUpdateDto>,
+    },
+    /// Server → local: seed a list discovered during initial sync (membership,
+    /// wrapped DEKs, metadata) so its updates can be decrypted.
+    IngestRemoteList {
+        meta: Box<MetadataResponse>,
+        keys: Vec<KeySlotDto>,
+    },
 }
 
 /// Plain, `Send` view data computed by the worker for the current targets+sort.
@@ -153,6 +165,17 @@ pub async fn run_store_worker(mut store: Store, mut cmd_rx: CommandRx, out: Work
                     let members = store.members(list_id).await?;
                     let _ = out.send(WorkerMsg::Members(Box::new((list_id, members))));
                     Ok(false)
+                }
+                StoreCommand::ApplyRemote { list_id, updates } => {
+                    let mut changed = false;
+                    for dto in updates {
+                        changed |= store.apply_remote_update(list_id, dto).await?;
+                    }
+                    Ok(changed)
+                }
+                StoreCommand::IngestRemoteList { meta, keys } => {
+                    store.ingest_remote_list(*meta, keys).await?;
+                    Ok(true)
                 }
             }
         }

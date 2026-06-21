@@ -1,0 +1,62 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT list_id, role, current_epoch, name_plaintext AS name FROM lists ORDER BY name_plaintext",
+  "describe": {
+    "columns": [
+      {
+        "name": "list_id",
+        "ordinal": 0,
+        "type_info": "Blob",
+        "origin": {
+          "Table": {
+            "table": "lists",
+            "name": "list_id"
+          }
+        }
+      },
+      {
+        "name": "role",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "lists",
+            "name": "role"
+          }
+        }
+      },
+      {
+        "name": "current_epoch",
+        "ordinal": 2,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "lists",
+            "name": "current_epoch"
+          }
+        }
+      },
+      {
+        "name": "name",
+        "ordinal": 3,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "lists",
+            "name": "name_plaintext"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "e81154a70dbbe1c57b218458f40d59a2111a658d454eaff8c47c0d7df1b93fb7"
+}

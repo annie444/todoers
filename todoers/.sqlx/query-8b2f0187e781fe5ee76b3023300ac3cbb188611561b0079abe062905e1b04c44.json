@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n                INSERT INTO todo_items\n                    (list_id, item_id, text, done, order_key, due_at, priority, notes, tags)\n                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 9
+    },
+    "nullable": []
+  },
+  "hash": "8b2f0187e781fe5ee76b3023300ac3cbb188611561b0079abe062905e1b04c44"
+}

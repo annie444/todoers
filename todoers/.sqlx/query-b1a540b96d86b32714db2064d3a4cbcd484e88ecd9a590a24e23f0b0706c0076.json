@@ -1,0 +1,62 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            SELECT item_id AS \"item_id!\", id AS \"id!\", title AS \"title!\", done AS \"done!: bool\"\n            FROM subtasks\n            WHERE list_id = ?\n            ",
+  "describe": {
+    "columns": [
+      {
+        "name": "item_id!",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "subtasks",
+            "name": "item_id"
+          }
+        }
+      },
+      {
+        "name": "id!",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "subtasks",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "name": "title!",
+        "ordinal": 2,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "subtasks",
+            "name": "title"
+          }
+        }
+      },
+      {
+        "name": "done!: bool",
+        "ordinal": 3,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "subtasks",
+            "name": "done"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "b1a540b96d86b32714db2064d3a4cbcd484e88ecd9a590a24e23f0b0706c0076"
+}

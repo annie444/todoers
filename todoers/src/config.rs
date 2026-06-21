@@ -20,6 +20,9 @@ pub struct AppConfig {
     /// Base URL of the todoers server used for registration/login.
     #[serde(default = "default_server_url")]
     pub server_url: String,
+    /// Icon style used in the UI: `nerd-fonts` (default), `emojis`, or `basic`.
+    #[serde(default)]
+    pub icon_type: IconType,
     /// Password-less device unlock via a local AGE/SSH key. Per-device (lives in
     /// the local config), so each device can use a different key.
     #[serde(default)]
@@ -27,6 +30,24 @@ pub struct AppConfig {
     /// Text-field editing style: `emacs` (default) or `vim`.
     #[serde(default)]
     pub editing_mode: EditingMode,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum IconType {
+    NerdFonts,
+    Emojis,
+    Basic,
+}
+
+impl Default for IconType {
+    fn default() -> Self {
+        if cfg!(windows) {
+            IconType::Emojis
+        } else {
+            IconType::NerdFonts
+        }
+    }
 }
 
 /// Which key bindings a focused text field obeys.
@@ -164,9 +185,7 @@ pub fn get_data_dir() -> PathBuf {
     }) && user.exists()
     {
         user
-    } else if let Some(base) = BaseDirs::new()
-        .map(|b| b.state_dir().map(|s| s.to_path_buf()))
-        .flatten()
+    } else if let Some(base) = BaseDirs::new().and_then(|b| b.state_dir().map(|s| s.to_path_buf()))
         && base.exists()
     {
         base

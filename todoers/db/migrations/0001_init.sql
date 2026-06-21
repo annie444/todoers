@@ -51,6 +51,8 @@ CREATE TABLE IF NOT EXISTS account (
     kdf_mem_kib         INTEGER NOT NULL,
     kdf_iters           INTEGER NOT NULL,
     kdf_parallelism     INTEGER NOT NULL,
+    device_id           BLOB CHECK (device_id IS NULL OR length(device_id) = 16),
+    device_wrapped_keys BLOB,  -- local key file: seal(UnlockedKeys ‖ device-auth key)
     created_at          INTEGER NOT NULL DEFAULT (unixepoch()),
     updated_at          INTEGER NOT NULL DEFAULT (unixepoch())
 ) STRICT;
@@ -135,11 +137,33 @@ CREATE TABLE IF NOT EXISTS todo_items (
     text       TEXT NOT NULL,
     done       INTEGER NOT NULL DEFAULT 0 CHECK (done IN (0,1)),
     order_key  TEXT,                       -- fractional index for MovableList position
+    due_at     INTEGER,                    -- unix seconds, NULL = no due date
+    priority   INTEGER NOT NULL DEFAULT 0, -- 0=none 1=low 2=med 3=high
+    notes      TEXT NOT NULL DEFAULT '',   -- free-text body
+    tags       TEXT NOT NULL DEFAULT '[]', -- JSON array of strings (denormalized from the doc)
     updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
     PRIMARY KEY (list_id, item_id)
 ) STRICT, WITHOUT ROWID;
 
+CREATE TABLE IF NOT EXISTS subtasks (
+    list_id      BLOB NOT NULL,
+    item_id      TEXT NOT NULL,
+    id           TEXT NOT NULL,
+    title        TEXT NOT NULL,
+    done         INTEGER NOT NULL DEFAULT 0 CHECK (done IN (0,1)),
+    updated_at   INTEGER NOT NULL DEFAULT (unixepoch()),
+    PRIMARY KEY (list_id, item_id, id)
+    FOREIGN KEY (list_id, item_id) REFERENCES todo_items(list_id, item_id) ON DELETE CASCADE
+) STRICT, WITHOUT ROWID;
+
 CREATE INDEX IF NOT EXISTS todo_items_by_list ON todo_items (list_id, order_key);
+
+-- Meta-list scans ("Due Today/Week/Month") filter by due_at across ALL lists,
+-- usually excluding done items; a partial index keeps it tight.
+CREATE INDEX IF NOT EXISTS todo_items_due ON todo_items (due_at) WHERE done = 0;
+
+-- Sorting a single list by priority.
+CREATE INDEX IF NOT EXISTS todo_items_priority ON todo_items (list_id, priority);
 
 CREATE TABLE sequences (
     name TEXT PRIMARY KEY,
@@ -147,3 +171,4 @@ CREATE TABLE sequences (
 ), STRICT, WITHOUT ROWID;
 
 PRAGMA user_version = 1;
+PRAGMA foreign_keys = ON;

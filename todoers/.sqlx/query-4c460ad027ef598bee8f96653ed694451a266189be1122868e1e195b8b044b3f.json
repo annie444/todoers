@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            INSERT INTO key_slots (list_id, epoch, wrapped_dek)\n            VALUES (?, ?, ?)\n            ON CONFLICT(list_id, epoch) DO UPDATE SET wrapped_dek = excluded.wrapped_dek\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "4c460ad027ef598bee8f96653ed694451a266189be1122868e1e195b8b044b3f"
+}

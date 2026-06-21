@@ -9,7 +9,8 @@ use tracing::{error, info};
 use uuid::Uuid;
 
 use todoers_types::{
-    DeviceInfo, KeySlotDto, LoginDto, MemberDto, Role, SnapshotDto, StoredUpdateDto, UserPubkeysDto,
+    DeviceInfo, KeySlotDto, KeySlotEntry, LoginDto, MemberDto, Role, SnapshotDto, StoredUpdateDto,
+    UserPubkeysDto,
 };
 
 use crate::config::DbConfig;
@@ -255,6 +256,24 @@ impl Db {
         row.ok_or(AppError::NotFound)
     }
 
+    /// This member's role on `list_id`, or `None` if they are not a member.
+    /// Used to gate owner-only operations and to confirm WS subscribers belong
+    /// to the list before attaching them to its broadcast stream.
+    pub async fn member_role(&self, list_id: Uuid, member_id: Uuid) -> AppResult<Option<Role>> {
+        let row = sqlx::query_scalar!(
+            r#"
+            SELECT role AS "role: Role"
+            FROM list_members
+            WHERE list_id = $1 AND member_id = $2
+            "#,
+            list_id,
+            member_id,
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
     pub async fn fetch_members(&self, list_id: Uuid) -> AppResult<Vec<MemberDto>> {
         let members = sqlx::query_as!(
             MemberDto,
@@ -363,6 +382,19 @@ impl Db {
         }).await
     }
 
+    /// Get the lists a user is currently apart of
+    pub async fn fetch_user_lists(&self, member: Uuid) -> AppResult<Vec<Uuid>> {
+        let list_ids = sqlx::query_scalar!(
+            r#"SELECT list_id
+                FROM list_members
+                WHERE member_id = $1"#,
+            member,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(list_ids)
+    }
+
     /// Add a member with their sealed copy of the given epoch's DEK.
     pub async fn add_member(
         &self,
@@ -409,25 +441,21 @@ impl Db {
         list_id: Uuid,
         member_id: Uuid,
         epoch: i64,
-        wrapped_dek: &[u8],
+        new_slots: &[KeySlotEntry],
     ) -> AppResult<()> {
         self.safe_transaction(async move |tx| {
-            let remaining_member_ids = sqlx::query_scalar!(
-                r#"
-                    SELECT k.member_id
-                    FROM key_slots k
-                    WHERE k.list_id = $1 AND k.epoch = $2 AND k.member_id != $3
-                    "#,
-                list_id,
-                epoch,
-                member_id,
-            )
-            .fetch_all(&mut *tx)
-            .await?;
-
             let new_epoch = epoch + 1;
 
-            for mem_id in remaining_member_ids {
+            // Seal the rotated DEK to each remaining member individually: a sealed
+            // box opens only for the pubkey it was sealed to, so every survivor
+            // needs their own copy. The removed member is simply absent from the
+            // caller-supplied list and has their slots dropped below.
+            for slot in new_slots {
+                if slot.member_id == member_id {
+                    return Err(AppError::BadRequest(
+                        "removed member must not receive a new key slot".into(),
+                    ));
+                }
                 sqlx::query!(
                     r#"
                     INSERT INTO key_slots (list_id, epoch, member_id, wrapped_dek)
@@ -436,8 +464,8 @@ impl Db {
                     "#,
                     list_id,
                     new_epoch,
-                    mem_id,
-                    wrapped_dek,
+                    slot.member_id,
+                    &slot.wrapped_dek,
                 )
                 .execute(&mut *tx)
                 .await?;

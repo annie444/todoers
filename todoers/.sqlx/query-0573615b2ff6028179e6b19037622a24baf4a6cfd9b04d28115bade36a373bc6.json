@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE outbound SET status = 'pending' WHERE local_id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "0573615b2ff6028179e6b19037622a24baf4a6cfd9b04d28115bade36a373bc6"
+}
