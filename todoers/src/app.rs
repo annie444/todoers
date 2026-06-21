@@ -102,11 +102,20 @@ fn is_global_chord(key: &KeyEvent) -> bool {
         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
 }
 
+/// Drain everything currently queued on an mpsc receiver without awaiting. Used
+/// by `handle_actions` to process the whole backlog in one loop turn (and coalesce
+/// renders), rather than one action per turn.
+fn drain<T>(rx: &mut mpsc::UnboundedReceiver<T>) -> Vec<T> {
+    let mut out = Vec::new();
+    while let Ok(v) = rx.try_recv() {
+        out.push(v);
+    }
+    out
+}
+
 /// Convert a `users/{username}/pubkeys` response into a [`Member`] to seal a list
 /// DEK to. Rejects keys of the wrong length rather than panicking.
-fn resolved_member(
-    dto: todoers_types::UserPubkeysDto,
-) -> anyhow::Result<todoers_types::Member> {
+fn resolved_member(dto: todoers_types::UserPubkeysDto) -> anyhow::Result<todoers_types::Member> {
     use todoers_types::{Ed25519Pub, Member, MemberId, Role, X25519Pub};
     let identity_pub: [u8; 32] = dto
         .identity_pub
@@ -346,495 +355,496 @@ impl App {
 
     #[tracing::instrument(skip(self, tui))]
     async fn handle_actions(&mut self, tui: &mut Tui) -> anyhow::Result<()> {
-        match self.action_rx.try_recv() {
-            Ok(action) => {
-                // Never debug-print `Register` verbatim: it carries the password.
-                if !matches!(
-                    action,
-                    Action::Tick
-                        | Action::Render
-                        | Action::Register { .. }
-                        | Action::Login { .. }
-                        | Action::Keys(_)
-                ) {
-                    debug!("{action:?}");
-                }
-                match action {
-                    Action::Tick => {
-                        self.last_tick_key_events.drain(..);
+        let mut should_render = false;
+        for action in drain(&mut self.action_rx) {
+            // Coalesce renders: note the request and draw once after draining the
+            // whole backlog, so a burst of actions costs at most one frame.
+            if matches!(action, Action::Render) {
+                should_render = true;
+                continue;
+            }
+            self.dispatch_action(action, tui).await?;
+        }
+        if should_render {
+            self.render(tui)?;
+        }
+        Ok(())
+    }
+
+    async fn dispatch_action(&mut self, action: Action, tui: &mut Tui) -> anyhow::Result<()> {
+        // Never debug-print `Register` verbatim: it carries the password.
+        if !matches!(
+            action,
+            Action::Tick
+                | Action::Render
+                | Action::Register { .. }
+                | Action::Login { .. }
+                | Action::Keys(_)
+        ) {
+            debug!("{action:?}");
+        }
+        match action {
+            Action::Tick => {
+                self.last_tick_key_events.drain(..);
+            }
+            Action::ToggleSidebar => {}
+            Action::Quit => self.should_quit = true,
+            Action::Suspend => self.should_suspend = true,
+            Action::Resume => self.should_suspend = false,
+            Action::ClearScreen => tui.terminal.clear()?,
+            Action::Resize(w, h) => self.handle_resize(tui, w, h)?,
+            // Coalesced in `handle_actions`; unreachable here but kept so
+            // the match stays exhaustive over `Action`.
+            Action::Render => {}
+            Action::SetMode(mode) => self.handle_switch_mode(mode, tui)?,
+            Action::StartCapture => self.capturing = true,
+            Action::StopCapture => self.capturing = false,
+            // Submit rides the message bus down into the open form modal's
+            // body (forwarded below); no app-level state changes here.
+            Action::SubmitForm => {}
+            // Normally consumed by the `Modal` to shift focus onto its
+            // buttons; if it reaches the app it's a harmless no-op.
+            Action::FocusButtons => {}
+            Action::Keys(ref keys) => {
+                info!("Received cryptographic keys");
+                self.acct_keys = Some(keys.to_owned());
+            }
+            Action::UnlockModal => {
+                // The user has a local account but no keys (e.g. first launch
+                // after a reinstall). Prompt for the password to unlock the
+                // escrowed keys from the server.
+                let mut modal = Modal::form("Unlock", Box::new(Unlock::new()), Action::AuthChooser);
+                modal.register_action_handler(self.action_tx.clone())?;
+                modal.register_config_handler(self.config.clone())?;
+                modal.init(tui.size()?)?;
+                self.prev_mode = self.mode;
+                self.mode = Mode::Home;
+                self.refresh_keys()?;
+                self.modal = Some(modal);
+                // Focus the password field (capturing on, Vim Normal mode),
+                // matching the login/register modals.
+                self.action_tx.send(Action::StartCapture)?;
+            }
+            Action::DeviceUnlock => {
+                // Password-less unlock: decrypt the on-disk cache with the
+                // configured local AGE/SSH key, then device-login for a
+                // fresh token. On any failure, fall back to the password
+                // prompt. Runs off the UI loop; result returns as actions.
+                let tx = self.action_tx.clone();
+                let db = self.db.clone();
+                let base_url = self.config.config.server_url.clone();
+                let du = self.config.config.device_unlock.clone();
+                tokio::spawn(async move {
+                    let attempt = async {
+                        let (device_id, blob) = db
+                            .load_device_cache()
+                            .await?
+                            .ok_or_else(|| anyhow::anyhow!("no device cache on this device"))?;
+                        let identity = du.identity.clone().ok_or_else(|| {
+                            anyhow::anyhow!("no device-unlock identity configured")
+                        })?;
+                        crate::net::unlock_via_device(&base_url, &identity, device_id, blob).await
                     }
-                    Action::ToggleSidebar => {}
-                    Action::Quit => self.should_quit = true,
-                    Action::Suspend => self.should_suspend = true,
-                    Action::Resume => self.should_suspend = false,
-                    Action::ClearScreen => tui.terminal.clear()?,
-                    Action::Resize(w, h) => self.handle_resize(tui, w, h)?,
-                    Action::Render => self.render(tui)?,
-                    Action::SetMode(mode) => self.handle_switch_mode(mode, tui)?,
-                    Action::StartCapture => self.capturing = true,
-                    Action::StopCapture => self.capturing = false,
-                    // Submit rides the message bus down into the open form modal's
-                    // body (forwarded below); no app-level state changes here.
-                    Action::SubmitForm => {}
-                    // Normally consumed by the `Modal` to shift focus onto its
-                    // buttons; if it reaches the app it's a harmless no-op.
-                    Action::FocusButtons => {}
-                    Action::Keys(ref keys) => {
-                        info!("Received cryptographic keys");
-                        self.acct_keys = Some(keys.to_owned());
+                    .await;
+                    match attempt {
+                        Ok(keys) => {
+                            let _ = tx.send(Action::Keys(keys));
+                            let _ = tx.send(Action::SetMode(Mode::Home));
+                        }
+                        Err(e) => {
+                            error!(?e, "device unlock failed; prompting for password");
+                            let _ = tx.send(Action::Error(format!("Device unlock failed: {e:#}")));
+                            let _ = tx.send(Action::UnlockModal);
+                        }
                     }
-                    Action::UnlockModal => {
-                        // The user has a local account but no keys (e.g. first launch
-                        // after a reinstall). Prompt for the password to unlock the
-                        // escrowed keys from the server.
-                        let mut modal =
-                            Modal::form("Unlock", Box::new(Unlock::new()), Action::AuthChooser);
-                        modal.register_action_handler(self.action_tx.clone())?;
-                        modal.register_config_handler(self.config.clone())?;
-                        modal.init(tui.size()?)?;
-                        self.prev_mode = self.mode;
-                        self.mode = Mode::Home;
-                        self.refresh_keys()?;
-                        self.modal = Some(modal);
-                        // Focus the password field (capturing on, Vim Normal mode),
-                        // matching the login/register modals.
-                        self.action_tx.send(Action::StartCapture)?;
-                    }
-                    Action::DeviceUnlock => {
-                        // Password-less unlock: decrypt the on-disk cache with the
-                        // configured local AGE/SSH key, then device-login for a
-                        // fresh token. On any failure, fall back to the password
-                        // prompt. Runs off the UI loop; result returns as actions.
-                        let tx = self.action_tx.clone();
-                        let db = self.db.clone();
-                        let base_url = self.config.config.server_url.clone();
-                        let du = self.config.config.device_unlock.clone();
-                        tokio::spawn(async move {
-                            let attempt = async {
-                                let (device_id, blob) =
-                                    db.load_device_cache().await?.ok_or_else(|| {
-                                        anyhow::anyhow!("no device cache on this device")
-                                    })?;
-                                let identity = du.identity.clone().ok_or_else(|| {
-                                    anyhow::anyhow!("no device-unlock identity configured")
-                                })?;
-                                crate::net::unlock_via_device(
-                                    &base_url, &identity, device_id, blob,
-                                )
-                                .await
+                });
+            }
+            Action::Register {
+                ref username,
+                ref password,
+            } => {
+                // Drive the networked OPAQUE registration off the UI loop;
+                // results come back as actions (Error, or StopCapture+SetMode).
+                let tx = self.action_tx.clone();
+                let db = self.db.clone();
+                let base_url = self.config.config.server_url.clone();
+                let username = username.clone();
+                let password = password.clone();
+                tokio::spawn(async move {
+                    match crate::net::register(&base_url, &username, &password).await {
+                        Ok(account) => match db.save_account(&account).await {
+                            Ok(()) => {
+                                let _ = tx.send(Action::StopCapture);
+                                let _ = tx.send(Action::CloseModal);
+                                let _ = tx.send(Action::SetMode(Mode::Home));
                             }
-                            .await;
-                            match attempt {
-                                Ok(keys) => {
-                                    let _ = tx.send(Action::Keys(keys));
-                                    let _ = tx.send(Action::SetMode(Mode::Home));
-                                }
-                                Err(e) => {
-                                    error!(?e, "device unlock failed; prompting for password");
-                                    let _ = tx
-                                        .send(Action::Error(format!("Device unlock failed: {e:#}")));
-                                    let _ = tx.send(Action::UnlockModal);
-                                }
+                            Err(e) => {
+                                let _ =
+                                    tx.send(Action::Error(format!("Could not save account: {e}")));
                             }
-                        });
-                    }
-                    Action::Register {
-                        ref username,
-                        ref password,
-                    } => {
-                        // Drive the networked OPAQUE registration off the UI loop;
-                        // results come back as actions (Error, or StopCapture+SetMode).
-                        let tx = self.action_tx.clone();
-                        let db = self.db.clone();
-                        let base_url = self.config.config.server_url.clone();
-                        let username = username.clone();
-                        let password = password.clone();
-                        tokio::spawn(async move {
-                            match crate::net::register(&base_url, &username, &password).await {
-                                Ok(account) => match db.save_account(&account).await {
-                                    Ok(()) => {
-                                        let _ = tx.send(Action::StopCapture);
-                                        let _ = tx.send(Action::CloseModal);
-                                        let _ = tx.send(Action::SetMode(Mode::Home));
-                                    }
-                                    Err(e) => {
-                                        let _ = tx.send(Action::Error(format!(
-                                            "Could not save account: {e}"
-                                        )));
-                                    }
-                                },
-                                Err(e) => {
-                                    let _ =
-                                        tx.send(Action::Error(format!("Registration failed: {e}")));
-                                }
-                            }
-                        });
-                    }
-                    Action::Login {
-                        ref username,
-                        ref password,
-                    } => {
-                        self.login(username.clone(), password.clone());
-                    }
-                    Action::Unlock { ref password } => {
-                        if let Some(account) = self.account.clone() {
-                            self.login(account.username.clone(), password.clone());
-                        } else {
-                            error!("Attempted to unlock without a local account");
-                            self.errorbar.show_error(
-                                "No local account found; please register or log in.".to_string(),
-                                Duration::from_secs(5),
-                            );
+                        },
+                        Err(e) => {
+                            let _ = tx.send(Action::Error(format!("Registration failed: {e}")));
                         }
                     }
-                    Action::Error(ref err) => {
-                        error!("Error action received: {err}");
-                        self.errorbar
-                            .show_error(err.clone(), Duration::from_secs(5));
-                    }
-                    Action::HelpModal => {
-                        // Build a help overlay for the *current* mode's bindings.
-                        // The modal itself stays mode-agnostic; we hand the body
-                        // the active mode so its cheatsheet is relevant.
-                        let mut modal = Modal::message("Help", Box::new(Help::new(self.mode)));
-                        modal.register_action_handler(self.action_tx.clone())?;
-                        modal.register_config_handler(self.config.clone())?;
-                        modal.init(tui.size()?)?;
-                        self.modal = Some(modal);
-                    }
-                    Action::AuthChooser => {
-                        // Shown when there is no local account: choose Login or
-                        // Register. This is the auth gate — nothing useful sits
-                        // behind it — so Esc/Cancel quits the app.
-                        let mut modal = Modal::new(
-                            "Welcome",
-                            Box::new(Prompt::new(
-                                "You're not signed in. Log in to an existing account, \
-                                 or register a new one.",
-                            )),
-                            vec![
-                                Button::new("Login", Action::LoginModal),
-                                Button::new("Register", Action::RegisterModal),
-                            ],
-                            Action::Quit,
-                        );
-                        modal.register_action_handler(self.action_tx.clone())?;
-                        modal.register_config_handler(self.config.clone())?;
-                        modal.init(tui.size()?)?;
-                        self.prev_mode = self.mode;
-                        self.mode = Mode::Home;
-                        self.refresh_keys()?;
-                        self.capturing = false;
-                        self.modal = Some(modal);
-                    }
-                    Action::RegisterModal => {
-                        // The registration form lives in a modal overlay with
-                        // Submit/Cancel buttons; Cancel (and Esc) returns to the
-                        // auth chooser. Track the matching mode so per-mode
-                        // keybindings (e.g. Ctrl-L to switch to login) resolve, then
-                        // StartCapture to focus the form's first field.
-                        let mut modal =
-                            Modal::form("Register", Box::new(Register::new()), Action::AuthChooser);
-                        modal.register_action_handler(self.action_tx.clone())?;
-                        modal.register_config_handler(self.config.clone())?;
-                        modal.init(tui.size()?)?;
-                        self.mode = Mode::Register;
-                        self.refresh_keys()?;
-                        self.modal = Some(modal);
-                        self.action_tx.send(Action::StartCapture)?;
-                    }
-                    Action::LoginModal => {
-                        // The login form lives in a modal overlay with Submit/Cancel
-                        // buttons; Cancel (and Esc) returns to the auth chooser.
-                        // Track the matching mode so per-mode keybindings (e.g.
-                        // Ctrl-R to switch to register) resolve, then StartCapture
-                        // to focus the form's first field.
-                        let mut modal =
-                            Modal::form("Login", Box::new(Login::new()), Action::AuthChooser);
-                        modal.register_action_handler(self.action_tx.clone())?;
-                        modal.register_config_handler(self.config.clone())?;
-                        modal.init(tui.size()?)?;
-                        self.mode = Mode::Login;
-                        self.refresh_keys()?;
-                        self.modal = Some(modal);
-                        self.action_tx.send(Action::StartCapture)?;
-                    }
-                    Action::CloseModal => {
-                        self.modal = None;
-                        self.capturing = false;
-                        self.handle_switch_mode(self.prev_mode, tui)?;
-                    }
-                    Action::OpenView { target, pane } => {
-                        if let Some(store) = self.store.as_ref()
-                            && let Err(e) = store.open_view(&self.view, target, pane).await
-                        {
-                            error!(?e, "failed to open view");
-                            self.errorbar
-                                .show_error(format!("Could not open list: {e:#}"), Duration::from_secs(5));
-                        }
-                    }
-                    Action::RefreshLists => {
-                        if let Some(store) = self.store.as_ref()
-                            && let Err(e) = store.refresh_view(&self.view).await
-                        {
-                            error!(?e, "failed to refresh lists");
-                        }
-                    }
-                    Action::NewListModal => {
-                        self.open_form_modal("New List", Box::new(ListForm::create()), tui)?;
-                    }
-                    Action::RenameListModal { list_id, ref name } => {
-                        self.open_form_modal(
-                            "Rename List",
-                            Box::new(ListForm::rename(list_id, name)),
-                            tui,
-                        )?;
-                    }
-                    Action::AddTodoModal(list_id) => {
-                        self.open_form_modal("Add Todo", Box::new(TodoForm::add(list_id)), tui)?;
-                    }
-                    Action::EditTodoModal {
-                        list_id,
-                        ref item_id,
-                    } => {
-                        let item = match self.store.as_mut() {
-                            Some(store) => store.full_item(list_id, item_id).await?,
-                            None => None,
-                        };
-                        if let Some(item) = item {
-                            self.open_form_modal(
-                                "Edit Todo",
-                                Box::new(TodoForm::edit(list_id, &item)),
-                                tui,
-                            )?;
-                        }
-                    }
-                    Action::CreateList { ref name } => {
-                        if let Some(store) = self.store.as_mut()
-                            && let Err(e) = store.create_list(name).await
-                        {
-                            self.errorbar.show_error(
-                                format!("Could not create list: {e:#}"),
-                                Duration::from_secs(5),
-                            );
-                        }
-                        self.refresh_view().await;
-                        self.action_tx.send(Action::CloseModal)?;
-                    }
-                    Action::RenameList { list_id, ref name } => {
-                        if let Some(store) = self.store.as_mut()
-                            && let Err(e) = store.rename_list(list_id, name).await
-                        {
-                            self.errorbar.show_error(
-                                format!("Could not rename list: {e:#}"),
-                                Duration::from_secs(5),
-                            );
-                        }
-                        self.refresh_view().await;
-                        self.action_tx.send(Action::CloseModal)?;
-                    }
-                    Action::SaveTodo {
-                        list_id,
-                        ref item_id,
-                        ref input,
-                    } => {
-                        if let Some(store) = self.store.as_mut() {
-                            let res = match item_id {
-                                Some(id) => store.edit_todo(list_id, id, input).await,
-                                None => store.add_todo(list_id, input).await.map(|_| ()),
-                            };
-                            if let Err(e) = res {
-                                self.errorbar.show_error(
-                                    format!("Could not save todo: {e:#}"),
-                                    Duration::from_secs(5),
-                                );
-                            }
-                        }
-                        self.refresh_view().await;
-                        self.action_tx.send(Action::CloseModal)?;
-                    }
-                    Action::ToggleDone {
-                        list_id,
-                        ref item_id,
-                    } => {
-                        if let Some(store) = self.store.as_mut()
-                            && let Err(e) = store.toggle_done(list_id, item_id).await
-                        {
-                            error!(?e, "toggle failed");
-                        }
-                        self.refresh_view().await;
-                    }
-                    Action::ConfirmDelete(ref target) => {
-                        let (msg, del) = match target.clone() {
-                            DeleteTarget::List(id) => (
-                                "Delete this list and all of its todos? This cannot be undone."
-                                    .to_string(),
-                                Action::DeleteList(id),
-                            ),
-                            DeleteTarget::Todo { list_id, item_id } => (
-                                "Delete this todo?".to_string(),
-                                Action::DeleteTodo { list_id, item_id },
-                            ),
-                        };
-                        let mut modal = Modal::new(
-                            "Confirm Delete",
-                            Box::new(Prompt::new(msg)),
-                            vec![
-                                Button::new("Delete", del),
-                                Button::new("Cancel", Action::CloseModal),
-                            ],
-                            Action::CloseModal,
-                        );
-                        modal.register_action_handler(self.action_tx.clone())?;
-                        modal.register_config_handler(self.config.clone())?;
-                        modal.init(tui.size()?)?;
-                        self.modal = Some(modal);
-                    }
-                    Action::DeleteList(list_id) => {
-                        if let Some(store) = self.store.as_mut()
-                            && let Err(e) = store.delete_list(list_id).await
-                        {
-                            error!(?e, "delete list failed");
-                        }
-                        // Any pane showing the deleted list falls back to All Tasks.
-                        {
-                            let deleted = crate::model::ViewTarget::List(list_id);
-                            let fallback =
-                                crate::model::ViewTarget::Meta(crate::model::MetaList::AllTasks);
-                            let mut v = self.view.borrow_mut();
-                            for pane in &mut v.panes {
-                                if pane.target == Some(deleted) {
-                                    pane.target = Some(fallback);
-                                }
-                            }
-                        }
-                        self.refresh_view().await;
-                        self.action_tx.send(Action::CloseModal)?;
-                    }
-                    Action::DeleteTodo {
-                        list_id,
-                        ref item_id,
-                    } => {
-                        if let Some(store) = self.store.as_mut()
-                            && let Err(e) = store.delete_todo(list_id, item_id).await
-                        {
-                            error!(?e, "delete todo failed");
-                        }
-                        self.refresh_view().await;
-                        self.action_tx.send(Action::CloseModal)?;
-                    }
-                    Action::ShareModal(list_id) => {
-                        self.open_form_modal("Share List", Box::new(ShareForm::new(list_id)), tui)?;
-                    }
-                    Action::ShareList {
-                        list_id,
-                        ref username,
-                    } => {
-                        // Resolving a username to keys is the one networked step;
-                        // run it off the loop and feed the member back as an action.
-                        let tx = self.action_tx.clone();
-                        let base_url = self.config.config.server_url.clone();
-                        let token = self
-                            .store
-                            .as_ref()
-                            .map(|s| s.session().token().to_string())
-                            .unwrap_or_default();
-                        let username = username.clone();
-                        tokio::spawn(async move {
-                            match crate::net::lookup_pubkeys(&base_url, &token, &username).await {
-                                Ok(dto) => match resolved_member(dto) {
-                                    Ok(member) => {
-                                        let _ = tx
-                                            .send(Action::AddResolvedMember { list_id, member });
-                                    }
-                                    Err(e) => {
-                                        let _ = tx.send(Action::Error(format!(
-                                            "Invalid keys for user: {e}"
-                                        )));
-                                    }
-                                },
-                                Err(e) => {
-                                    let _ = tx.send(Action::Error(format!("Share failed: {e:#}")));
-                                }
-                            }
-                        });
-                    }
-                    Action::AddResolvedMember { list_id, ref member } => {
-                        if let Some(store) = self.store.as_mut()
-                            && let Err(e) = store.add_member_local(list_id, member.clone()).await
-                        {
-                            self.errorbar.show_error(
-                                format!("Could not add member: {e:#}"),
-                                Duration::from_secs(5),
-                            );
-                        }
-                        self.refresh_view().await;
-                        self.action_tx.send(Action::CloseModal)?;
-                    }
-                    Action::MembersModal(list_id) => {
-                        let members = match self.store.as_ref() {
-                            Some(store) => store.members(list_id).await.unwrap_or_default(),
-                            None => Vec::new(),
-                        };
-                        let me = self
-                            .store
-                            .as_ref()
-                            .map(|s| s.session().member_id())
-                            .unwrap_or_default();
-                        let mut modal = Modal::message(
-                            "Members",
-                            Box::new(Members::new(list_id, members, me)),
-                        );
-                        modal.register_action_handler(self.action_tx.clone())?;
-                        modal.register_config_handler(self.config.clone())?;
-                        modal.init(tui.size()?)?;
-                        self.modal = Some(modal);
-                    }
-                    Action::Unshare { list_id, member_id } => {
-                        if let Some(store) = self.store.as_mut()
-                            && let Err(e) = store.remove_member_local(list_id, member_id).await
-                        {
-                            self.errorbar.show_error(
-                                format!("Could not remove member: {e:#}"),
-                                Duration::from_secs(5),
-                            );
-                        }
-                        self.refresh_view().await;
-                        self.action_tx.send(Action::CloseModal)?;
-                    }
-                    Action::CycleSort => {
-                        {
-                            let mut v = self.view.borrow_mut();
-                            v.sort = v.sort.next();
-                        }
-                        self.refresh_view().await;
-                    }
-                }
-                // Forward the action to the modal while it is open, otherwise to
-                // the active mode component — never both, so the background mode
-                // stays inert behind the overlay.
-                if let Some(modal) = self.modal.as_mut() {
-                    if let Some(action) = modal.update(action.clone())? {
-                        self.action_tx.send(action)?
-                    };
+                });
+            }
+            Action::Login {
+                ref username,
+                ref password,
+            } => {
+                self.login(username.clone(), password.clone());
+            }
+            Action::Unlock { ref password } => {
+                if let Some(account) = self.account.clone() {
+                    self.login(account.username.clone(), password.clone());
                 } else {
-                    let component = if let Some(comp) = self.modes.get_mut(&self.mode) {
-                        comp
-                    } else if let Some(comp) = self.modes.get_mut(&self.prev_mode) {
-                        comp
-                    } else {
-                        self.modes.get_mut(&Mode::default()).unwrap()
-                    };
-                    if let Some(action) = component.update(action.clone())? {
-                        self.action_tx.send(action)?
-                    };
+                    error!("Attempted to unlock without a local account");
+                    self.errorbar.show_error(
+                        "No local account found; please register or log in.".to_string(),
+                        Duration::from_secs(5),
+                    );
                 }
             }
-            Err(mpsc::error::TryRecvError::Empty) => {}
-            Err(mpsc::error::TryRecvError::Disconnected) => {
-                // If the sender has been dropped, we can choose to quit the app or handle it as needed.
-                self.should_quit = true;
+            Action::Error(ref err) => {
+                error!("Error action received: {err}");
+                self.errorbar
+                    .show_error(err.clone(), Duration::from_secs(5));
             }
+            Action::HelpModal => {
+                // Build a help overlay for the *current* mode's bindings.
+                // The modal itself stays mode-agnostic; we hand the body
+                // the active mode so its cheatsheet is relevant.
+                let mut modal = Modal::message("Help", Box::new(Help::new(self.mode)));
+                modal.register_action_handler(self.action_tx.clone())?;
+                modal.register_config_handler(self.config.clone())?;
+                modal.init(tui.size()?)?;
+                self.modal = Some(modal);
+            }
+            Action::AuthChooser => {
+                // Shown when there is no local account: choose Login or
+                // Register. This is the auth gate — nothing useful sits
+                // behind it — so Esc/Cancel quits the app.
+                let mut modal = Modal::new(
+                    "Welcome",
+                    Box::new(Prompt::new(
+                        "You're not signed in. Log in to an existing account, \
+                                 or register a new one.",
+                    )),
+                    vec![
+                        Button::new("Login", Action::LoginModal),
+                        Button::new("Register", Action::RegisterModal),
+                    ],
+                    Action::Quit,
+                );
+                modal.register_action_handler(self.action_tx.clone())?;
+                modal.register_config_handler(self.config.clone())?;
+                modal.init(tui.size()?)?;
+                self.prev_mode = self.mode;
+                self.mode = Mode::Home;
+                self.refresh_keys()?;
+                self.capturing = false;
+                self.modal = Some(modal);
+            }
+            Action::RegisterModal => {
+                // The registration form lives in a modal overlay with
+                // Submit/Cancel buttons; Cancel (and Esc) returns to the
+                // auth chooser. Track the matching mode so per-mode
+                // keybindings (e.g. Ctrl-L to switch to login) resolve, then
+                // StartCapture to focus the form's first field.
+                let mut modal =
+                    Modal::form("Register", Box::new(Register::new()), Action::AuthChooser);
+                modal.register_action_handler(self.action_tx.clone())?;
+                modal.register_config_handler(self.config.clone())?;
+                modal.init(tui.size()?)?;
+                self.mode = Mode::Register;
+                self.refresh_keys()?;
+                self.modal = Some(modal);
+                self.action_tx.send(Action::StartCapture)?;
+            }
+            Action::LoginModal => {
+                // The login form lives in a modal overlay with Submit/Cancel
+                // buttons; Cancel (and Esc) returns to the auth chooser.
+                // Track the matching mode so per-mode keybindings (e.g.
+                // Ctrl-R to switch to register) resolve, then StartCapture
+                // to focus the form's first field.
+                let mut modal = Modal::form("Login", Box::new(Login::new()), Action::AuthChooser);
+                modal.register_action_handler(self.action_tx.clone())?;
+                modal.register_config_handler(self.config.clone())?;
+                modal.init(tui.size()?)?;
+                self.mode = Mode::Login;
+                self.refresh_keys()?;
+                self.modal = Some(modal);
+                self.action_tx.send(Action::StartCapture)?;
+            }
+            Action::CloseModal => {
+                self.modal = None;
+                self.capturing = false;
+                self.handle_switch_mode(self.prev_mode, tui)?;
+            }
+            Action::OpenView { target, pane } => {
+                if let Some(store) = self.store.as_ref()
+                    && let Err(e) = store.open_view(&self.view, target, pane).await
+                {
+                    error!(?e, "failed to open view");
+                    self.errorbar.show_error(
+                        format!("Could not open list: {e:#}"),
+                        Duration::from_secs(5),
+                    );
+                }
+            }
+            Action::RefreshLists => {
+                if let Some(store) = self.store.as_ref()
+                    && let Err(e) = store.refresh_view(&self.view).await
+                {
+                    error!(?e, "failed to refresh lists");
+                }
+            }
+            Action::NewListModal => {
+                self.open_form_modal("New List", Box::new(ListForm::create()), tui)?;
+            }
+            Action::RenameListModal { list_id, ref name } => {
+                self.open_form_modal(
+                    "Rename List",
+                    Box::new(ListForm::rename(list_id, name)),
+                    tui,
+                )?;
+            }
+            Action::AddTodoModal(list_id) => {
+                self.open_form_modal("Add Todo", Box::new(TodoForm::add(list_id)), tui)?;
+            }
+            Action::EditTodoModal {
+                list_id,
+                ref item_id,
+            } => {
+                let item = match self.store.as_mut() {
+                    Some(store) => store.full_item(list_id, item_id).await?,
+                    None => None,
+                };
+                if let Some(item) = item {
+                    self.open_form_modal(
+                        "Edit Todo",
+                        Box::new(TodoForm::edit(list_id, &item)),
+                        tui,
+                    )?;
+                }
+            }
+            Action::CreateList { ref name } => {
+                if let Some(store) = self.store.as_mut()
+                    && let Err(e) = store.create_list(name).await
+                {
+                    self.errorbar.show_error(
+                        format!("Could not create list: {e:#}"),
+                        Duration::from_secs(5),
+                    );
+                }
+                self.refresh_view().await;
+                self.action_tx.send(Action::CloseModal)?;
+            }
+            Action::RenameList { list_id, ref name } => {
+                if let Some(store) = self.store.as_mut()
+                    && let Err(e) = store.rename_list(list_id, name).await
+                {
+                    self.errorbar.show_error(
+                        format!("Could not rename list: {e:#}"),
+                        Duration::from_secs(5),
+                    );
+                }
+                self.refresh_view().await;
+                self.action_tx.send(Action::CloseModal)?;
+            }
+            Action::SaveTodo {
+                list_id,
+                ref item_id,
+                ref input,
+            } => {
+                if let Some(store) = self.store.as_mut() {
+                    let res = match item_id {
+                        Some(id) => store.edit_todo(list_id, id, input).await,
+                        None => store.add_todo(list_id, input).await.map(|_| ()),
+                    };
+                    if let Err(e) = res {
+                        self.errorbar.show_error(
+                            format!("Could not save todo: {e:#}"),
+                            Duration::from_secs(5),
+                        );
+                    }
+                }
+                self.refresh_view().await;
+                self.action_tx.send(Action::CloseModal)?;
+            }
+            Action::ToggleDone {
+                list_id,
+                ref item_id,
+            } => {
+                if let Some(store) = self.store.as_mut()
+                    && let Err(e) = store.toggle_done(list_id, item_id).await
+                {
+                    error!(?e, "toggle failed");
+                }
+                self.refresh_view().await;
+            }
+            Action::ConfirmDelete(ref target) => {
+                let (msg, del) = match target.clone() {
+                    DeleteTarget::List(id) => (
+                        "Delete this list and all of its todos? This cannot be undone.".to_string(),
+                        Action::DeleteList(id),
+                    ),
+                    DeleteTarget::Todo { list_id, item_id } => (
+                        "Delete this todo?".to_string(),
+                        Action::DeleteTodo { list_id, item_id },
+                    ),
+                };
+                let mut modal = Modal::new(
+                    "Confirm Delete",
+                    Box::new(Prompt::new(msg)),
+                    vec![
+                        Button::new("Delete", del),
+                        Button::new("Cancel", Action::CloseModal),
+                    ],
+                    Action::CloseModal,
+                );
+                modal.register_action_handler(self.action_tx.clone())?;
+                modal.register_config_handler(self.config.clone())?;
+                modal.init(tui.size()?)?;
+                self.modal = Some(modal);
+            }
+            Action::DeleteList(list_id) => {
+                if let Some(store) = self.store.as_mut()
+                    && let Err(e) = store.delete_list(list_id).await
+                {
+                    error!(?e, "delete list failed");
+                }
+                // Any pane showing the deleted list falls back to All Tasks.
+                {
+                    let deleted = crate::model::ViewTarget::List(list_id);
+                    let fallback = crate::model::ViewTarget::Meta(crate::model::MetaList::AllTasks);
+                    let mut v = self.view.borrow_mut();
+                    for pane in &mut v.panes {
+                        if pane.target == Some(deleted) {
+                            pane.target = Some(fallback);
+                        }
+                    }
+                }
+                self.refresh_view().await;
+                self.action_tx.send(Action::CloseModal)?;
+            }
+            Action::DeleteTodo {
+                list_id,
+                ref item_id,
+            } => {
+                if let Some(store) = self.store.as_mut()
+                    && let Err(e) = store.delete_todo(list_id, item_id).await
+                {
+                    error!(?e, "delete todo failed");
+                }
+                self.refresh_view().await;
+                self.action_tx.send(Action::CloseModal)?;
+            }
+            Action::ShareModal(list_id) => {
+                self.open_form_modal("Share List", Box::new(ShareForm::new(list_id)), tui)?;
+            }
+            Action::ShareList {
+                list_id,
+                ref username,
+            } => {
+                // Resolving a username to keys is the one networked step;
+                // run it off the loop and feed the member back as an action.
+                let tx = self.action_tx.clone();
+                let base_url = self.config.config.server_url.clone();
+                let token = self
+                    .store
+                    .as_ref()
+                    .map(|s| s.session().token().to_string())
+                    .unwrap_or_default();
+                let username = username.clone();
+                tokio::spawn(async move {
+                    match crate::net::lookup_pubkeys(&base_url, &token, &username).await {
+                        Ok(dto) => match resolved_member(dto) {
+                            Ok(member) => {
+                                let _ = tx.send(Action::AddResolvedMember { list_id, member });
+                            }
+                            Err(e) => {
+                                let _ =
+                                    tx.send(Action::Error(format!("Invalid keys for user: {e}")));
+                            }
+                        },
+                        Err(e) => {
+                            let _ = tx.send(Action::Error(format!("Share failed: {e:#}")));
+                        }
+                    }
+                });
+            }
+            Action::AddResolvedMember {
+                list_id,
+                ref member,
+            } => {
+                if let Some(store) = self.store.as_mut()
+                    && let Err(e) = store.add_member_local(list_id, member.clone()).await
+                {
+                    self.errorbar.show_error(
+                        format!("Could not add member: {e:#}"),
+                        Duration::from_secs(5),
+                    );
+                }
+                self.refresh_view().await;
+                self.action_tx.send(Action::CloseModal)?;
+            }
+            Action::MembersModal(list_id) => {
+                let members = match self.store.as_ref() {
+                    Some(store) => store.members(list_id).await.unwrap_or_default(),
+                    None => Vec::new(),
+                };
+                let me = self
+                    .store
+                    .as_ref()
+                    .map(|s| s.session().member_id())
+                    .unwrap_or_default();
+                let mut modal =
+                    Modal::message("Members", Box::new(Members::new(list_id, members, me)));
+                modal.register_action_handler(self.action_tx.clone())?;
+                modal.register_config_handler(self.config.clone())?;
+                modal.init(tui.size()?)?;
+                self.modal = Some(modal);
+            }
+            Action::Unshare { list_id, member_id } => {
+                if let Some(store) = self.store.as_mut()
+                    && let Err(e) = store.remove_member_local(list_id, member_id).await
+                {
+                    self.errorbar.show_error(
+                        format!("Could not remove member: {e:#}"),
+                        Duration::from_secs(5),
+                    );
+                }
+                self.refresh_view().await;
+                self.action_tx.send(Action::CloseModal)?;
+            }
+            Action::CycleSort => {
+                {
+                    let mut v = self.view.borrow_mut();
+                    v.sort = v.sort.next();
+                }
+                self.refresh_view().await;
+            }
+        }
+        // Forward the action to the modal while it is open, otherwise to
+        // the active mode component — never both, so the background mode
+        // stays inert behind the overlay.
+        if let Some(modal) = self.modal.as_mut() {
+            if let Some(action) = modal.update(action.clone())? {
+                self.action_tx.send(action)?
+            };
+        } else {
+            let component = if let Some(comp) = self.modes.get_mut(&self.mode) {
+                comp
+            } else if let Some(comp) = self.modes.get_mut(&self.prev_mode) {
+                comp
+            } else {
+                self.modes.get_mut(&Mode::default()).unwrap()
+            };
+            if let Some(action) = component.update(action.clone())? {
+                self.action_tx.send(action)?
+            };
         }
         Ok(())
     }
@@ -1087,8 +1097,19 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::is_global_chord;
+    use super::{drain, is_global_chord};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    /// `handle_actions` relies on `drain` pulling the *entire* backlog in one pass
+    /// (the RC2 fix); a single `try_recv` would leave later actions queued.
+    #[test]
+    fn drain_collects_everything_queued() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(1).unwrap();
+        tx.send(2).unwrap();
+        tx.send(3).unwrap();
+        assert_eq!(drain(&mut rx), vec![1, 2, 3]);
+    }
 
     fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, mods)
