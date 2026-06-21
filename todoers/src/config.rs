@@ -611,7 +611,10 @@ mod tests {
                 .unwrap()
                 .get(&parse_key_sequence("q").unwrap_or_default())
                 .unwrap(),
-            &ActionConfig::NoShow(Action::Quit)
+            &ActionConfig::Show {
+                action: Action::Quit,
+                show: true
+            }
         );
         Ok(())
     }
