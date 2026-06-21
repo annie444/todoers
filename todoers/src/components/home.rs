@@ -500,8 +500,7 @@ impl Component for Home {
     fn draw(&mut self, frame: &mut Frame, area: Rect) -> anyhow::Result<()> {
         if self.sidebar_visible {
             let [sidebar, panes] =
-                Layout::horizontal([Constraint::Percentage(18), Constraint::Percentage(82)])
-                    .areas(area);
+                Layout::horizontal([Constraint::Length(30), Constraint::Fill(1)]).areas(area);
             self.draw_sidebar(frame, sidebar);
             self.draw_panes(frame, panes);
         } else {
