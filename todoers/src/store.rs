@@ -99,10 +99,6 @@ impl Store {
         }
     }
 
-    pub fn session(&self) -> &Session {
-        &self.session
-    }
-
     pub fn session_mut(&mut self) -> &mut Session {
         &mut self.session
     }
@@ -310,36 +306,9 @@ impl Store {
 
     // ── view-model refresh ─────────────────────────────────────────────────────
 
-    /// Reload the sidebar summaries and every open pane's items into the shared
-    /// [`ViewModel`].
-    #[tracing::instrument(skip(self, view))]
-    pub async fn refresh_view(&self, view: &SharedView) -> anyhow::Result<()> {
-        // Snapshot inputs without holding the borrow across an await.
-        let (targets, sort) = {
-            let v = view.borrow();
-            (v.panes.iter().map(|p| p.target).collect::<Vec<_>>(), v.sort)
-        };
-        let mut summaries = self.list_summaries().await?;
-        sort_summaries(&mut summaries, sort);
-        let mut loaded = Vec::with_capacity(targets.len());
-        for t in &targets {
-            loaded.push(match t {
-                Some(target) => self.load_view(*target, sort).await?,
-                None => Vec::new(),
-            });
-        }
-        let mut v = view.borrow_mut();
-        v.lists = summaries;
-        for (pane, items) in v.panes.iter_mut().zip(loaded) {
-            pane.items = items;
-        }
-        Ok(())
-    }
-
     /// Compute a [`ViewSnapshot`](crate::store_worker::ViewSnapshot) for the given
-    /// pane targets + sort. Unlike [`refresh_view`](Self::refresh_view) this returns
-    /// plain `Send` data instead of mutating a `SharedView`, so the off-loop
-    /// store-worker can hand results back to the UI task.
+    /// pane targets + sort. Returns plain `Send` data the off-loop store-worker
+    /// hands back to the UI task to install into its `SharedView`.
     pub async fn snapshot_for(
         &self,
         targets: &[Option<ViewTarget>],
@@ -355,20 +324,6 @@ impl Store {
             });
         }
         Ok(crate::store_worker::ViewSnapshot { lists, panes })
-    }
-
-    /// Point a pane at a new view target and reload its items.
-    #[tracing::instrument(skip(self, view))]
-    pub async fn open_view(
-        &self,
-        view: &SharedView,
-        target: ViewTarget,
-        pane: usize,
-    ) -> anyhow::Result<()> {
-        if let Some(p) = view.borrow_mut().panes.get_mut(pane) {
-            p.target = Some(target);
-        }
-        self.refresh_view(view).await
     }
 
     // ── reads ─────────────────────────────────────────────────────────────────

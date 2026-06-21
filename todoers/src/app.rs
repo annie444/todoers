@@ -23,6 +23,7 @@ use crate::config::Config;
 use crate::db::Db;
 use crate::session::Session;
 use crate::store::{SharedView, Store, ViewModel};
+use crate::store_worker::{CommandTx, StoreCommand, WorkerMsg, WorkerRx, run_store_worker};
 use crate::tui::{Event, Tui};
 
 pub struct App {
@@ -52,8 +53,20 @@ pub struct App {
     /// Ensures the password-less device-unlock path is attempted at most once per
     /// run (otherwise every tick would re-spawn the unlock task).
     device_unlock_attempted: bool,
-    /// The list/todo data layer, built once keys are unlocked.
-    store: Option<Store>,
+    /// Channel to the off-loop store-worker task, built once keys are unlocked.
+    /// The worker owns the [`Store`] (and thus the secret keys + Loro docs); the
+    /// UI sends [`StoreCommand`]s and never touches db/crypto/Loro inline.
+    cmd_tx: Option<CommandTx>,
+    /// Replies from the worker (chiefly [`ViewSnapshot`](crate::store_worker::ViewSnapshot)s).
+    worker_rx: Option<WorkerRx>,
+    /// Stashed while waiting on the worker so the modal can be opened on the next
+    /// `dispatch_action` pass (which has `tui`). See [`Self::handle_worker_msg`].
+    pending_edit: Option<(todoers_types::ListId, crate::model::TodoItem)>,
+    pending_members: Option<(
+        todoers_types::ListId,
+        Vec<todoers_types::Member>,
+        todoers_types::MemberId,
+    )>,
     /// Render-side snapshot shared with the workspace component.
     view: SharedView,
 }
@@ -113,6 +126,15 @@ fn drain<T>(rx: &mut mpsc::UnboundedReceiver<T>) -> Vec<T> {
     out
 }
 
+/// Receive from the worker channel when one exists. Before login (`None`) this
+/// future never resolves, so the `select!` falls through to terminal events.
+async fn recv_opt(rx: &mut Option<WorkerRx>) -> Option<WorkerMsg> {
+    match rx {
+        Some(r) => r.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Convert a `users/{username}/pubkeys` response into a [`Member`] to seal a list
 /// DEK to. Rejects keys of the wrong length rather than panicking.
 fn resolved_member(dto: todoers_types::UserPubkeysDto) -> anyhow::Result<todoers_types::Member> {
@@ -167,7 +189,10 @@ impl App {
             errorbar: ErrorBar::new(),
             account_verified: false,
             device_unlock_attempted: false,
-            store: None,
+            cmd_tx: None,
+            worker_rx: None,
+            pending_edit: None,
+            pending_members: None,
             view,
         })
     }
@@ -178,7 +203,7 @@ impl App {
     /// if keys aren't available yet.
     #[tracing::instrument(skip(self))]
     async fn init_session(&mut self) -> anyhow::Result<()> {
-        if self.store.is_some() {
+        if self.cmd_tx.is_some() {
             return Ok(());
         }
         let Some(keys) = self.acct_keys.as_ref() else {
@@ -187,9 +212,45 @@ impl App {
         let mut session = Session::new(keys);
         session.rehydrate(&self.db).await?;
         let store = Store::new(self.db.clone(), session);
-        store.refresh_view(&self.view).await?;
-        self.store = Some(store);
+
+        // The store owns `Send` state (keys + Loro docs), so it can run on its
+        // own task; the UI talks to it only over channels and never blocks.
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (out_tx, out_rx) = mpsc::unbounded_channel();
+        tokio::spawn(run_store_worker(store, cmd_rx, out_tx));
+        self.cmd_tx = Some(cmd_tx);
+        self.worker_rx = Some(out_rx);
+
+        // Prime the worker with the initial pane targets + sort from the view-model.
+        self.send_set_view();
         Ok(())
+    }
+
+    /// Tell the worker which targets/sort to render. Call after any layout/sort
+    /// change so it recomputes and snapshots back.
+    fn send_set_view(&self) {
+        if let Some(tx) = &self.cmd_tx {
+            let v = self.view.borrow();
+            let targets = v.panes.iter().map(|p| p.target).collect();
+            let _ = tx.send(StoreCommand::SetView { targets, sort: v.sort });
+        }
+    }
+
+    /// Send a command to the worker (no-op before login).
+    fn store_cmd(&self, cmd: StoreCommand) {
+        if let Some(tx) = &self.cmd_tx {
+            let _ = tx.send(cmd);
+        }
+    }
+
+    /// The current member id ("me"), derived from the account/keys since the
+    /// worker now owns the session.
+    fn session_member_id(&self) -> todoers_types::MemberId {
+        self.account
+            .as_ref()
+            .map(|a| a.member_id)
+            .or_else(|| self.acct_keys.as_ref().map(|k| k.member_id))
+            .unwrap_or_default()
     }
 
     #[tracing::instrument(skip(self))]
@@ -213,8 +274,20 @@ impl App {
 
         let action_tx = self.action_tx.clone();
         loop {
-            self.handle_events(&mut tui).await?;
-            self.handle_actions(&mut tui).await?;
+            // Drive the UI from two sources at once: terminal events and replies
+            // from the store-worker. Neither blocks the other, so a long store
+            // mutation can't freeze input/render.
+            tokio::select! {
+                maybe_event = tui.next_event() => {
+                    if let Some(event) = maybe_event {
+                        self.on_event(event).await?;
+                    }
+                }
+                Some(msg) = recv_opt(&mut self.worker_rx) => {
+                    self.handle_worker_msg(msg)?;
+                }
+            }
+            self.handle_actions(&mut tui)?;
             if self.should_suspend {
                 tui.suspend()?;
                 action_tx.send(Action::Resume)?;
@@ -229,11 +302,8 @@ impl App {
         Ok(())
     }
 
-    #[tracing::instrument(skip(self, tui))]
-    async fn handle_events(&mut self, tui: &mut Tui) -> anyhow::Result<()> {
-        let Some(event) = tui.next_event().await else {
-            return Ok(());
-        };
+    #[tracing::instrument(skip(self))]
+    async fn on_event(&mut self, event: Event) -> anyhow::Result<()> {
         let action_tx = self.action_tx.clone();
         match event {
             Event::Quit => action_tx.send(Action::Quit)?,
@@ -354,7 +424,7 @@ impl App {
     }
 
     #[tracing::instrument(skip(self, tui))]
-    async fn handle_actions(&mut self, tui: &mut Tui) -> anyhow::Result<()> {
+    fn handle_actions(&mut self, tui: &mut Tui) -> anyhow::Result<()> {
         let mut should_render = false;
         for action in drain(&mut self.action_rx) {
             // Coalesce renders: note the request and draw once after draining the
@@ -363,7 +433,7 @@ impl App {
                 should_render = true;
                 continue;
             }
-            self.dispatch_action(action, tui).await?;
+            self.dispatch_action(action, tui)?;
         }
         if should_render {
             self.render(tui)?;
@@ -371,7 +441,43 @@ impl App {
         Ok(())
     }
 
-    async fn dispatch_action(&mut self, action: Action, tui: &mut Tui) -> anyhow::Result<()> {
+    /// Install a worker reply. Snapshots refresh the view-model and request a
+    /// render; request/reply messages stash data and emit a "ready" action so
+    /// `dispatch_action` (which has `tui`) can open the modal next pass.
+    fn handle_worker_msg(&mut self, msg: WorkerMsg) -> anyhow::Result<()> {
+        match msg {
+            WorkerMsg::Snapshot(snap) => {
+                let mut v = self.view.borrow_mut();
+                v.lists = snap.lists;
+                // Install items per pane by index; keep UI layout (split/ratio)
+                // intact. `zip` truncates, so a stale snapshot can only
+                // under-fill, never panic.
+                for (pane, items) in v.panes.iter_mut().zip(snap.panes.into_iter()) {
+                    pane.items = items;
+                }
+                drop(v);
+                self.action_tx.send(Action::Render)?;
+            }
+            WorkerMsg::FullItem(boxed) => {
+                if let Some((list_id, item)) = *boxed {
+                    self.pending_edit = Some((list_id, item));
+                    self.action_tx.send(Action::OpenEditReady)?;
+                }
+            }
+            WorkerMsg::Members(boxed) => {
+                let (list_id, members) = *boxed;
+                let me = self.session_member_id();
+                self.pending_members = Some((list_id, members, me));
+                self.action_tx.send(Action::OpenMembersReady)?;
+            }
+            WorkerMsg::Error(e) => {
+                self.errorbar.show_error(e, Duration::from_secs(5));
+            }
+        }
+        Ok(())
+    }
+
+    fn dispatch_action(&mut self, action: Action, tui: &mut Tui) -> anyhow::Result<()> {
         // Never debug-print `Register` verbatim: it carries the password.
         if !matches!(
             action,
@@ -583,23 +689,13 @@ impl App {
                 self.handle_switch_mode(self.prev_mode, tui)?;
             }
             Action::OpenView { target, pane } => {
-                if let Some(store) = self.store.as_ref()
-                    && let Err(e) = store.open_view(&self.view, target, pane).await
-                {
-                    error!(?e, "failed to open view");
-                    self.errorbar.show_error(
-                        format!("Could not open list: {e:#}"),
-                        Duration::from_secs(5),
-                    );
+                if let Some(p) = self.view.borrow_mut().panes.get_mut(pane) {
+                    p.target = Some(target);
                 }
+                // Worker recomputes that pane and snapshots back.
+                self.send_set_view();
             }
-            Action::RefreshLists => {
-                if let Some(store) = self.store.as_ref()
-                    && let Err(e) = store.refresh_view(&self.view).await
-                {
-                    error!(?e, "failed to refresh lists");
-                }
-            }
+            Action::RefreshLists => self.send_set_view(),
             Action::NewListModal => {
                 self.open_form_modal("New List", Box::new(ListForm::create()), tui)?;
             }
@@ -617,40 +713,22 @@ impl App {
                 list_id,
                 ref item_id,
             } => {
-                let item = match self.store.as_mut() {
-                    Some(store) => store.full_item(list_id, item_id).await?,
-                    None => None,
-                };
-                if let Some(item) = item {
-                    self.open_form_modal(
-                        "Edit Todo",
-                        Box::new(TodoForm::edit(list_id, &item)),
-                        tui,
-                    )?;
-                }
+                // The worker fetches the full item (with subtasks); the modal
+                // opens when `WorkerMsg::FullItem` arrives → `Action::OpenEditReady`.
+                self.store_cmd(StoreCommand::FetchFullItem {
+                    list_id,
+                    item_id: item_id.clone(),
+                });
             }
             Action::CreateList { ref name } => {
-                if let Some(store) = self.store.as_mut()
-                    && let Err(e) = store.create_list(name).await
-                {
-                    self.errorbar.show_error(
-                        format!("Could not create list: {e:#}"),
-                        Duration::from_secs(5),
-                    );
-                }
-                self.refresh_view().await;
+                self.store_cmd(StoreCommand::CreateList { name: name.clone() });
                 self.action_tx.send(Action::CloseModal)?;
             }
             Action::RenameList { list_id, ref name } => {
-                if let Some(store) = self.store.as_mut()
-                    && let Err(e) = store.rename_list(list_id, name).await
-                {
-                    self.errorbar.show_error(
-                        format!("Could not rename list: {e:#}"),
-                        Duration::from_secs(5),
-                    );
-                }
-                self.refresh_view().await;
+                self.store_cmd(StoreCommand::RenameList {
+                    list_id,
+                    name: name.clone(),
+                });
                 self.action_tx.send(Action::CloseModal)?;
             }
             Action::SaveTodo {
@@ -658,31 +736,27 @@ impl App {
                 ref item_id,
                 ref input,
             } => {
-                if let Some(store) = self.store.as_mut() {
-                    let res = match item_id {
-                        Some(id) => store.edit_todo(list_id, id, input).await,
-                        None => store.add_todo(list_id, input).await.map(|_| ()),
-                    };
-                    if let Err(e) = res {
-                        self.errorbar.show_error(
-                            format!("Could not save todo: {e:#}"),
-                            Duration::from_secs(5),
-                        );
-                    }
+                match item_id {
+                    Some(id) => self.store_cmd(StoreCommand::EditTodo {
+                        list_id,
+                        item_id: id.clone(),
+                        input: input.clone(),
+                    }),
+                    None => self.store_cmd(StoreCommand::AddTodo {
+                        list_id,
+                        input: input.clone(),
+                    }),
                 }
-                self.refresh_view().await;
                 self.action_tx.send(Action::CloseModal)?;
             }
             Action::ToggleDone {
                 list_id,
                 ref item_id,
             } => {
-                if let Some(store) = self.store.as_mut()
-                    && let Err(e) = store.toggle_done(list_id, item_id).await
-                {
-                    error!(?e, "toggle failed");
-                }
-                self.refresh_view().await;
+                self.store_cmd(StoreCommand::ToggleDone {
+                    list_id,
+                    item_id: item_id.clone(),
+                });
             }
             Action::ConfirmDelete(ref target) => {
                 let (msg, del) = match target.clone() {
@@ -710,12 +784,8 @@ impl App {
                 self.modal = Some(modal);
             }
             Action::DeleteList(list_id) => {
-                if let Some(store) = self.store.as_mut()
-                    && let Err(e) = store.delete_list(list_id).await
-                {
-                    error!(?e, "delete list failed");
-                }
-                // Any pane showing the deleted list falls back to All Tasks.
+                self.store_cmd(StoreCommand::DeleteList(list_id));
+                // Mirror the worker's fallback locally so the pane target matches.
                 {
                     let deleted = crate::model::ViewTarget::List(list_id);
                     let fallback = crate::model::ViewTarget::Meta(crate::model::MetaList::AllTasks);
@@ -726,19 +796,17 @@ impl App {
                         }
                     }
                 }
-                self.refresh_view().await;
+                self.send_set_view();
                 self.action_tx.send(Action::CloseModal)?;
             }
             Action::DeleteTodo {
                 list_id,
                 ref item_id,
             } => {
-                if let Some(store) = self.store.as_mut()
-                    && let Err(e) = store.delete_todo(list_id, item_id).await
-                {
-                    error!(?e, "delete todo failed");
-                }
-                self.refresh_view().await;
+                self.store_cmd(StoreCommand::DeleteTodo {
+                    list_id,
+                    item_id: item_id.clone(),
+                });
                 self.action_tx.send(Action::CloseModal)?;
             }
             Action::ShareModal(list_id) => {
@@ -752,10 +820,12 @@ impl App {
                 // run it off the loop and feed the member back as an action.
                 let tx = self.action_tx.clone();
                 let base_url = self.config.config.server_url.clone();
+                // The worker owns the session now; the bearer token also lives in
+                // the unlocked account keys.
                 let token = self
-                    .store
+                    .acct_keys
                     .as_ref()
-                    .map(|s| s.session().token().to_string())
+                    .map(|k| k.token.clone())
                     .unwrap_or_default();
                 let username = username.clone();
                 tokio::spawn(async move {
@@ -779,44 +849,19 @@ impl App {
                 list_id,
                 ref member,
             } => {
-                if let Some(store) = self.store.as_mut()
-                    && let Err(e) = store.add_member_local(list_id, member.clone()).await
-                {
-                    self.errorbar.show_error(
-                        format!("Could not add member: {e:#}"),
-                        Duration::from_secs(5),
-                    );
-                }
-                self.refresh_view().await;
+                self.store_cmd(StoreCommand::AddMember {
+                    list_id,
+                    member: member.clone(),
+                });
                 self.action_tx.send(Action::CloseModal)?;
             }
             Action::MembersModal(list_id) => {
-                let members = match self.store.as_ref() {
-                    Some(store) => store.members(list_id).await.unwrap_or_default(),
-                    None => Vec::new(),
-                };
-                let me = self
-                    .store
-                    .as_ref()
-                    .map(|s| s.session().member_id())
-                    .unwrap_or_default();
-                let mut modal =
-                    Modal::message("Members", Box::new(Members::new(list_id, members, me)));
-                modal.register_action_handler(self.action_tx.clone())?;
-                modal.register_config_handler(self.config.clone())?;
-                modal.init(tui.size()?)?;
-                self.modal = Some(modal);
+                // The worker fetches members; the modal opens on
+                // `WorkerMsg::Members` → `Action::OpenMembersReady`.
+                self.store_cmd(StoreCommand::FetchMembers(list_id));
             }
             Action::Unshare { list_id, member_id } => {
-                if let Some(store) = self.store.as_mut()
-                    && let Err(e) = store.remove_member_local(list_id, member_id).await
-                {
-                    self.errorbar.show_error(
-                        format!("Could not remove member: {e:#}"),
-                        Duration::from_secs(5),
-                    );
-                }
-                self.refresh_view().await;
+                self.store_cmd(StoreCommand::RemoveMember { list_id, member_id });
                 self.action_tx.send(Action::CloseModal)?;
             }
             Action::CycleSort => {
@@ -824,7 +869,26 @@ impl App {
                     let mut v = self.view.borrow_mut();
                     v.sort = v.sort.next();
                 }
-                self.refresh_view().await;
+                self.send_set_view();
+            }
+            Action::OpenEditReady => {
+                if let Some((list_id, item)) = self.pending_edit.take() {
+                    self.open_form_modal(
+                        "Edit Todo",
+                        Box::new(TodoForm::edit(list_id, &item)),
+                        tui,
+                    )?;
+                }
+            }
+            Action::OpenMembersReady => {
+                if let Some((list_id, members, me)) = self.pending_members.take() {
+                    let mut modal =
+                        Modal::message("Members", Box::new(Members::new(list_id, members, me)));
+                    modal.register_action_handler(self.action_tx.clone())?;
+                    modal.register_config_handler(self.config.clone())?;
+                    modal.init(tui.size()?)?;
+                    self.modal = Some(modal);
+                }
             }
         }
         // Forward the action to the modal while it is open, otherwise to
@@ -863,15 +927,6 @@ impl App {
         self.modal = Some(modal);
         self.action_tx.send(Action::StartCapture)?;
         Ok(())
-    }
-
-    /// Reload the sidebar + current view after a store mutation.
-    async fn refresh_view(&mut self) {
-        if let Some(store) = self.store.as_ref()
-            && let Err(e) = store.refresh_view(&self.view).await
-        {
-            error!(?e, "failed to refresh view");
-        }
     }
 
     #[tracing::instrument(skip(self, tui))]

@@ -27,20 +27,39 @@ and unlocked `acct_keys`, the current `Mode`, a `HashMap<Mode, Box<dyn
 Component>>`, an optional `Modal` overlay, persistent chrome (`Keys` footer,
 `ErrorBar`), and an mpsc `Action` channel.
 
-The main loop in `App::run` is:
+The main loop in `App::run` is a `tokio::select!` over two sources — terminal
+events and replies from the store-worker — followed by draining the action queue:
 
 ```
-handle_events  →  handle_actions  →  render
+select! { Tui event → on_event ; worker WorkerMsg → handle_worker_msg }
+   →  handle_actions  →  render
 ```
 
-1. **`handle_events`** pulls the next `Event` from the `Tui` and turns it into
+1. **`on_event`** takes the `Event` the select produced and turns it into
    `Action`s on the channel. It also routes the raw event to either the open
    modal *or* the active mode component (never both), so the background stays
    inert behind an overlay.
-2. **`handle_actions`** drains the channel: `App` mutates global state for each
-   action, then forwards the action to the modal or active component's `update`.
-3. **`render`** draws the active mode in the body, then the modal on top, then the
+2. **`handle_worker_msg`** installs a store-worker reply: a `ViewSnapshot`
+   refreshes the shared `ViewModel` (and requests one `Render`); request/reply
+   messages (`FullItem`/`Members`) stash data and emit a "ready" action so the
+   modal opens on the next `handle_actions` pass (which has `tui`).
+3. **`handle_actions`** (synchronous) drains the whole channel each turn,
+   coalescing renders to at most one. For each action `App` mutates UI/global
+   state and forwards it to the modal or active component's `update`. **It never
+   blocks on the store** — mutations become `StoreCommand`s sent to the worker.
+4. **`render`** draws the active mode in the body, then the modal on top, then the
    error bar and keybinding footer.
+
+### Store-worker (`store_worker.rs`)
+
+All db/crypto/Loro work runs on a dedicated tokio task (actor pattern). The UI
+future is non-`Send` (`Rc<RefCell<ViewModel>>`, `Box<dyn Component>`), but the
+`Store` (which owns the session keys + `LoroDoc`s) is `Send`, so it moves to the
+worker. The UI sends `StoreCommand`s and receives `WorkerMsg`s — chiefly
+`ViewSnapshot`s of plain `Send` data it installs into the view-model. The worker
+remembers the current `(targets, sort)` and emits a fresh snapshot after every
+mutating command; the UI re-sends `SetView` whenever pane targets/sort/count
+change. This keeps input and render responsive *during* store mutations.
 
 ### The `Component` trait (`components/mod.rs`)
 

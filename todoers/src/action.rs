@@ -138,6 +138,13 @@ pub enum Action {
 
     /// Cycle the active sort mode (tasks in the pane + sidebar aggregates).
     CycleSort,
+
+    /// The store-worker returned a full item; open the edit modal from
+    /// `pending_edit`. Deferred so the modal opens where `tui` is available.
+    OpenEditReady,
+    /// The store-worker returned members; open the members modal from
+    /// `pending_members`.
+    OpenMembersReady,
 }
 
 impl std::fmt::Display for Action {
@@ -188,6 +195,8 @@ impl std::fmt::Display for Action {
             Action::MembersModal(_) => write!(f, "List members"),
             Action::Unshare { .. } => write!(f, "Unshare"),
             Action::CycleSort => write!(f, "Cycle sort"),
+            Action::OpenEditReady => write!(f, "Open edit (ready)"),
+            Action::OpenMembersReady => write!(f, "Open members (ready)"),
         }
     }
 }
