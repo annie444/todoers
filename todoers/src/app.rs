@@ -21,6 +21,7 @@ use crate::components::{
 };
 use crate::config::Config;
 use crate::db::Db;
+use crate::model::{MetaList, ViewTarget};
 use crate::session::Session;
 use crate::store::{SharedView, Store, ViewModel};
 use crate::store_worker::{CommandTx, StoreCommand, WorkerMsg, WorkerRx, run_store_worker};
@@ -281,10 +282,8 @@ impl App {
             // from the store-worker. Neither blocks the other, so a long store
             // mutation can't freeze input/render.
             tokio::select! {
-                maybe_event = tui.next_event() => {
-                    if let Some(event) = maybe_event {
-                        self.on_event(event).await?;
-                    }
+                Some(event) = tui.next_event() => {
+                    self.on_event(event).await?;
                 }
                 Some(msg) = recv_opt(&mut self.worker_rx) => {
                     self.handle_worker_msg(msg)?;
@@ -455,7 +454,7 @@ impl App {
                 // Install items per pane by index; keep UI layout (split/ratio)
                 // intact. `zip` truncates, so a stale snapshot can only
                 // under-fill, never panic.
-                for (pane, items) in v.panes.iter_mut().zip(snap.panes.into_iter()) {
+                for (pane, items) in v.panes.iter_mut().zip(snap.panes) {
                     pane.items = items;
                 }
                 drop(v);
@@ -790,8 +789,8 @@ impl App {
                 self.store_cmd(StoreCommand::DeleteList(list_id));
                 // Mirror the worker's fallback locally so the pane target matches.
                 {
-                    let deleted = crate::model::ViewTarget::List(list_id);
-                    let fallback = crate::model::ViewTarget::Meta(crate::model::MetaList::AllTasks);
+                    let deleted = ViewTarget::List(list_id);
+                    let fallback = ViewTarget::Meta(MetaList::AllTasks);
                     let mut v = self.view.borrow_mut();
                     for pane in &mut v.panes {
                         if pane.target == Some(deleted) {
