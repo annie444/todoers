@@ -13,7 +13,7 @@ use zeroize::Zeroizing;
 use todoers_types::{
     DeviceInfo, DeviceLoginFinishRequest, DeviceLoginFinishResponse, DeviceLoginStartRequest,
     DeviceLoginStartResponse, EnrollDeviceRequest, FinishRegisterResponse, ListDevicesResponse,
-    LoginFinishResponse, LoginStartResponse, StartRegisterResponse,
+    LoginFinishResponse, LoginStartResponse, StartRegisterResponse, UserPubkeysDto,
 };
 
 use crate::auth::{self, AccountRow, NewAccount, UnlockedKeys};
@@ -255,6 +255,30 @@ pub async fn list_devices(base_url: &str, token: &str) -> anyhow::Result<Vec<Dev
         .await
         .context("invalid list devices response")?;
     Ok(resp.devices)
+}
+
+/// Look up another user's public keys by username, to seal a list DEK to them
+/// when sharing. The only list/membership endpoint the client calls before the
+/// full sync phase. A missing user surfaces as a 4xx → `Err`.
+#[tracing::instrument(skip(token))]
+pub async fn lookup_pubkeys(
+    base_url: &str,
+    token: &str,
+    username: &str,
+) -> anyhow::Result<UserPubkeysDto> {
+    let base = base_url.trim_end_matches('/');
+    let resp: UserPubkeysDto = Client::new()
+        .get(format!("{base}/v1/users/{username}/pubkeys"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .context("pubkey lookup request failed")?
+        .error_for_status()
+        .context("no such user")?
+        .json()
+        .await
+        .context("invalid pubkey lookup response")?;
+    Ok(resp)
 }
 
 /// Revoke a device (compromise kill-switch). The server then rejects its logins.

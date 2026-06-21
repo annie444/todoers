@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-use todoers_types::ListId;
+use todoers_types::{ListId, Member, MemberId};
 
 use crate::app::Mode;
 use crate::auth::UnlockedKeys;
@@ -62,8 +62,8 @@ pub enum Action {
     },
     Keys(Zeroizing<UnlockedKeys>),
     ToggleSidebar,
-    /// Open a list or meta-list in the main pane (loads its items into the view).
-    OpenView(ViewTarget),
+    /// Open a list or meta-list in pane `pane` (loads its items into the view).
+    OpenView { target: ViewTarget, pane: usize },
     /// Reload the sidebar list summaries (and the current view) from the store.
     RefreshLists,
 
@@ -94,6 +94,21 @@ pub enum Action {
     DeleteList(ListId),
     /// Delete a single todo (after confirmation).
     DeleteTodo { list_id: ListId, item_id: String },
+
+    // ── sharing / membership (Phase 5) ──────────────────────────────────────
+    /// Open the "share list" form (add a member by username).
+    ShareModal(ListId),
+    /// Resolve a username to keys and add them to a list (emitted by the form).
+    ShareList { list_id: ListId, username: String },
+    /// A resolved collaborator to seal the DEK to (from the pubkey lookup task).
+    AddResolvedMember { list_id: ListId, member: Member },
+    /// Open the members list for a list (view + unshare).
+    MembersModal(ListId),
+    /// Remove a member, rotating the list's DEK/epoch locally.
+    Unshare { list_id: ListId, member_id: MemberId },
+
+    /// Cycle the active sort mode (tasks in the pane + sidebar aggregates).
+    CycleSort,
 }
 
 impl std::fmt::Display for Action {
@@ -125,7 +140,7 @@ impl std::fmt::Display for Action {
             Action::Register { username, .. } => write!(f, "Register {}", username),
             Action::Login { username, .. } => write!(f, "Login {}", username),
             Action::Keys(_) => write!(f, "Cryptographic keys"),
-            Action::OpenView(target) => write!(f, "Open view {target:?}"),
+            Action::OpenView { target, pane } => write!(f, "Open view {target:?} in pane {pane}"),
             Action::RefreshLists => write!(f, "Refresh lists"),
             Action::NewListModal => write!(f, "New list"),
             Action::CreateList { name } => write!(f, "Create list {name}"),
@@ -138,6 +153,12 @@ impl std::fmt::Display for Action {
             Action::ConfirmDelete(target) => write!(f, "Confirm delete {target:?}"),
             Action::DeleteList(_) => write!(f, "Delete list"),
             Action::DeleteTodo { item_id, .. } => write!(f, "Delete todo {item_id}"),
+            Action::ShareModal(_) => write!(f, "Share list"),
+            Action::ShareList { username, .. } => write!(f, "Share with {username}"),
+            Action::AddResolvedMember { .. } => write!(f, "Add resolved member"),
+            Action::MembersModal(_) => write!(f, "List members"),
+            Action::Unshare { .. } => write!(f, "Unshare"),
+            Action::CycleSort => write!(f, "Cycle sort"),
         }
     }
 }

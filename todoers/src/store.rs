@@ -18,6 +18,7 @@ use std::rc::Rc;
 
 use anyhow::Context;
 use loro::VersionVector;
+use ratatui::layout::Direction;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -33,21 +34,46 @@ use crate::session::Session;
 /// `signing_view`/`aead_aad` version on both ends (see [`crate::crypto`]).
 const UPDATE_VERSION: u8 = 1;
 
+/// One open pane: a view target plus its (sorted) items.
+#[derive(Default, Clone)]
+pub struct PaneData {
+    /// The list/meta-list this pane shows (`None` before anything is opened).
+    pub target: Option<ViewTarget>,
+    /// The pane's items, sorted, each tagged with its owning list so commands
+    /// work even in meta-list views (which span lists).
+    pub items: Vec<(ListId, TodoItem)>,
+}
+
 /// The render-side snapshot the UI reads in `draw`. `App` refreshes it after
 /// actions; the workspace component holds a clone of the [`SharedView`] handle.
 /// Single-threaded (the run loop is driven by `block_on`), so `Rc<RefCell>` is
 /// sound — no `Send` is required and net tasks never capture it.
-#[derive(Default)]
 pub struct ViewModel {
     /// Sidebar user lists (meta-lists are fixed and not stored here).
     pub lists: Vec<ListSummary>,
-    /// What the main pane is currently showing.
-    pub current: Option<ViewTarget>,
-    /// The current view's items, already sorted, each tagged with its owning
-    /// list so commands work even in meta-list views (which span lists).
-    pub items: Vec<(ListId, TodoItem)>,
-    /// Active sort applied to `items`.
+    /// Active sort applied to items + sidebar aggregates.
     pub sort: SortMode,
+    /// Open panes (1 or 2). The workspace renders them side-by-side / stacked.
+    pub panes: Vec<PaneData>,
+    /// `None` = single pane; `Some(dir)` = two panes split along `dir`.
+    pub split: Option<Direction>,
+    /// Percent of the area given to the first pane when split (clamped 10..=90).
+    pub ratio: u16,
+}
+
+impl Default for ViewModel {
+    fn default() -> Self {
+        Self {
+            lists: Vec::new(),
+            sort: SortMode::default(),
+            panes: vec![PaneData {
+                target: Some(ViewTarget::Meta(MetaList::AllTasks)),
+                items: Vec::new(),
+            }],
+            split: None,
+            ratio: 50,
+        }
+    }
 }
 
 /// Shared handle to the [`ViewModel`].
@@ -280,31 +306,46 @@ impl Store {
 
     // ── view-model refresh ─────────────────────────────────────────────────────
 
-    /// Reload the sidebar summaries and the current view's items into the shared
-    /// [`ViewModel`]. Defaults the target to `AllTasks` on first load.
+    /// Reload the sidebar summaries and every open pane's items into the shared
+    /// [`ViewModel`].
     #[tracing::instrument(skip(self, view))]
     pub async fn refresh_view(&self, view: &SharedView) -> anyhow::Result<()> {
-        // Snapshot the inputs without holding the borrow across an await.
-        let (target, sort) = {
+        // Snapshot inputs without holding the borrow across an await.
+        let (targets, sort) = {
             let v = view.borrow();
             (
-                v.current.unwrap_or(ViewTarget::Meta(MetaList::AllTasks)),
+                v.panes.iter().map(|p| p.target).collect::<Vec<_>>(),
                 v.sort,
             )
         };
-        let summaries = self.list_summaries().await?;
-        let items = self.load_view(target, sort).await?;
+        let mut summaries = self.list_summaries().await?;
+        sort_summaries(&mut summaries, sort);
+        let mut loaded = Vec::with_capacity(targets.len());
+        for t in &targets {
+            loaded.push(match t {
+                Some(target) => self.load_view(*target, sort).await?,
+                None => Vec::new(),
+            });
+        }
         let mut v = view.borrow_mut();
         v.lists = summaries;
-        v.current = Some(target);
-        v.items = items;
+        for (pane, items) in v.panes.iter_mut().zip(loaded) {
+            pane.items = items;
+        }
         Ok(())
     }
 
-    /// Switch the current view target, reloading its items.
+    /// Point a pane at a new view target and reload its items.
     #[tracing::instrument(skip(self, view))]
-    pub async fn open_view(&self, view: &SharedView, target: ViewTarget) -> anyhow::Result<()> {
-        view.borrow_mut().current = Some(target);
+    pub async fn open_view(
+        &self,
+        view: &SharedView,
+        target: ViewTarget,
+        pane: usize,
+    ) -> anyhow::Result<()> {
+        if let Some(p) = view.borrow_mut().panes.get_mut(pane) {
+            p.target = Some(target);
+        }
         self.refresh_view(view).await
     }
 
@@ -466,6 +507,25 @@ impl Store {
 /// Whether an item belongs in a meta-list view as of `now`.
 fn in_meta(meta: MetaList, it: &TodoItem, now: OffsetDateTime) -> bool {
     meta.contains(it.due, now)
+}
+
+/// Sort sidebar list summaries by the active mode, using per-list aggregates for
+/// due/priority (nearest due first; highest top-priority first).
+fn sort_summaries(lists: &mut [ListSummary], sort: SortMode) {
+    match sort {
+        SortMode::Alphabetical => {
+            lists.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        }
+        SortMode::DueDate => lists.sort_by(|a, b| match (a.next_due, b.next_due) {
+            (Some(x), Some(y)) => x.cmp(&y),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+        }),
+        SortMode::Priority => {
+            lists.sort_by(|a, b| b.top_priority.rank().cmp(&a.top_priority.rank()))
+        }
+    }
 }
 
 /// Sort items in place. Done-ness is not a sort key here (callers filter first

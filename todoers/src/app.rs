@@ -16,8 +16,8 @@ use zeroize::Zeroizing;
 use crate::action::{Action, DeleteTarget};
 use crate::auth::{AccountRow, UnlockedKeys};
 use crate::components::{
-    Button, Captures, Component, EditorMode, ErrorBar, Help, Home, Keys, ListForm, Login, Modal,
-    Prompt, Register, TodoForm, Unlock,
+    Button, Captures, Component, EditorMode, ErrorBar, Help, Home, Keys, ListForm, Login, Members,
+    Modal, Prompt, Register, ShareForm, TodoForm, Unlock,
 };
 use crate::config::Config;
 use crate::db::Db;
@@ -100,6 +100,30 @@ impl Captures for Mode {
 fn is_global_chord(key: &KeyEvent) -> bool {
     key.modifiers
         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+}
+
+/// Convert a `users/{username}/pubkeys` response into a [`Member`] to seal a list
+/// DEK to. Rejects keys of the wrong length rather than panicking.
+fn resolved_member(
+    dto: todoers_types::UserPubkeysDto,
+) -> anyhow::Result<todoers_types::Member> {
+    use todoers_types::{Ed25519Pub, Member, MemberId, Role, X25519Pub};
+    let identity_pub: [u8; 32] = dto
+        .identity_pub
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("bad identity key length"))?;
+    let signing_pub: [u8; 32] = dto
+        .signing_pub
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("bad signing key length"))?;
+    Ok(Member {
+        id: MemberId(*dto.member_id.as_bytes()),
+        identity_pub: X25519Pub(identity_pub),
+        signing_pub: Ed25519Pub(signing_pub),
+        role: Role::Member,
+    })
 }
 
 impl App {
@@ -540,9 +564,9 @@ impl App {
                         self.capturing = false;
                         self.handle_switch_mode(self.prev_mode, tui)?;
                     }
-                    Action::OpenView(target) => {
+                    Action::OpenView { target, pane } => {
                         if let Some(store) = self.store.as_ref()
-                            && let Err(e) = store.open_view(&self.view, target).await
+                            && let Err(e) = store.open_view(&self.view, target, pane).await
                         {
                             error!(?e, "failed to open view");
                             self.errorbar
@@ -586,17 +610,13 @@ impl App {
                         }
                     }
                     Action::CreateList { ref name } => {
-                        if let Some(store) = self.store.as_mut() {
-                            match store.create_list(name).await {
-                                Ok(id) => {
-                                    self.view.borrow_mut().current =
-                                        Some(crate::model::ViewTarget::List(id));
-                                }
-                                Err(e) => self.errorbar.show_error(
-                                    format!("Could not create list: {e:#}"),
-                                    Duration::from_secs(5),
-                                ),
-                            }
+                        if let Some(store) = self.store.as_mut()
+                            && let Err(e) = store.create_list(name).await
+                        {
+                            self.errorbar.show_error(
+                                format!("Could not create list: {e:#}"),
+                                Duration::from_secs(5),
+                            );
                         }
                         self.refresh_view().await;
                         self.action_tx.send(Action::CloseModal)?;
@@ -676,12 +696,16 @@ impl App {
                         {
                             error!(?e, "delete list failed");
                         }
-                        // If we deleted the open list, fall back to All Tasks.
+                        // Any pane showing the deleted list falls back to All Tasks.
                         {
+                            let deleted = crate::model::ViewTarget::List(list_id);
+                            let fallback =
+                                crate::model::ViewTarget::Meta(crate::model::MetaList::AllTasks);
                             let mut v = self.view.borrow_mut();
-                            if v.current == Some(crate::model::ViewTarget::List(list_id)) {
-                                v.current =
-                                    Some(crate::model::ViewTarget::Meta(crate::model::MetaList::AllTasks));
+                            for pane in &mut v.panes {
+                                if pane.target == Some(deleted) {
+                                    pane.target = Some(fallback);
+                                }
                             }
                         }
                         self.refresh_view().await;
@@ -698,6 +722,92 @@ impl App {
                         }
                         self.refresh_view().await;
                         self.action_tx.send(Action::CloseModal)?;
+                    }
+                    Action::ShareModal(list_id) => {
+                        self.open_form_modal("Share List", Box::new(ShareForm::new(list_id)), tui)?;
+                    }
+                    Action::ShareList {
+                        list_id,
+                        ref username,
+                    } => {
+                        // Resolving a username to keys is the one networked step;
+                        // run it off the loop and feed the member back as an action.
+                        let tx = self.action_tx.clone();
+                        let base_url = self.config.config.server_url.clone();
+                        let token = self
+                            .store
+                            .as_ref()
+                            .map(|s| s.session().token().to_string())
+                            .unwrap_or_default();
+                        let username = username.clone();
+                        tokio::spawn(async move {
+                            match crate::net::lookup_pubkeys(&base_url, &token, &username).await {
+                                Ok(dto) => match resolved_member(dto) {
+                                    Ok(member) => {
+                                        let _ = tx
+                                            .send(Action::AddResolvedMember { list_id, member });
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(Action::Error(format!(
+                                            "Invalid keys for user: {e}"
+                                        )));
+                                    }
+                                },
+                                Err(e) => {
+                                    let _ = tx.send(Action::Error(format!("Share failed: {e:#}")));
+                                }
+                            }
+                        });
+                    }
+                    Action::AddResolvedMember { list_id, ref member } => {
+                        if let Some(store) = self.store.as_mut()
+                            && let Err(e) = store.add_member_local(list_id, member.clone()).await
+                        {
+                            self.errorbar.show_error(
+                                format!("Could not add member: {e:#}"),
+                                Duration::from_secs(5),
+                            );
+                        }
+                        self.refresh_view().await;
+                        self.action_tx.send(Action::CloseModal)?;
+                    }
+                    Action::MembersModal(list_id) => {
+                        let members = match self.store.as_ref() {
+                            Some(store) => store.members(list_id).await.unwrap_or_default(),
+                            None => Vec::new(),
+                        };
+                        let me = self
+                            .store
+                            .as_ref()
+                            .map(|s| s.session().member_id())
+                            .unwrap_or_default();
+                        let mut modal = Modal::message(
+                            "Members",
+                            Box::new(Members::new(list_id, members, me)),
+                        );
+                        modal.register_action_handler(self.action_tx.clone())?;
+                        modal.register_config_handler(self.config.clone())?;
+                        modal.init(tui.size()?)?;
+                        self.modal = Some(modal);
+                    }
+                    Action::Unshare { list_id, member_id } => {
+                        if let Some(store) = self.store.as_mut()
+                            && let Err(e) = store.remove_member_local(list_id, member_id).await
+                        {
+                            self.errorbar.show_error(
+                                format!("Could not remove member: {e:#}"),
+                                Duration::from_secs(5),
+                            );
+                        }
+                        self.refresh_view().await;
+                        self.action_tx.send(Action::CloseModal)?;
+                    }
+                    Action::CycleSort => {
+                        {
+                            let mut v = self.view.borrow_mut();
+                            v.sort = v.sort.next();
+                        }
+                        self.refresh_view().await;
                     }
                 }
                 // Forward the action to the modal while it is open, otherwise to

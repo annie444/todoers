@@ -319,7 +319,7 @@ impl std::fmt::Display for Role {
 }
 
 /// Public identity of one collaborator. None of this is secret.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Member {
     pub id: MemberId,
     pub identity_pub: X25519Pub, // seal DEKs to this
