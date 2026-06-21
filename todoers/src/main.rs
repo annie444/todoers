@@ -25,6 +25,19 @@ async fn body() -> anyhow::Result<()> {
     crate::logging::init()?;
 
     let args = Cli::parse();
+    if let Some(subcommand) = args.subcommand {
+        match subcommand {
+            cli::Commands::Version => {
+                println!("{}", cli::version());
+                return Ok(());
+            }
+            cli::Commands::Keygen(args) => {
+                crypto::keygen(&args.output)?;
+                println!("Key pair generated and saved to {}", args.output.display());
+                return Ok(());
+            }
+        }
+    }
     let config = Config::new()?;
     let db = Db::init(&config.config.data_dir).await?;
     let account = db.load_account().await?;

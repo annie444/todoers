@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use crossterm::event::{KeyEvent, KeyModifiers};
 use nohash_hasher::BuildNoHashHasher;
 use ratatui::prelude::{Constraint, Layout, Rect};
+use ratatui::style::{Color, Style};
+use ratatui::widgets::Paragraph;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::time::Duration;
@@ -12,10 +14,10 @@ use zeroize::Zeroizing;
 use crate::action::Action;
 use crate::auth::{AccountRow, UnlockedKeys};
 use crate::components::{
-    Button, Captures, Component, ErrorBar, Help, Home, Keys, Login, Modal, Prompt, Register, Unlock,
+    Button, Captures, Component, EditorMode, ErrorBar, Help, Home, Keys, Login, Modal, Prompt,
+    Register, Unlock,
 };
 use crate::config::Config;
-use crate::crypto::DeviceBackend;
 use crate::db::Db;
 use crate::tui::{Event, Tui};
 
@@ -267,7 +269,7 @@ impl App {
         match keymap.get(&vec![key]) {
             Some(action) => {
                 info!("Got action: {action:?}");
-                action_tx.send(action.clone())?;
+                action_tx.send(action.clone().into())?;
             }
             _ => {
                 // If the key was not handled as a single key action,
@@ -277,7 +279,7 @@ impl App {
                 // Check for multi-key combinations
                 if let Some(action) = keymap.get(&self.last_tick_key_events) {
                     info!("Got action: {action:?}");
-                    action_tx.send(action.clone())?;
+                    action_tx.send(action.clone().into())?;
                 }
             }
         }
@@ -323,10 +325,6 @@ impl App {
                         info!("Received cryptographic keys");
                         self.acct_keys = Some(keys.to_owned());
                     }
-                    Action::SubmitInput(ref text) => {
-                        info!("Submitted input: {text}");
-                        self.capturing = false;
-                    }
                     Action::UnlockModal => {
                         // The user has a local account but no keys (e.g. first launch
                         // after a reinstall). Prompt for the password to unlock the
@@ -339,8 +337,10 @@ impl App {
                         self.prev_mode = self.mode;
                         self.mode = Mode::Home;
                         self.refresh_keys()?;
-                        self.capturing = false;
                         self.modal = Some(modal);
+                        // Focus the password field (capturing on, Vim Normal mode),
+                        // matching the login/register modals.
+                        self.action_tx.send(Action::StartCapture)?;
                     }
                     Action::DeviceUnlock => {
                         // Password-less unlock: decrypt the on-disk cache with the
@@ -357,12 +357,11 @@ impl App {
                                     db.load_device_cache().await?.ok_or_else(|| {
                                         anyhow::anyhow!("no device cache on this device")
                                     })?;
-                                let backend = du.backend.unwrap_or(DeviceBackend::Age);
                                 let identity = du.identity.clone().ok_or_else(|| {
                                     anyhow::anyhow!("no device-unlock identity configured")
                                 })?;
                                 crate::net::unlock_via_device(
-                                    &base_url, backend, &identity, device_id, blob,
+                                    &base_url, &identity, device_id, blob,
                                 )
                                 .await
                             }
@@ -375,7 +374,7 @@ impl App {
                                 Err(e) => {
                                     error!(?e, "device unlock failed; prompting for password");
                                     let _ = tx
-                                        .send(Action::Error(format!("Device unlock failed: {e}")));
+                                        .send(Action::Error(format!("Device unlock failed: {e:#}")));
                                     let _ = tx.send(Action::UnlockModal);
                                 }
                             }
@@ -555,6 +554,20 @@ impl App {
         Ok(())
     }
 
+    /// The Vim editing sub-mode of the currently focused field, if any — a focused
+    /// modal body takes precedence over the background mode component. Drives the
+    /// status-footer mode indicator.
+    fn active_editor_mode(&self) -> Option<EditorMode> {
+        if let Some(modal) = self.modal.as_ref() {
+            return modal.editor_mode();
+        }
+        self.modes
+            .get(&self.mode)
+            .or_else(|| self.modes.get(&self.prev_mode))
+            .or_else(|| self.modes.get(&Mode::default()))
+            .and_then(|comp| comp.editor_mode())
+    }
+
     #[tracing::instrument(skip(self, tui))]
     fn handle_switch_mode(&mut self, mode: Mode, tui: &mut Tui) -> anyhow::Result<()> {
         self.prev_mode = self.mode;
@@ -578,6 +591,8 @@ impl App {
 
     #[tracing::instrument(skip(self, tui))]
     fn render(&mut self, tui: &mut Tui) -> anyhow::Result<()> {
+        // Resolve the Vim mode indicator before the draw closure borrows `self`.
+        let editor_mode = self.active_editor_mode();
         tui.draw(|frame| {
             let [body, errorbar, footer] = Layout::vertical([
                 Constraint::Fill(1),
@@ -620,6 +635,18 @@ impl App {
                     "Failed to draw key bindings: {:?}",
                     err
                 )));
+            }
+
+            // Lualine-style Vim mode indicator: classic `-- MODE --`, dimmed, on
+            // the right of the footer's top rule line. Only shown for Vim fields.
+            if let Some(mode) = editor_mode {
+                let label = format!("-- {} --", mode.label());
+                let w = (label.chars().count() as u16).min(footer.width);
+                let rect = Rect::new(footer.right().saturating_sub(w), footer.y, w, 1);
+                frame.render_widget(
+                    Paragraph::new(label).style(Style::default().fg(Color::DarkGray)),
+                    rect,
+                );
             }
         })?;
         Ok(())
@@ -691,11 +718,10 @@ impl App {
             if du.enabled && !keys.token.is_empty() {
                 let already_enrolled = matches!(db.load_device_cache().await, Ok(Some(_)));
                 if !already_enrolled {
-                    match (du.backend, du.recipient.as_deref()) {
-                        (Some(backend), Some(recipient)) => match crate::net::enroll_this_device(
+                    match du.recipient.as_deref() {
+                        Some(recipient) => match crate::net::enroll_this_device(
                             &base_url,
                             &keys.token,
-                            backend,
                             recipient,
                             &keys,
                             &username,
@@ -705,20 +731,19 @@ impl App {
                             Ok((device_id, blob)) => {
                                 if let Err(e) = db.save_device_cache(&device_id, &blob).await {
                                     let _ = tx.send(Action::Error(format!(
-                                        "Logged in, but could not save device cache: {e}"
+                                        "Logged in, but could not save device cache: {e:#}"
                                     )));
                                 }
                             }
                             Err(e) => {
                                 let _ = tx.send(Action::Error(format!(
-                                    "Logged in, but device enrollment failed: {e}"
+                                    "Logged in, but device enrollment failed: {e:#}"
                                 )));
                             }
                         },
-                        _ => {
+                        None => {
                             let _ = tx.send(Action::Error(
-                                "device_unlock.enabled is set but backend/recipient are missing"
-                                    .to_string(),
+                                "device_unlock.enabled is set but recipient is missing".to_string(),
                             ));
                         }
                     }

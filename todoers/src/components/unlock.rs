@@ -7,8 +7,7 @@ use zeroize::Zeroizing;
 use super::{Captures, Component, TextInput};
 use crate::action::Action;
 use crate::config::Config;
-
-/// Field indices into [`Register::fields`].
+use crate::tui::Event;
 
 /// A registration form: three text inputs plus a key-hint footer.
 ///
@@ -117,6 +116,20 @@ impl Component for Unlock {
     }
 
     #[tracing::instrument(skip(self))]
+    fn handle_events(&mut self, event: Option<Event>) -> anyhow::Result<Option<Action>> {
+        // Bracketed paste arrives as a single `Event::Paste`, which the default
+        // `handle_events` drops. Forward it to the password field.
+        if let Some(Event::Paste(_)) = event {
+            return self.password.handle_events(event);
+        }
+        match event {
+            Some(Event::Key(key)) => self.handle_key_event(key),
+            Some(Event::Mouse(mouse)) => self.handle_mouse_event(mouse),
+            _ => Ok(None),
+        }
+    }
+
+    #[tracing::instrument(skip(self))]
     fn handle_key_event(&mut self, key: KeyEvent) -> anyhow::Result<Option<Action>> {
         match key.code {
             KeyCode::Tab | KeyCode::Down => {
@@ -138,6 +151,9 @@ impl Component for Unlock {
                     Ok(Some(Action::FocusButtons))
                 }
             }
+            // In Vim mode, Esc while editing returns the field to Normal mode; let
+            // it consume the key instead of clearing the error / closing the modal.
+            KeyCode::Esc if self.password.consumes_escape() => self.password.handle_key_event(key),
             KeyCode::Esc => {
                 self.error = None;
                 Ok(None)
@@ -146,6 +162,16 @@ impl Component for Unlock {
             // only the focused field.
             _ => self.password.handle_key_event(key),
         }
+    }
+
+    #[tracing::instrument(skip(self))]
+    fn consumes_escape(&self) -> bool {
+        self.password.consumes_escape()
+    }
+
+    #[tracing::instrument(skip(self))]
+    fn editor_mode(&self) -> Option<super::EditorMode> {
+        self.password.editor_mode()
     }
 
     #[tracing::instrument(skip(self))]
@@ -242,6 +268,31 @@ mod tests {
 
         screen.handle_key_event(code(KeyCode::Tab)).unwrap();
         typed(&mut screen, "hunter2");
+        assert_eq!(screen.password.value(), "hunter2");
+    }
+
+    /// In Vim mode the unlock field is focused into Normal mode (not Insert), and
+    /// reports that mode for the footer indicator.
+    #[test]
+    fn vim_unlock_starts_in_normal_mode() {
+        let mut screen = Unlock::new();
+        let mut cfg = Config::default();
+        cfg.config.editing_mode = crate::config::EditingMode::Vim;
+        screen.register_config_handler(cfg).unwrap();
+        screen.update(Action::StartCapture).unwrap();
+        assert_eq!(screen.editor_mode(), Some(super::super::EditorMode::Normal));
+    }
+
+    /// Bracketed paste (a single `Event::Paste`) lands in the focused field rather
+    /// than being dropped by the default `handle_events`.
+    #[test]
+    fn paste_inserts_into_focused_field() {
+        let mut screen = Unlock::new();
+        screen.update(Action::StartCapture).unwrap();
+
+        screen
+            .handle_events(Some(Event::Paste("hunter2".to_string())))
+            .unwrap();
         assert_eq!(screen.password.value(), "hunter2");
     }
 

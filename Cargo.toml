@@ -74,6 +74,9 @@ tui-widgets = { version = "0.7", default-features = false, features = [
 crossterm = { version = "0.29", features = ["serde", "event-stream"] }
 unicode-width = "0.2"
 
+# Realtime collaboration
+loro = "1.13"
+
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["std"] }
@@ -90,7 +93,6 @@ config = { version = "0.15", default-features = false, features = [
 serde_arrays = "0.2"
 humantime-serde = "1.1"
 hex = { version = "0.4", features = ["serde"] }
-loro = "1.13"
 indexmap = { version = "2.14", features = ["serde", "std"] }
 
 # Crypto
@@ -107,13 +109,13 @@ argon2 = "0.5"
 subtle = "2"
 getrandom = "0.4"
 dryoc = "0.8"
-age = { version = "0.11", features = ["ssh", "armor"] }
 sha2 = "0.11"
 oldsha2 = { package = "sha2", version = "0.10" }
 old_rand_core = { package = "rand_core", version = "0.6" }
 secrecy = { version = "0.10", features = ["serde"] }
 zeroize = { version = "1.9", features = ["alloc", "derive", "serde"] }
 hmac = "0.13"
+x-wing = { version = "0.1.0-rc", features = ["zeroize", "getrandom"] }
 
 # Logging
 tracing = "0.1"

@@ -1,13 +1,13 @@
 use std::{collections::HashMap, env, path::PathBuf, sync::LazyLock};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use directories::ProjectDirs;
+use directories::{BaseDirs, ProjectDirs, UserDirs};
 use indexmap::IndexMap;
 use ratatui::style::{Color, Modifier, Style};
 use serde::{Deserialize, de::Deserializer};
 use tracing::{debug, error};
 
-use crate::{action::Action, app::Mode, crypto::DeviceBackend};
+use crate::{action::Action, app::Mode};
 
 const CONFIG: &str = include_str!("../app_config.toml");
 
@@ -24,6 +24,22 @@ pub struct AppConfig {
     /// the local config), so each device can use a different key.
     #[serde(default)]
     pub device_unlock: DeviceUnlockConfig,
+    /// Text-field editing style: `emacs` (default) or `vim`.
+    #[serde(default)]
+    pub editing_mode: EditingMode,
+}
+
+/// Which key bindings a focused text field obeys.
+///
+/// `Emacs` delegates to [`ratatui_textarea::TextArea::input`], which ships a full
+/// set of emacs motions/edits. `Vim` runs a modal state machine on top of the same
+/// widget (see [`crate::components::text_input`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EditingMode {
+    #[default]
+    Emacs,
+    Vim,
 }
 
 /// Per-device password-less unlock settings. When `enabled`, after a normal
@@ -33,15 +49,12 @@ pub struct AppConfig {
 pub struct DeviceUnlockConfig {
     #[serde(default)]
     pub enabled: bool,
-    /// `"age"` or `"ssh"`.
-    #[serde(default)]
-    pub backend: Option<DeviceBackend>,
-    /// Recipient to encrypt the cache to: an age recipient (`age1…`) or an
-    /// OpenSSH public key line (`ssh-ed25519 …`).
+    /// Recipient to seal the cache to: the hex-encoded X-Wing public key printed
+    /// by `todoers keygen`.
     #[serde(default)]
     pub recipient: Option<String>,
-    /// Path to the identity used to decrypt the cache: an age identity file or an
-    /// OpenSSH private key file.
+    /// Path to the identity file used to open the cache: the hex-encoded X-Wing
+    /// secret key written by `todoers keygen`.
     #[serde(default)]
     pub identity: Option<String>,
 }
@@ -80,6 +93,8 @@ impl Config {
         let default_config: Config = toml::from_str(CONFIG).unwrap();
         let data_dir = get_data_dir();
         let config_dir = get_config_dir();
+        debug!("Using data directory: {}", data_dir.display());
+        debug!("Using config directory: {}", config_dir.display());
         let mut builder = config::Config::builder()
             .set_default("data_dir", data_dir.to_str().unwrap())?
             .set_default("config_dir", config_dir.to_str().unwrap())?;
@@ -122,6 +137,15 @@ impl Config {
             }
         }
 
+        cfg.config.device_unlock.identity.iter_mut().for_each(|p| {
+            if p.get(0..1).map(|i| i == "~").unwrap_or(false)
+                && let Some(user) =
+                    UserDirs::new().map(|u| u.home_dir().to_string_lossy().to_string())
+            {
+                p.replace_range(0..1, &user);
+            }
+        });
+
         debug!("Config loaded: {cfg:#?}");
 
         Ok(cfg)
@@ -132,7 +156,21 @@ impl Config {
 pub fn get_data_dir() -> PathBuf {
     if let Some(s) = DATA_FOLDER.clone() {
         s
-    } else if let Some(proj_dirs) = project_directory() {
+    } else if let Some(user) = UserDirs::new().map(|u| {
+        u.home_dir()
+            .join(".local")
+            .join("state")
+            .join(env!("CARGO_PKG_NAME"))
+    }) && user.exists()
+    {
+        user
+    } else if let Some(base) = BaseDirs::new()
+        .map(|b| b.state_dir().map(|s| s.to_path_buf()))
+        .flatten()
+        && base.exists()
+    {
+        base
+    } else if let Some(proj_dirs) = project_dir() {
         proj_dirs.data_local_dir().to_path_buf()
     } else {
         PathBuf::from(".").join(".data")
@@ -143,7 +181,16 @@ pub fn get_data_dir() -> PathBuf {
 pub fn get_config_dir() -> PathBuf {
     if let Some(s) = CONFIG_FOLDER.clone() {
         s
-    } else if let Some(proj_dirs) = project_directory() {
+    } else if let Some(user) =
+        UserDirs::new().map(|u| u.home_dir().join(".config").join(env!("CARGO_PKG_NAME")))
+        && user.exists()
+    {
+        user
+    } else if let Some(base) = BaseDirs::new().map(|b| b.config_dir().join(env!("CARGO_PKG_NAME")))
+        && base.exists()
+    {
+        base
+    } else if let Some(proj_dirs) = project_dir() {
         proj_dirs.config_local_dir().to_path_buf()
     } else {
         PathBuf::from(".").join(".config")
@@ -151,12 +198,43 @@ pub fn get_config_dir() -> PathBuf {
 }
 
 #[tracing::instrument]
-fn project_directory() -> Option<ProjectDirs> {
+fn project_dir() -> Option<ProjectDirs> {
     ProjectDirs::from("com", "annieehler", env!("CARGO_PKG_NAME"))
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum ActionConfig {
+    NoShow(Action),
+    Show { action: Action, show: bool },
+}
+
+impl From<Action> for ActionConfig {
+    fn from(action: Action) -> Self {
+        ActionConfig::NoShow(action)
+    }
+}
+
+impl From<ActionConfig> for Action {
+    fn from(config: ActionConfig) -> Self {
+        match config {
+            ActionConfig::NoShow(action) => action,
+            ActionConfig::Show { action, .. } => action,
+        }
+    }
+}
+
+impl<'a> From<&'a ActionConfig> for &'a Action {
+    fn from(config: &'a ActionConfig) -> Self {
+        match config {
+            ActionConfig::NoShow(action) => action,
+            ActionConfig::Show { action, .. } => action,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
-pub struct KeyBindings(pub HashMap<Mode, IndexMap<Vec<KeyEvent>, Action>>);
+pub struct KeyBindings(pub HashMap<Mode, IndexMap<Vec<KeyEvent>, ActionConfig>>);
 
 impl<'de> Deserialize<'de> for KeyBindings {
     #[tracing::instrument(skip(deserializer))]
@@ -164,7 +242,8 @@ impl<'de> Deserialize<'de> for KeyBindings {
     where
         D: Deserializer<'de>,
     {
-        let parsed_map = HashMap::<Mode, IndexMap<String, Action>>::deserialize(deserializer)?;
+        let parsed_map =
+            HashMap::<Mode, IndexMap<String, ActionConfig>>::deserialize(deserializer)?;
 
         let keybindings = parsed_map
             .into_iter()
@@ -532,7 +611,7 @@ mod tests {
                 .unwrap()
                 .get(&parse_key_sequence("q").unwrap_or_default())
                 .unwrap(),
-            &Action::Quit
+            &ActionConfig::NoShow(Action::Quit)
         );
         Ok(())
     }

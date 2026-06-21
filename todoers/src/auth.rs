@@ -405,7 +405,6 @@ pub fn generate_device_identity() -> ([u8; 16], [u8; 32], [u8; 32]) {
 /// producing the on-disk cache blob (class-1, safe at rest).
 #[tracing::instrument(skip(keys, device_signing_seed))]
 pub fn build_device_cache(
-    backend: crypto::DeviceBackend,
     recipient: &str,
     keys: &UnlockedKeys,
     device_id: [u8; 16],
@@ -421,20 +420,19 @@ pub fn build_device_cache(
         device_signing_pub,
     };
     let mut json = serde_json::to_vec(&payload).map_err(|_| AppError::Aead)?;
-    let sealed = crypto::device_seal(backend, recipient, &json);
+    let sealed = crypto::device_seal(recipient, &json);
     json.zeroize();
     sealed
 }
 
-/// Open the on-disk device cache with the local AGE/SSH identity, recovering the
+/// Open the on-disk device cache with the local X-Wing identity, recovering the
 /// unlocked keys and device-auth keypair. A wrong/absent key fails decryption.
 #[tracing::instrument(skip(identity_contents, blob))]
 pub fn unlock_from_device_cache(
-    backend: crypto::DeviceBackend,
     identity_contents: &str,
     blob: &[u8],
 ) -> AppResult<Zeroizing<DeviceCachePayload>> {
-    let mut json = crypto::device_open(backend, identity_contents, blob)?;
+    let mut json = crypto::device_open(identity_contents, blob)?;
     let payload: DeviceCachePayload = serde_json::from_slice(&json).map_err(|_| AppError::Aead)?;
     json.zeroize();
     Ok(Zeroizing::new(payload))
@@ -578,8 +576,6 @@ mod tests {
     /// verifies against its enrolled public key (the server's check).
     #[test]
     fn device_cache_round_trip_and_challenge() {
-        use secrecy::ExposeSecret;
-
         let keys = UnlockedKeys {
             member_id: MemberId([5u8; 16]),
             identity_secret: [9u8; 32],
@@ -589,27 +585,20 @@ mod tests {
             token: "live-token-should-not-be-cached".into(),
         };
 
-        // A throwaway local age key plays the role of the user's AGE identity.
-        let identity = age::x25519::Identity::generate();
-        let recipient = identity.to_public().to_string();
-        let identity_str = identity.to_string().expose_secret().to_string();
+        // A throwaway local X-Wing key plays the role of the user's device key.
+        use x_wing::{KeyExport, XWingKem, kem::Kem};
+        let (sk, pk) = XWingKem::generate_keypair();
+        let recipient = hex::encode(pk.to_bytes());
+        let identity_str = hex::encode(sk.as_bytes());
 
         let (device_id, device_seed, device_pub) = generate_device_identity();
-        let blob = build_device_cache(
-            crypto::DeviceBackend::Age,
-            &recipient,
-            &keys,
-            device_id,
-            device_seed,
-            device_pub,
-        )
-        .unwrap();
+        let blob =
+            build_device_cache(&recipient, &keys, device_id, device_seed, device_pub).unwrap();
 
         // The sealed blob must not be the plaintext, and must not leak the token.
         assert!(!blob.windows(9).any(|w| w == b"live-toke"));
 
-        let recovered =
-            unlock_from_device_cache(crypto::DeviceBackend::Age, &identity_str, &blob).unwrap();
+        let recovered = unlock_from_device_cache(&identity_str, &blob).unwrap();
         assert_eq!(recovered.keys.identity_secret, keys.identity_secret);
         assert_eq!(recovered.keys.signing_seed, keys.signing_seed);
         assert_eq!(recovered.keys.member_id, keys.member_id);
@@ -637,16 +626,10 @@ mod tests {
         );
         assert!(vk.verify(&msg, &Signature::from_bytes(&sig)).is_ok());
 
-        // A wrong age identity cannot open the cache.
-        let other = age::x25519::Identity::generate();
-        assert!(
-            unlock_from_device_cache(
-                crypto::DeviceBackend::Age,
-                other.to_string().expose_secret(),
-                &blob
-            )
-            .is_err()
-        );
+        // A different device key cannot open the cache.
+        let (other_sk, _) = XWingKem::generate_keypair();
+        let other_identity = hex::encode(other_sk.as_bytes());
+        assert!(unlock_from_device_cache(&other_identity, &blob).is_err());
     }
 
     /// A login attempt with the wrong password must fail at client finish.

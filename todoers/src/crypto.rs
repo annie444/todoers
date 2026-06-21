@@ -1,17 +1,20 @@
 //! Wire + key schema for a zero-knowledge, shareable todo list.
 
-use std::io::{Read, Write};
-use std::str::FromStr;
+use std::path::Path;
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce, aead::Aead};
 use dryoc::dryocbox::{DryocBox, KeyPair, PublicKey};
 use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
 use old_rand_core::{OsRng, RngCore};
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tracing::error;
 use uuid::Uuid;
-use zeroize::Zeroize;
+use x_wing::{
+    CIPHERTEXT_SIZE, Ciphertext, DecapsulationKey, EncapsulationKey, KeyExport, XWingKem,
+    kem::{Decapsulate, Encapsulate, Kem},
+};
+use zeroize::{Zeroize, Zeroizing};
 
 use todoers_types::{
     DEVICE_CHALLENGE_VERSION, Ed25519Pub, Epoch, KeySlot, ListId, ListMetadata, Member, MemberId,
@@ -268,108 +271,112 @@ pub fn unwrap_secret_keys(master: &[u8; 32], blob: &[u8]) -> AppResult<([u8; 32]
 // agent/passphrase/hardware-backed key over a plaintext identity file.
 // ---------------------------------------------------------------------------
 
-/// Which kind of local key protects the on-disk key cache.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum DeviceBackend {
-    /// Native age recipient (`age1...`) / identity (`AGE-SECRET-KEY-…`).
-    Age,
-    /// OpenSSH key (`ssh-ed25519 ...` recipient, OpenSSH private key identity).
-    Ssh,
-}
+#[tracing::instrument]
+pub fn keygen<P: AsRef<Path> + std::fmt::Debug>(output_path: P) -> AppResult<()> {
+    const CONTENTS: &str = r##"# This is your device vault key. Keep it secret and safe!
+# It protects the cached keys that unlock your todo lists on this device.
+# Anyone with access to this file can impersonate you on this device."##;
+    let (secret_key, public_key) = XWingKem::generate_keypair();
+    let mut encoded_secret = hex::encode(secret_key.as_bytes());
+    let encoded_public = hex::encode(public_key.to_bytes());
 
-/// Encrypt `plaintext` to a local AGE/SSH `recipient`, returning an age file.
-#[tracing::instrument(skip(plaintext))]
-pub fn device_seal(
-    backend: DeviceBackend,
-    recipient: &str,
-    plaintext: &[u8],
-) -> AppResult<Vec<u8>> {
-    let recipient = recipient.trim();
-    let encryptor = match backend {
-        DeviceBackend::Age => {
-            let r = age::x25519::Recipient::from_str(recipient)
-                .map_err(|e| AppError::DeviceVault(format!("invalid age recipient: {e}")))?;
-            age::Encryptor::with_recipients(std::iter::once(&r as &dyn age::Recipient))
-        }
-        DeviceBackend::Ssh => {
-            let r = age::ssh::Recipient::from_str(recipient)
-                .map_err(|e| AppError::DeviceVault(format!("invalid ssh recipient: {e:?}")))?;
-            age::Encryptor::with_recipients(std::iter::once(&r as &dyn age::Recipient))
-        }
+    // The secret key file is class-3 material: create it owner-only (0o600) and
+    // refuse to clobber an existing key (overwriting would orphan any cache
+    // already sealed to the old key — the user must remove it explicitly).
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
     }
-    .map_err(|e| AppError::DeviceVault(format!("failed to build encryptor: {e}")))?;
+    // TODO(windows): `mode(0o600)` is unix-only. If Windows support is added,
+    // restrict this file's ACL to the current user (the default ACL may grant
+    // broader read access), e.g. via a `windows-acl`/`windows-sys` DACL set.
+    let mut file = opts.open(output_path.as_ref()).map_err(|e| {
+        error!(?e, "failed to create device vault key");
+        AppError::DeviceVault(format!(
+            "failed to create device vault key at {}: {e}",
+            output_path.as_ref().display()
+        ))
+    })?;
+    let contents = Zeroizing::new(format!("{CONTENTS}\n{encoded_secret}\n"));
+    encoded_secret.zeroize(); // wipe the standalone hex copy; `contents` zeroizes on drop
+    std::io::Write::write_all(&mut file, contents.as_bytes()).map_err(|e| {
+        error!(?e, "failed to write device vault key");
+        AppError::DeviceVault(format!("failed to write device vault key: {e}"))
+    })?;
+    println!(
+        "Device vault key generated and saved to {}.",
+        output_path.as_ref().display()
+    );
+    println!("Public key:\n");
+    println!("{encoded_public}\n");
+    println!("Save this public key in your configuration as:\n");
+    println!("[device_unlock]");
+    println!("enabled = true");
+    println!(r#"recipient = "<your-public-key>""#);
+    println!();
+    Ok(())
+}
 
-    let mut out = Vec::new();
-    let mut writer = encryptor
-        .wrap_output(&mut out)
-        .map_err(|e| AppError::DeviceVault(format!("failed to start encryption: {e}")))?;
-    writer
-        .write_all(plaintext)
-        .map_err(|e| AppError::DeviceVault(format!("encryption write failed: {e}")))?;
-    writer
-        .finish()
-        .map_err(|e| AppError::DeviceVault(format!("encryption finalize failed: {e}")))?;
+/// Seal `plaintext` to a local X-Wing `recipient` (the hex-encoded public
+/// encapsulation key from [`keygen`]). KEM-DEM: encapsulate to the recipient to
+/// derive a 32-byte shared key, then `XChaCha20-Poly1305` over `plaintext`. The
+/// blob layout is `ciphertext(1120) || nonce(24) || aead(tag+ct)`.
+#[tracing::instrument(skip(plaintext))]
+pub fn device_seal(recipient: &str, plaintext: &[u8]) -> AppResult<Vec<u8>> {
+    let pk_bytes = hex::decode(recipient.trim())
+        .map_err(|e| AppError::DeviceVault(format!("recipient is not valid hex: {e}")))?;
+    let ek = EncapsulationKey::try_from(pk_bytes.as_slice())
+        .map_err(|e| AppError::DeviceVault(format!("invalid recipient key: {e}")))?;
+
+    let (ct, ss) = ek.encapsulate();
+    let cipher = XChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(ss.as_slice()));
+    let mut nonce = [0u8; 24];
+    OsRng.fill_bytes(&mut nonce);
+    let aead = cipher
+        .encrypt(XNonce::from_slice(&nonce), plaintext)
+        .map_err(|_| AppError::Aead)?;
+
+    let mut out = Vec::with_capacity(CIPHERTEXT_SIZE + nonce.len() + aead.len());
+    out.extend_from_slice(ct.as_slice());
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&aead);
     Ok(out)
 }
 
-/// Decrypt an age `blob` with a local AGE/SSH identity (the file contents, not a
-/// path). Passphrase-encrypted SSH keys are rejected for now — use an unencrypted
-/// or agent-backed key (interactive passphrase prompts are a follow-up).
+/// Open a [`device_seal`] blob with the local X-Wing identity (the file
+/// contents: comments plus one hex-encoded 32-byte decapsulation key). A
+/// wrong/short key fails the KEM or the AEAD tag and returns an error.
 #[tracing::instrument(skip(identity_contents, blob))]
-pub fn device_open(
-    backend: DeviceBackend,
-    identity_contents: &str,
-    blob: &[u8],
-) -> AppResult<Vec<u8>> {
-    let decryptor = age::Decryptor::new_buffered(blob)
-        .map_err(|e| AppError::DeviceVault(format!("not a valid age file: {e}")))?;
+pub fn device_open(identity_contents: &str, blob: &[u8]) -> AppResult<Vec<u8>> {
+    // The identity file may hold comments (`#…`) above the single key line.
+    let sk_hex = identity_contents
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with('#'))
+        .ok_or_else(|| AppError::DeviceVault("no device key found in identity file".into()))?;
+    let sk: [u8; 32] = hex::decode(sk_hex)
+        .map_err(|e| AppError::DeviceVault(format!("identity is not valid hex: {e}")))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| AppError::DeviceVault("device key must be 32 bytes".into()))?;
+    let dk = DecapsulationKey::from(sk);
 
-    let mut reader = match backend {
-        DeviceBackend::Age => {
-            // An age identity file may hold comments (`#…`) and one or more keys.
-            let identities = identity_contents
-                .lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty() && !l.starts_with('#'))
-                .map(|l| {
-                    age::x25519::Identity::from_str(l)
-                        .map_err(|e| AppError::DeviceVault(format!("invalid age identity: {e}")))
-                })
-                .collect::<AppResult<Vec<_>>>()?;
-            if identities.is_empty() {
-                return Err(AppError::DeviceVault("no age identities found".into()));
-            }
-            decryptor
-                .decrypt(identities.iter().map(|i| i as &dyn age::Identity))
-                .map_err(|e| AppError::DeviceVault(format!("decryption failed: {e}")))?
-        }
-        DeviceBackend::Ssh => {
-            let identity = age::ssh::Identity::from_buffer(identity_contents.as_bytes(), None)
-                .map_err(|e| AppError::DeviceVault(format!("invalid ssh identity: {e}")))?;
-            match identity {
-                age::ssh::Identity::Encrypted(_) => {
-                    return Err(AppError::DeviceVault(
-                        "the SSH key is passphrase-encrypted; use an unencrypted or agent-backed \
-                         key (interactive passphrase prompts are a follow-up)"
-                            .into(),
-                    ));
-                }
-                age::ssh::Identity::Unsupported(_) => {
-                    return Err(AppError::DeviceVault("unsupported SSH key type".into()));
-                }
-                age::ssh::Identity::Unencrypted(_) => decryptor
-                    .decrypt(std::iter::once(&identity as &dyn age::Identity))
-                    .map_err(|e| AppError::DeviceVault(format!("decryption failed: {e}")))?,
-            }
-        }
-    };
+    if blob.len() < CIPHERTEXT_SIZE + 24 {
+        return Err(AppError::DeviceVault("device cache blob is too short".into()));
+    }
+    let (ct_bytes, rest) = blob.split_at(CIPHERTEXT_SIZE);
+    let (nonce, aead) = rest.split_at(24);
+    let ct = Ciphertext::try_from(ct_bytes)
+        .map_err(|_| AppError::DeviceVault("invalid KEM ciphertext".into()))?;
 
-    let mut out = Vec::new();
-    reader
-        .read_to_end(&mut out)
-        .map_err(|e| AppError::DeviceVault(format!("decryption read failed: {e}")))?;
-    Ok(out)
+    let ss = dk.decapsulate(&ct);
+    let cipher = XChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(ss.as_slice()));
+    cipher
+        .decrypt(XNonce::from_slice(nonce), aead)
+        .map_err(|_| AppError::Aead)
 }
 
 /// Sign a server-issued device-login challenge with the per-device Ed25519

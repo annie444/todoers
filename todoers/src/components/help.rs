@@ -4,6 +4,7 @@ use crossterm::event::KeyModifiers;
 use ratatui::{prelude::*, widgets::*};
 
 use super::{Captures, Component};
+use crate::action::Action;
 use crate::app::Mode;
 use crate::config::Config;
 
@@ -65,7 +66,8 @@ impl Component for Help {
     fn register_config_handler(&mut self, config: Config) -> anyhow::Result<()> {
         if let Some(keybinds) = config.keybindings.0.get(&self.mode) {
             let mut key_strs: HashMap<String, Vec<String>> = HashMap::new();
-            for (keys, action) in keybinds {
+            for (keys, action_cfg) in keybinds {
+                let action: &Action = action_cfg.into();
                 for key in keys {
                     key_strs
                         .entry(action.to_string())

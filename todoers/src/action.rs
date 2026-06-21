@@ -32,7 +32,6 @@ pub enum Action {
     SetMode(Mode),
     StartCapture,
     StopCapture,
-    SubmitInput(String),
     /// Submit a completed registration form. The password is class-3 material:
     /// never log this variant verbatim (see `Display` below and `App::handle_actions`).
     UnlockModal,
@@ -77,7 +76,6 @@ impl std::fmt::Display for Action {
             Action::SetMode(mode) => write!(f, "Go {}", mode),
             Action::StartCapture => write!(f, "Start key capture"),
             Action::StopCapture => write!(f, "Stop key capture"),
-            Action::SubmitInput(text) => write!(f, "Submit {}", text),
             Action::UnlockModal => write!(f, "Unlock todoers"),
             Action::DeviceUnlock => write!(f, "Device unlock"),
             Action::Unlock { .. } => write!(f, "Unlock keys"),

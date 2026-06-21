@@ -2,6 +2,8 @@
 //! stays pure and unit-testable: `auth` builds/consumes the wire DTOs, `net` moves
 //! them over the wire.
 
+use std::path::Path;
+
 use anyhow::Context;
 use reqwest::Client;
 use tracing::error;
@@ -15,7 +17,6 @@ use todoers_types::{
 };
 
 use crate::auth::{self, AccountRow, NewAccount, UnlockedKeys};
-use crate::crypto::DeviceBackend;
 
 /// Run the full two-message OPAQUE registration against `base_url` and return the
 /// local `NewAccount` to persist. Network/server failures (including a duplicate
@@ -327,20 +328,24 @@ pub async fn device_login(
 /// token. If the server is unreachable, returns the cached keys with an empty
 /// token (offline unlock) rather than failing.
 #[tracing::instrument(skip(blob))]
-pub async fn unlock_via_device(
+pub async fn unlock_via_device<P: AsRef<Path> + std::fmt::Debug>(
     base_url: &str,
-    backend: DeviceBackend,
-    identity_path: &str,
+    identity_path: P,
     device_id: [u8; 16],
     blob: Vec<u8>,
 ) -> anyhow::Result<Zeroizing<UnlockedKeys>> {
-    let identity_contents = tokio::fs::read_to_string(identity_path)
+    let identity_contents = tokio::fs::read_to_string(identity_path.as_ref())
         .await
-        .with_context(|| format!("reading device identity file {identity_path}"))?;
+        .with_context(|| {
+            format!(
+                "reading device identity file {}",
+                identity_path.as_ref().display()
+            )
+        })?;
 
-    // age decryption (and any agent round-trips) are blocking; keep them off the loop.
+    // KEM decapsulation + AEAD are blocking; keep them off the loop.
     let payload = tokio::task::spawn_blocking(move || {
-        auth::unlock_from_device_cache(backend, &identity_contents, &blob)
+        auth::unlock_from_device_cache(&identity_contents, &blob)
     })
     .await
     .context("device unlock task panicked")?
@@ -350,10 +355,20 @@ pub async fn unlock_via_device(
     let device_uuid = Uuid::from_bytes(payload.device_id);
 
     let mut keys = payload.keys.clone();
-    match device_login(base_url, member_uuid, device_uuid, &payload.device_signing_seed).await {
+    match device_login(
+        base_url,
+        member_uuid,
+        device_uuid,
+        &payload.device_signing_seed,
+    )
+    .await
+    {
         Ok(resp) => keys.token = resp.token,
         Err(e) => {
-            error!(?e, "device login failed; continuing offline with cached keys");
+            error!(
+                ?e,
+                "device login failed; continuing offline with cached keys"
+            );
             keys.token = String::new();
         }
     }
@@ -367,7 +382,6 @@ pub async fn unlock_via_device(
 pub async fn enroll_this_device(
     base_url: &str,
     token: &str,
-    backend: DeviceBackend,
     recipient: &str,
     keys: &UnlockedKeys,
     label: &str,
@@ -377,12 +391,19 @@ pub async fn enroll_this_device(
     let keys = keys.clone();
     let recipient = recipient.to_string();
     let blob = tokio::task::spawn_blocking(move || {
-        auth::build_device_cache(backend, &recipient, &keys, device_id, device_seed, device_pub)
+        auth::build_device_cache(&recipient, &keys, device_id, device_seed, device_pub)
     })
     .await
     .context("device cache sealing panicked")?
     .context("failed to seal device cache")?;
 
-    enroll_device(base_url, token, Uuid::from_bytes(device_id), device_pub, label).await?;
+    enroll_device(
+        base_url,
+        token,
+        Uuid::from_bytes(device_id),
+        device_pub,
+        label,
+    )
+    .await?;
     Ok((device_id, blob))
 }

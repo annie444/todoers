@@ -8,7 +8,7 @@ use tracing::warn;
 use super::{Captures, Component};
 use crate::action::Action;
 use crate::app::Mode;
-use crate::config::Config;
+use crate::config::{ActionConfig, Config};
 use crate::tui::Event;
 
 #[derive(Default)]
@@ -54,34 +54,38 @@ impl Component for Keys {
     fn register_config_handler(&mut self, config: Config) -> anyhow::Result<()> {
         if let Some(keybinds) = config.keybindings.0.get(&self.mode) {
             let mut key_strs: IndexMap<String, Vec<String>> = IndexMap::new();
-            for (keys, action) in keybinds {
-                for key in keys {
-                    let mut key_str = String::new();
-                    if !key.modifiers.is_empty() {
-                        if key.modifiers.contains(KeyModifiers::CONTROL) {
-                            key_str.push_str("Ctrl+");
+            for (keys, action_cfg) in keybinds {
+                if let ActionConfig::Show { action, show } = action_cfg
+                    && *show
+                {
+                    for key in keys {
+                        let mut key_str = String::new();
+                        if !key.modifiers.is_empty() {
+                            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                                key_str.push_str("Ctrl+");
+                            }
+                            if key.modifiers.contains(KeyModifiers::ALT) {
+                                key_str.push_str("Alt+");
+                            }
+                            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                                key_str.push_str("Shift+");
+                            }
+                            if key.modifiers.contains(KeyModifiers::SUPER) {
+                                key_str.push_str("Super+");
+                            }
+                            if key.modifiers.contains(KeyModifiers::META) {
+                                key_str.push_str("Meta+");
+                            }
+                            if key.modifiers.contains(KeyModifiers::HYPER) {
+                                key_str.push_str("Hyper+");
+                            }
                         }
-                        if key.modifiers.contains(KeyModifiers::ALT) {
-                            key_str.push_str("Alt+");
-                        }
-                        if key.modifiers.contains(KeyModifiers::SHIFT) {
-                            key_str.push_str("Shift+");
-                        }
-                        if key.modifiers.contains(KeyModifiers::SUPER) {
-                            key_str.push_str("Super+");
-                        }
-                        if key.modifiers.contains(KeyModifiers::META) {
-                            key_str.push_str("Meta+");
-                        }
-                        if key.modifiers.contains(KeyModifiers::HYPER) {
-                            key_str.push_str("Hyper+");
-                        }
+                        key_str.push_str(&format!("{}", key.code));
+                        key_strs
+                            .entry(action.to_string())
+                            .or_default()
+                            .push(key_str);
                     }
-                    key_str.push_str(&format!("{}", key.code));
-                    key_strs
-                        .entry(action.to_string())
-                        .or_default()
-                        .push(key_str);
                 }
             }
             for (action, keys) in key_strs.into_iter() {

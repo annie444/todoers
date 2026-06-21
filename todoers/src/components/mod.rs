@@ -26,7 +26,7 @@ pub use login::Login;
 pub use modal::Modal;
 pub use prompt::Prompt;
 pub use register::Register;
-pub use text_input::TextInput;
+pub use text_input::{EditorMode, TextInput};
 pub use unlock::Unlock;
 
 /// `Captures` is a trait that indicates whether a component captures input events.
@@ -134,6 +134,24 @@ pub trait Component: Captures {
     fn handle_mouse_event(&mut self, mouse: MouseEvent) -> anyhow::Result<Option<Action>> {
         let _ = mouse; // to appease clippy
         Ok(None)
+    }
+    /// Whether this component will *consume* an `Esc` press rather than letting it
+    /// bubble up to close/cancel the surrounding modal or form.
+    ///
+    /// This exists for Vim-style editing: while a text field is in Insert/Visual/
+    /// Operator-pending mode, `Esc` returns it to Normal mode and must not also
+    /// dismiss the dialog. In Emacs mode (and Vim Normal mode) this is `false`, so
+    /// `Esc` keeps its existing close/cancel behavior. Container components delegate
+    /// to whichever child currently holds focus.
+    fn consumes_escape(&self) -> bool {
+        false
+    }
+    /// The Vim editing sub-mode to surface in the status footer, if this component
+    /// (or whichever child currently has focus) is a focused Vim text field.
+    /// Returns `None` in Emacs mode or when no Vim field is focused. Container
+    /// components delegate to the focused child.
+    fn editor_mode(&self) -> Option<EditorMode> {
+        None
     }
     /// Update the state of the component based on a received action. (REQUIRED)
     ///

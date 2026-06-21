@@ -1,63 +1,377 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{prelude::*, widgets::*};
-use ratatui_textarea::TextArea;
+use ratatui_textarea::{CursorMove, Input, Key, TextArea};
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::debug;
-use unicode_width::UnicodeWidthStr;
 
 use super::{Captures, Component};
 use crate::action::Action;
-use crate::config::Config;
+use crate::config::{Config, EditingMode};
 use crate::tui::Event;
 
-/// A single-line text input.
+/// Character used to mask password fields.
+const MASK_CHAR: char = '•';
+
+/// A single-line text input backed by [`ratatui_textarea::TextArea`].
+///
+/// The widget does all of the editing, cursor placement, and horizontal
+/// scrolling. We only choose *which* key bindings drive it: in
+/// [`EditingMode::Emacs`] keys are handed straight to [`TextArea::input`] (which
+/// ships a full emacs keymap); in [`EditingMode::Vim`] they run through a small
+/// modal [`VimState`] machine layered on [`TextArea::input_without_shortcuts`].
 #[derive(Default)]
 pub struct TextInput {
     command_tx: Option<UnboundedSender<Action>>,
     config: Config,
-    /// The current contents of the field.
-    text: String,
-    /// Cursor position as a CHARACTER index into `text` (`0..=text.chars().count()`).
-    cursor: usize,
     /// Whether the input is currently capturing keystrokes.
     capturing: bool,
     /// When set, render the contents as bullets (for passwords).
     mask: bool,
     /// Shown as the bordered block's title.
     label: String,
-    /// The actual text area widget, which we use for its built-in
-    /// horizontal scrolling and cursor placement logic.
-    text_area: TextArea,
+    /// The editing widget; owns the text buffer and cursor.
+    text_area: TextArea<'static>,
+    /// Vim modal-editing state. Only consulted in [`EditingMode::Vim`].
+    vim: VimState,
 }
 
-/// A normalized editing intent, decoupled from raw key events.
-///
-/// `map_key` turns a [`KeyEvent`] into one of these; `apply` is the only place
-/// that mutates `(text, cursor)`. Remove the `allow(dead_code)` once every
-/// variant is produced by `map_key` and consumed by `apply`.
-#[allow(dead_code)]
+/// A user-facing label for a focused field's editing mode, surfaced in the
+/// status footer (lualine-style). Only produced for fields in [`EditingMode::Vim`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Edit<'a> {
-    /// Insert a character at the cursor.
-    Insert(char),
-    /// Insert a string at the cursor (for paste events).
-    String(&'a str),
-    /// Delete the character before the cursor (Backspace).
-    DeleteBack,
-    /// Delete the character at the cursor (Delete).
-    DeleteFwd,
-    /// Move the cursor one character left.
-    Left,
-    /// Move the cursor one character right.
-    Right,
-    /// Move the cursor to the start of the line.
-    Home,
-    /// Move the cursor to the end of the line.
-    End,
-    /// Commit the current contents (Enter).
-    Submit,
-    /// Abandon capture (Esc).
-    Cancel,
+pub enum EditorMode {
+    Normal,
+    Insert,
+    Visual,
+    /// An operator (`d`/`c`/`y`) is waiting for a motion.
+    OperatorPending,
+}
+
+impl EditorMode {
+    /// Short uppercase label, e.g. `"NORMAL"`.
+    pub fn label(self) -> &'static str {
+        match self {
+            EditorMode::Normal => "NORMAL",
+            EditorMode::Insert => "INSERT",
+            EditorMode::Visual => "VISUAL",
+            EditorMode::OperatorPending => "O-PENDING",
+        }
+    }
+}
+
+/// The current Vim sub-mode of a field.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum VimMode {
+    /// Motions and operators; `i`/`a`/… switch to [`VimMode::Insert`].
+    #[default]
+    Normal,
+    /// Plain text entry; `Esc` returns to [`VimMode::Normal`].
+    Insert,
+    /// A selection is active; motions extend it, `d`/`c`/`y` operate on it.
+    Visual,
+    /// An operator (`d`/`c`/`y`) was pressed and is waiting for a motion.
+    Operator(char),
+}
+
+/// Minimal modal-editing state machine for a single-line [`TextArea`].
+#[derive(Debug, Default)]
+struct VimState {
+    mode: VimMode,
+    /// Accumulates a numeric count prefix (e.g. the `2` in `2dw`).
+    count: Option<usize>,
+}
+
+impl VimState {
+    /// Drive the textarea from one key. Returns an [`Action`] to emit upstream,
+    /// if any (currently always `None` — submit is owned by the parent form).
+    fn on_key(&mut self, ta: &mut TextArea<'static>, input: Input) -> Option<Action> {
+        match self.mode {
+            VimMode::Insert => self.insert_key(ta, input),
+            VimMode::Normal => self.normal_key(ta, input),
+            VimMode::Visual => self.visual_key(ta, input),
+            VimMode::Operator(op) => self.operator_key(ta, op, input),
+        }
+    }
+
+    /// In Insert mode every key edits, except `Esc`/`Ctrl-C` which leave to Normal
+    /// (Vim parks the cursor one column left on exit).
+    fn insert_key(&mut self, ta: &mut TextArea<'static>, input: Input) -> Option<Action> {
+        if input.key == Key::Esc || (input.ctrl && input.key == Key::Char('c')) {
+            self.mode = VimMode::Normal;
+            ta.move_cursor(CursorMove::Back);
+            return None;
+        }
+        ta.input_without_shortcuts(input);
+        None
+    }
+
+    /// Normalize a key into the `char` command Vim thinks in (arrows alias to hjkl,
+    /// Home/End to `0`/`$`, etc.). Returns `None` for keys Vim ignores.
+    fn command_char(input: Input) -> Option<char> {
+        Some(match input.key {
+            Key::Char(c) => c,
+            Key::Left | Key::Backspace => 'h',
+            Key::Right => 'l',
+            Key::Up => 'k',
+            Key::Down => 'j',
+            Key::Home => '0',
+            Key::End => '$',
+            Key::Delete => 'x',
+            _ => return None,
+        })
+    }
+
+    fn normal_key(&mut self, ta: &mut TextArea<'static>, input: Input) -> Option<Action> {
+        // Ctrl-R = redo (the only Ctrl chord we honor in Normal mode).
+        if input.ctrl && input.key == Key::Char('r') {
+            ta.redo();
+            self.count = None;
+            return None;
+        }
+        let Some(c) = Self::command_char(input) else {
+            self.count = None;
+            return None;
+        };
+
+        // Count prefix: any digit, plus `0` once a count is already in progress.
+        if c.is_ascii_digit() && (c != '0' || self.count.is_some()) {
+            let d = c.to_digit(10).unwrap() as usize;
+            self.count = Some(self.count.unwrap_or(0) * 10 + d);
+            return None;
+        }
+        let n = self.count.take().unwrap_or(1);
+
+        match c {
+            'h' => repeat(n, || ta.move_cursor(CursorMove::Back)),
+            'l' => repeat(n, || ta.move_cursor(CursorMove::Forward)),
+            'j' => repeat(n, || ta.move_cursor(CursorMove::Down)),
+            'k' => repeat(n, || ta.move_cursor(CursorMove::Up)),
+            'w' => repeat(n, || ta.move_cursor(CursorMove::WordForward)),
+            'e' => repeat(n, || ta.move_cursor(CursorMove::WordEnd)),
+            'b' => repeat(n, || ta.move_cursor(CursorMove::WordBack)),
+            '0' | '^' => ta.move_cursor(CursorMove::Head),
+            '$' => ta.move_cursor(CursorMove::End),
+            'i' => self.mode = VimMode::Insert,
+            'I' => {
+                ta.move_cursor(CursorMove::Head);
+                self.mode = VimMode::Insert;
+            }
+            'a' => {
+                ta.move_cursor(CursorMove::Forward);
+                self.mode = VimMode::Insert;
+            }
+            // `A`, and `o`/`O` on a single line, all open insert at end of line.
+            'A' | 'o' | 'O' => {
+                ta.move_cursor(CursorMove::End);
+                self.mode = VimMode::Insert;
+            }
+            'x' => repeat(n, || {
+                ta.delete_next_char();
+            }),
+            'D' => {
+                ta.delete_line_by_end();
+            }
+            'C' => {
+                ta.delete_line_by_end();
+                self.mode = VimMode::Insert;
+            }
+            's' => {
+                ta.delete_next_char();
+                self.mode = VimMode::Insert;
+            }
+            'p' | 'P' => {
+                ta.paste();
+            }
+            'u' => {
+                ta.undo();
+            }
+            'v' => {
+                ta.start_selection();
+                self.mode = VimMode::Visual;
+            }
+            'd' | 'c' | 'y' => self.mode = VimMode::Operator(c),
+            _ => {}
+        }
+        None
+    }
+
+    fn visual_key(&mut self, ta: &mut TextArea<'static>, input: Input) -> Option<Action> {
+        if input.key == Key::Esc {
+            ta.cancel_selection();
+            self.mode = VimMode::Normal;
+            return None;
+        }
+        let c = Self::command_char(input)?;
+        if c.is_ascii_digit() && (c != '0' || self.count.is_some()) {
+            let d = c.to_digit(10).unwrap() as usize;
+            self.count = Some(self.count.unwrap_or(0) * 10 + d);
+            return None;
+        }
+        let n = self.count.take().unwrap_or(1);
+        match c {
+            'h' => repeat(n, || ta.move_cursor(CursorMove::Back)),
+            'l' => repeat(n, || ta.move_cursor(CursorMove::Forward)),
+            'w' => repeat(n, || ta.move_cursor(CursorMove::WordForward)),
+            'e' => repeat(n, || ta.move_cursor(CursorMove::WordEnd)),
+            'b' => repeat(n, || ta.move_cursor(CursorMove::WordBack)),
+            '0' | '^' => ta.move_cursor(CursorMove::Head),
+            '$' => ta.move_cursor(CursorMove::End),
+            'd' | 'x' => {
+                ta.cut();
+                self.mode = VimMode::Normal;
+            }
+            'c' => {
+                ta.cut();
+                self.mode = VimMode::Insert;
+            }
+            'y' => {
+                ta.copy();
+                ta.cancel_selection();
+                self.mode = VimMode::Normal;
+            }
+            'v' => {
+                ta.cancel_selection();
+                self.mode = VimMode::Normal;
+            }
+            _ => {}
+        }
+        None
+    }
+
+    fn operator_key(
+        &mut self,
+        ta: &mut TextArea<'static>,
+        op: char,
+        input: Input,
+    ) -> Option<Action> {
+        if input.key == Key::Esc {
+            self.mode = VimMode::Normal;
+            self.count = None;
+            return None;
+        }
+        let Some(c) = Self::command_char(input) else {
+            self.mode = VimMode::Normal;
+            self.count = None;
+            return None;
+        };
+        let n = self.count.take().unwrap_or(1);
+
+        // Doubled operator (`dd`/`cc`/`yy`) acts on the whole line.
+        if c == op {
+            ta.move_cursor(CursorMove::Head);
+            ta.start_selection();
+            ta.move_cursor(CursorMove::End);
+            self.finish_operator(ta, op);
+            return None;
+        }
+
+        // Operator + motion: select across the motion, then apply.
+        ta.start_selection();
+        let moved = match c {
+            'w' => {
+                repeat(n, || ta.move_cursor(CursorMove::WordForward));
+                true
+            }
+            'e' => {
+                repeat(n, || ta.move_cursor(CursorMove::WordEnd));
+                true
+            }
+            'b' => {
+                repeat(n, || ta.move_cursor(CursorMove::WordBack));
+                true
+            }
+            'h' => {
+                repeat(n, || ta.move_cursor(CursorMove::Back));
+                true
+            }
+            'l' => {
+                repeat(n, || ta.move_cursor(CursorMove::Forward));
+                true
+            }
+            '0' | '^' => {
+                ta.move_cursor(CursorMove::Head);
+                true
+            }
+            '$' => {
+                ta.move_cursor(CursorMove::End);
+                true
+            }
+            _ => false,
+        };
+        if moved {
+            self.finish_operator(ta, op);
+        } else {
+            ta.cancel_selection();
+            self.mode = VimMode::Normal;
+        }
+        None
+    }
+
+    /// Apply the pending operator to the active selection and set the next mode.
+    fn finish_operator(&mut self, ta: &mut TextArea<'static>, op: char) {
+        match op {
+            'd' => {
+                ta.cut();
+                self.mode = VimMode::Normal;
+            }
+            'c' => {
+                ta.cut();
+                self.mode = VimMode::Insert;
+            }
+            'y' => {
+                ta.copy();
+                ta.cancel_selection();
+                self.mode = VimMode::Normal;
+            }
+            _ => self.mode = VimMode::Normal,
+        }
+    }
+}
+
+/// Run `f` `n` times (vim count prefix on a motion/edit).
+fn repeat(n: usize, mut f: impl FnMut()) {
+    for _ in 0..n {
+        f();
+    }
+}
+
+/// Convert a crossterm [`KeyEvent`] into a backend-agnostic [`Input`].
+///
+/// Built by hand rather than via `Input::from` so it is decoupled from whichever
+/// crossterm version `ratatui-textarea` links against.
+fn to_input(key: KeyEvent) -> Input {
+    let k = match key.code {
+        KeyCode::Char(c) => Key::Char(c),
+        KeyCode::Backspace => Key::Backspace,
+        KeyCode::Enter => Key::Enter,
+        KeyCode::Left => Key::Left,
+        KeyCode::Right => Key::Right,
+        KeyCode::Up => Key::Up,
+        KeyCode::Down => Key::Down,
+        KeyCode::Tab => Key::Tab,
+        KeyCode::Delete => Key::Delete,
+        KeyCode::Home => Key::Home,
+        KeyCode::End => Key::End,
+        KeyCode::PageUp => Key::PageUp,
+        KeyCode::PageDown => Key::PageDown,
+        KeyCode::Esc => Key::Esc,
+        KeyCode::F(n) => Key::F(n),
+        _ => Key::Null,
+    };
+    Input {
+        key: k,
+        ctrl: key.modifiers.contains(KeyModifiers::CONTROL),
+        alt: key.modifiers.contains(KeyModifiers::ALT),
+        shift: key.modifiers.contains(KeyModifiers::SHIFT),
+    }
+}
+
+/// Build a fresh, empty textarea, applying the mask char for password fields.
+fn build_textarea(mask: bool) -> TextArea<'static> {
+    let mut ta = TextArea::default();
+    if mask {
+        ta.set_mask_char(MASK_CHAR);
+    }
+    ta
 }
 
 impl TextInput {
@@ -80,16 +394,24 @@ impl TextInput {
     #[tracing::instrument(skip(self))]
     pub fn masked(mut self) -> Self {
         self.mask = true;
+        self.text_area.set_mask_char(MASK_CHAR);
         self
     }
 
-    /// Give this input keyboard focus: start capturing and park the cursor at the
-    /// end of the existing contents. Unlike `Action::StartCapture`, this does NOT
-    /// clear the text — a multi-field form keeps each field's value while focus moves.
+    /// The current Vim sub-mode (Normal by default / in Emacs mode).
+    fn editing_mode(&self) -> EditingMode {
+        self.config.config.editing_mode
+    }
+
+    /// Give this input keyboard focus: start capturing, park the cursor at the end
+    /// of the existing contents, and (in Vim) reset to Normal mode. Unlike
+    /// `Action::StartCapture`, this does NOT clear the text — a multi-field form
+    /// keeps each field's value while focus moves between them.
     #[tracing::instrument(skip(self))]
     pub fn focus(&mut self) {
         self.capturing = true;
-        self.cursor = self.char_count();
+        self.text_area.move_cursor(CursorMove::End);
+        self.vim = VimState::default();
     }
 
     /// Remove keyboard focus (stop capturing) without disturbing the contents.
@@ -98,95 +420,16 @@ impl TextInput {
         self.capturing = false;
     }
 
-    /// The current contents of the field.
+    /// The current contents of the field. (Single-line, so the lines join to one.)
     #[tracing::instrument(skip(self))]
-    pub fn value(&self) -> &str {
-        &self.text
+    pub fn value(&self) -> String {
+        self.text_area.lines().join("")
     }
 
-    /// Number of characters currently in the field (NOT bytes).
-    #[tracing::instrument(skip(self))]
-    fn char_count(&self) -> usize {
-        self.text.chars().count()
-    }
-
-    /// Byte offset of character index `idx`, or `text.len()` if `idx` is at/past
-    /// the end. Use this to convert the character-indexed cursor into the byte
-    /// index that `String::insert` / `String::remove` expect.
-    #[tracing::instrument(skip(self))]
-    fn byte_at(&self, idx: usize) -> usize {
-        self.text
-            .char_indices()
-            .nth(idx)
-            .map(|(b, _)| b)
-            .unwrap_or(self.text.len())
-    }
-
-    /// Translate a key event into an editing intent, or `None` to ignore it.
-    #[tracing::instrument]
-    fn map_key<'a>(key: KeyEvent) -> Option<Edit<'a>> {
-        match key.code {
-            KeyCode::Char(c)
-                if !key
-                    .modifiers
-                    .contains(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
-                Some(Edit::Insert(c))
-            }
-            KeyCode::Backspace => Some(Edit::DeleteBack),
-            KeyCode::Delete => Some(Edit::DeleteFwd),
-            KeyCode::Left => Some(Edit::Left),
-            KeyCode::Right => Some(Edit::Right),
-            KeyCode::Home => Some(Edit::Home),
-            KeyCode::End => Some(Edit::End),
-            KeyCode::Enter => Some(Edit::Submit),
-            KeyCode::Esc => Some(Edit::Cancel),
-            _ => None,
-        }
-    }
-
-    /// Apply an editing intent to `(text, cursor)` and return an [`Action`] to
-    /// emit upstream, if any.
-    #[tracing::instrument(skip(self))]
-    fn apply(&mut self, edit: Edit) -> Option<Action> {
-        match edit {
-            Edit::Insert(c) => {
-                let at = self.byte_at(self.cursor);
-                self.text.insert(at, c);
-                self.cursor += 1;
-            }
-            Edit::String(s) => {
-                let at = self.byte_at(self.cursor);
-                self.text.insert_str(at, &s);
-                self.cursor += s.chars().count();
-            }
-            Edit::DeleteBack => {
-                if self.cursor > 0 {
-                    let at = self.byte_at(self.cursor - 1);
-                    self.text.remove(at); // remove() takes a byte index, returns the char
-                    self.cursor -= 1;
-                }
-            }
-            Edit::DeleteFwd => {
-                if self.cursor < self.char_count() {
-                    let at = self.byte_at(self.cursor);
-                    self.text.remove(at);
-                }
-            }
-            Edit::Left => self.cursor = self.cursor.saturating_sub(1),
-            Edit::Right => self.cursor = (self.cursor + 1).min(self.char_count()),
-            Edit::Home => self.cursor = 0,
-            Edit::End => self.cursor = self.char_count(),
-            Edit::Submit => {
-                let action = Action::SubmitInput(self.text.clone());
-                self.capturing = false;
-                self.text.clear();
-                self.cursor = 0;
-                return Some(action);
-            }
-            Edit::Cancel => return Some(Action::StopCapture),
-        }
-        None
+    /// Clear the buffer and reset Vim state (used when capture (re)starts).
+    fn reset(&mut self) {
+        self.text_area = build_textarea(self.mask);
+        self.vim = VimState::default();
     }
 }
 
@@ -210,7 +453,12 @@ impl Component for TextInput {
         let action = match event {
             Some(Event::Key(key_event)) => self.handle_key_event(key_event)?,
             Some(Event::Mouse(mouse_event)) => self.handle_mouse_event(mouse_event)?,
-            Some(Event::Paste(text)) => self.apply(Edit::String(&text)),
+            Some(Event::Paste(text)) => {
+                if self.capturing {
+                    self.text_area.insert_str(&text);
+                }
+                None
+            }
             _ => None,
         };
         Ok(action)
@@ -222,7 +470,36 @@ impl Component for TextInput {
             return Ok(None);
         }
         debug!("saw key event: {key:?}");
-        Ok(Self::map_key(key).and_then(|edit| self.apply(edit)))
+        let input = to_input(key);
+        match self.editing_mode() {
+            EditingMode::Emacs => {
+                self.text_area.input(input);
+                Ok(None)
+            }
+            EditingMode::Vim => Ok(self.vim.on_key(&mut self.text_area, input)),
+        }
+    }
+
+    /// In Vim mode, an `Esc` pressed while *not* in Normal mode is consumed to
+    /// return to Normal — so it must not also close the surrounding modal/form.
+    #[tracing::instrument(skip(self))]
+    fn consumes_escape(&self) -> bool {
+        self.editing_mode() == EditingMode::Vim && self.vim.mode != VimMode::Normal
+    }
+
+    /// The Vim sub-mode label to show in the footer, or `None` when the field is
+    /// not a focused Vim field (Emacs mode or not capturing).
+    #[tracing::instrument(skip(self))]
+    fn editor_mode(&self) -> Option<EditorMode> {
+        if self.editing_mode() != EditingMode::Vim || !self.capturing {
+            return None;
+        }
+        Some(match self.vim.mode {
+            VimMode::Normal => EditorMode::Normal,
+            VimMode::Insert => EditorMode::Insert,
+            VimMode::Visual => EditorMode::Visual,
+            VimMode::Operator(_) => EditorMode::OperatorPending,
+        })
     }
 
     #[tracing::instrument(skip(self))]
@@ -230,8 +507,7 @@ impl Component for TextInput {
         match action {
             Action::StartCapture => {
                 self.capturing = true;
-                self.text.clear();
-                self.cursor = 0;
+                self.reset();
             }
             Action::StopCapture => {
                 self.capturing = false;
@@ -262,25 +538,19 @@ impl Component for TextInput {
             .title(self.label.as_str());
         let inner = block.inner(area);
         frame.render_widget(block, area);
-        // Bullets are width-1, so the cursor column math below (which measures the
-        // raw text) still lines up for masked fields.
-        let display = if self.mask {
-            "•".repeat(self.char_count())
-        } else {
-            self.text.clone()
-        };
-        frame.render_widget(Paragraph::new(display), inner);
 
-        // Place the hardware cursor at the correct DISPLAY column. The column is
-        // the rendered width of the text before the cursor — not the character
-        // count — so wide glyphs (CJK, emoji) line up. (Basic version: assumes
-        // the text fits; long-line horizontal scrolling is a later enhancement.)
-        if self.capturing {
-            let before: String = self.text.chars().take(self.cursor).collect();
-            let col = UnicodeWidthStr::width(before.as_str()) as u16;
-            let max_col = inner.width.saturating_sub(1);
-            frame.set_cursor_position((inner.x + col.min(max_col), inner.y));
-        }
+        // The cursor is a styled cell rendered by the widget itself: a reversed
+        // block while editing, a distinct color in Vim Normal/Visual mode, and
+        // hidden (no highlight) when the field is not focused.
+        let cursor_style = if !self.capturing {
+            Style::default()
+        } else if self.editing_mode() == EditingMode::Vim && self.vim.mode != VimMode::Insert {
+            Style::default().fg(Color::Black).bg(Color::Green)
+        } else {
+            Style::default().add_modifier(Modifier::REVERSED)
+        };
+        self.text_area.set_cursor_style(cursor_style);
+        frame.render_widget(&self.text_area, inner);
         Ok(())
     }
 }
@@ -288,108 +558,144 @@ impl Component for TextInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::KeyModifiers;
     use pretty_assertions::assert_eq;
 
-    /// Build an input in a known state for testing `apply` in isolation.
-    fn input(text: &str, cursor: usize) -> TextInput {
-        TextInput {
-            text: text.to_string(),
-            cursor,
-            capturing: true,
-            ..Default::default()
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::empty())
+    }
+
+    fn ch(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty())
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    /// An Emacs-mode input, focused and ready to type.
+    fn emacs() -> TextInput {
+        let mut ti = TextInput::new();
+        ti.capturing = true;
+        ti
+    }
+
+    /// A Vim-mode input, focused and starting in Normal mode.
+    fn vim() -> TextInput {
+        let mut ti = TextInput::new();
+        ti.config.config.editing_mode = EditingMode::Vim;
+        ti.capturing = true;
+        ti
+    }
+
+    fn typed(ti: &mut TextInput, s: &str) {
+        for c in s.chars() {
+            ti.handle_key_event(ch(c)).unwrap();
         }
     }
 
     #[test]
-    fn insert_at_cursor() {
-        let mut ti = input("ac", 1);
-        assert_eq!(ti.apply(Edit::Insert('b')), None);
-        assert_eq!(ti.text, "abc");
-        assert_eq!(ti.cursor, 2);
+    fn emacs_typing_inserts_text() {
+        let mut ti = emacs();
+        typed(&mut ti, "hello");
+        assert_eq!(ti.value(), "hello");
     }
 
     #[test]
-    fn insert_at_end() {
-        let mut ti = input("ab", 2);
-        ti.apply(Edit::Insert('c'));
-        assert_eq!(ti.text, "abc");
-        assert_eq!(ti.cursor, 3);
+    fn emacs_backspace_deletes_before_cursor() {
+        let mut ti = emacs();
+        typed(&mut ti, "abc");
+        ti.handle_key_event(key(KeyCode::Backspace)).unwrap();
+        assert_eq!(ti.value(), "ab");
     }
 
+    /// Ctrl-A jumps to the head, so the next insert lands at the start.
     #[test]
-    fn delete_back_removes_char_before_cursor() {
-        let mut ti = input("abc", 2);
-        ti.apply(Edit::DeleteBack);
-        assert_eq!(ti.text, "ac");
-        assert_eq!(ti.cursor, 1);
+    fn emacs_ctrl_a_moves_to_head() {
+        let mut ti = emacs();
+        typed(&mut ti, "abc");
+        ti.handle_key_event(ctrl('a')).unwrap();
+        typed(&mut ti, "X");
+        assert_eq!(ti.value(), "Xabc");
     }
 
+    /// Ctrl-E returns to the end; Ctrl-K kills to end of line.
     #[test]
-    fn delete_back_at_start_is_noop() {
-        let mut ti = input("abc", 0);
-        ti.apply(Edit::DeleteBack);
-        assert_eq!(ti.text, "abc");
-        assert_eq!(ti.cursor, 0);
+    fn emacs_ctrl_k_kills_to_end() {
+        let mut ti = emacs();
+        typed(&mut ti, "abcdef");
+        ti.handle_key_event(ctrl('a')).unwrap();
+        ti.handle_key_event(key(KeyCode::Right)).unwrap();
+        ti.handle_key_event(key(KeyCode::Right)).unwrap();
+        ti.handle_key_event(ctrl('k')).unwrap();
+        assert_eq!(ti.value(), "ab");
     }
 
+    /// Editing is Unicode-safe: multibyte glyphs are deleted whole.
     #[test]
-    fn delete_fwd_removes_char_at_cursor() {
-        let mut ti = input("abc", 1);
-        ti.apply(Edit::DeleteFwd);
-        assert_eq!(ti.text, "ac");
-        assert_eq!(ti.cursor, 1);
+    fn emacs_editing_is_unicode_safe() {
+        let mut ti = emacs();
+        typed(&mut ti, "café");
+        ti.handle_key_event(key(KeyCode::Backspace)).unwrap();
+        assert_eq!(ti.value(), "caf");
     }
 
+    /// Without `i`, Vim Normal mode ignores typed letters as commands.
     #[test]
-    fn delete_fwd_at_end_is_noop() {
-        let mut ti = input("abc", 3);
-        ti.apply(Edit::DeleteFwd);
-        assert_eq!(ti.text, "abc");
-        assert_eq!(ti.cursor, 3);
+    fn vim_normal_does_not_insert() {
+        let mut ti = vim();
+        typed(&mut ti, "hello");
+        assert_eq!(ti.value(), "");
     }
 
+    /// `i` enters Insert mode; subsequent keys type; `Esc` returns to Normal.
     #[test]
-    fn cursor_moves_clamp_to_bounds() {
-        let mut ti = input("ab", 0);
-        ti.apply(Edit::Left); // already at start, stays
-        assert_eq!(ti.cursor, 0);
-        ti.apply(Edit::Right);
-        assert_eq!(ti.cursor, 1);
-        ti.apply(Edit::End);
-        assert_eq!(ti.cursor, 2);
-        ti.apply(Edit::Right); // already at end, stays
-        assert_eq!(ti.cursor, 2);
-        ti.apply(Edit::Home);
-        assert_eq!(ti.cursor, 0);
+    fn vim_insert_then_escape() {
+        let mut ti = vim();
+        assert!(!ti.consumes_escape());
+        ti.handle_key_event(ch('i')).unwrap();
+        assert!(ti.consumes_escape(), "Insert mode must swallow Esc");
+        typed(&mut ti, "hi");
+        assert_eq!(ti.value(), "hi");
+        ti.handle_key_event(key(KeyCode::Esc)).unwrap();
+        assert!(!ti.consumes_escape(), "back in Normal mode, Esc bubbles up");
+        assert_eq!(ti.vim.mode, VimMode::Normal);
     }
 
-    /// The reason the cursor is a *character* index: byte-indexing would split
-    /// or mis-count multi-byte UTF-8 here ("é" is two bytes).
+    /// `x` deletes the char under the cursor in Normal mode.
     #[test]
-    fn editing_is_unicode_safe() {
-        let mut ti = input("café", 4); // 4 chars, 5 bytes
-        ti.apply(Edit::DeleteBack); // remove 'é'
-        assert_eq!(ti.text, "caf");
-        assert_eq!(ti.cursor, 3);
-
-        let mut ti = input("aé", 1); // cursor between 'a' and 'é'
-        ti.apply(Edit::Insert('X'));
-        assert_eq!(ti.text, "aXé");
-        assert_eq!(ti.cursor, 2);
+    fn vim_x_deletes_char() {
+        let mut ti = vim();
+        ti.handle_key_event(ch('i')).unwrap();
+        typed(&mut ti, "abc");
+        ti.handle_key_event(key(KeyCode::Esc)).unwrap(); // cursor parks on 'c'
+        ti.handle_key_event(ch('0')).unwrap(); // back to head ('a')
+        ti.handle_key_event(ch('x')).unwrap();
+        assert_eq!(ti.value(), "bc");
     }
 
+    /// `dd` clears the (single) line.
     #[test]
-    fn submit_emits_action_with_current_text() {
-        let mut ti = input("hello", 5);
-        assert_eq!(
-            ti.apply(Edit::Submit),
-            Some(Action::SubmitInput("hello".to_string()))
-        );
+    fn vim_dd_clears_line() {
+        let mut ti = vim();
+        ti.handle_key_event(ch('i')).unwrap();
+        typed(&mut ti, "delete me");
+        ti.handle_key_event(key(KeyCode::Esc)).unwrap();
+        ti.handle_key_event(ch('d')).unwrap();
+        ti.handle_key_event(ch('d')).unwrap();
+        assert_eq!(ti.value(), "");
     }
 
+    /// `A` appends at end of line: enters insert mode with the cursor past the text.
     #[test]
-    fn cancel_stops_capture() {
-        let mut ti = input("hello", 5);
-        assert_eq!(ti.apply(Edit::Cancel), Some(Action::StopCapture));
+    fn vim_append_at_end() {
+        let mut ti = vim();
+        ti.handle_key_event(ch('i')).unwrap();
+        typed(&mut ti, "ab");
+        ti.handle_key_event(key(KeyCode::Esc)).unwrap();
+        ti.handle_key_event(ch('0')).unwrap();
+        ti.handle_key_event(ch('A')).unwrap();
+        typed(&mut ti, "cd");
+        assert_eq!(ti.value(), "abcd");
     }
 }

@@ -6,6 +6,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use super::{Button, Captures, Component};
 use crate::action::Action;
 use crate::config::Config;
+use crate::tui::Event;
 
 /// A centered overlay dialog that floats on top of whatever mode is running.
 ///
@@ -170,10 +171,42 @@ impl Component for Modal {
     }
 
     #[tracing::instrument(skip(self))]
+    fn editor_mode(&self) -> Option<super::EditorMode> {
+        if self.focus_body && self.body.captures_input() {
+            self.body.editor_mode()
+        } else {
+            None
+        }
+    }
+
+    #[tracing::instrument(skip(self))]
+    fn handle_events(&mut self, event: Option<Event>) -> anyhow::Result<Option<Action>> {
+        // Bracketed paste arrives as a single `Event::Paste`, which the default
+        // `handle_events` silently drops. Route it to a focused interactive body so
+        // its text field receives the pasted text; keys/mouse keep normal routing.
+        if let Some(Event::Paste(_)) = event
+            && self.focus_body
+            && self.body.captures_input()
+        {
+            return self.body.handle_events(event);
+        }
+        match event {
+            Some(Event::Key(key)) => self.handle_key_event(key),
+            Some(Event::Mouse(mouse)) => self.handle_mouse_event(mouse),
+            _ => Ok(None),
+        }
+    }
+
+    #[tracing::instrument(skip(self))]
     fn handle_key_event(&mut self, key: KeyEvent) -> anyhow::Result<Option<Action>> {
         // Esc dismisses the modal. Where that leads depends on the modal (quit
         // for the auth gate, back-to-chooser for a form, close for an info box).
+        // Exception: a focused Vim field mid-edit consumes Esc (Insert→Normal) and
+        // the dialog stays open — only a field already in Normal mode lets Esc through.
         if key.code == KeyCode::Esc {
+            if self.focus_body && self.body.captures_input() && self.body.consumes_escape() {
+                return self.body.handle_key_event(key);
+            }
             return Ok(Some(self.esc_action.clone()));
         }
 
@@ -351,6 +384,34 @@ mod tests {
             modal.handle_key_event(code(KeyCode::Enter)).unwrap(),
             Some(Action::SubmitForm)
         );
+        modal.update(Action::SubmitForm).unwrap();
+
+        match rx.try_recv() {
+            Ok(Action::Register { username, password }) => {
+                assert_eq!(username, "alice");
+                assert_eq!(password, Zeroizing::new("hunter2".to_string()));
+            }
+            other => panic!("expected Register, got {other:?}"),
+        }
+    }
+
+    /// A bracketed paste routes through the modal into the focused form field, so
+    /// submitting carries the pasted text (regression: paste was silently dropped).
+    #[test]
+    fn paste_routes_through_modal_into_form() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut modal = Modal::form("Register", Box::new(Register::new()), Action::AuthChooser);
+        modal.register_action_handler(tx).unwrap();
+        modal.update(Action::StartCapture).unwrap();
+
+        // Paste the username, then type the two password fields and submit.
+        modal
+            .handle_events(Some(Event::Paste("alice".to_string())))
+            .unwrap();
+        modal.handle_key_event(code(KeyCode::Tab)).unwrap();
+        type_str(&mut modal, "hunter2");
+        modal.handle_key_event(code(KeyCode::Tab)).unwrap();
+        type_str(&mut modal, "hunter2");
         modal.update(Action::SubmitForm).unwrap();
 
         match rx.try_recv() {

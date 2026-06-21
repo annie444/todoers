@@ -7,6 +7,7 @@ use zeroize::Zeroizing;
 use super::{Captures, Component, TextInput};
 use crate::action::Action;
 use crate::config::Config;
+use crate::tui::Event;
 
 /// Field indices into [`Register::fields`].
 const USERNAME: usize = 0;
@@ -144,6 +145,20 @@ impl Component for Register {
     }
 
     #[tracing::instrument(skip(self))]
+    fn handle_events(&mut self, event: Option<Event>) -> anyhow::Result<Option<Action>> {
+        // Bracketed paste arrives as a single `Event::Paste`, which the default
+        // `handle_events` drops. Forward it to the focused field.
+        if let Some(Event::Paste(_)) = event {
+            return self.fields[self.focused].handle_events(event);
+        }
+        match event {
+            Some(Event::Key(key)) => self.handle_key_event(key),
+            Some(Event::Mouse(mouse)) => self.handle_mouse_event(mouse),
+            _ => Ok(None),
+        }
+    }
+
+    #[tracing::instrument(skip(self))]
     fn handle_key_event(&mut self, key: KeyEvent) -> anyhow::Result<Option<Action>> {
         match key.code {
             KeyCode::Tab | KeyCode::Down => {
@@ -165,6 +180,11 @@ impl Component for Register {
                     Ok(Some(Action::FocusButtons))
                 }
             }
+            // In Vim mode, Esc while editing returns the field to Normal mode; let
+            // it consume the key instead of clearing the error / closing the modal.
+            KeyCode::Esc if self.fields[self.focused].consumes_escape() => {
+                self.fields[self.focused].handle_key_event(key)
+            }
             KeyCode::Esc => {
                 self.error = None;
                 Ok(None)
@@ -173,6 +193,16 @@ impl Component for Register {
             // only the focused field.
             _ => self.fields[self.focused].handle_key_event(key),
         }
+    }
+
+    #[tracing::instrument(skip(self))]
+    fn consumes_escape(&self) -> bool {
+        self.fields[self.focused].consumes_escape()
+    }
+
+    #[tracing::instrument(skip(self))]
+    fn editor_mode(&self) -> Option<super::EditorMode> {
+        self.fields[self.focused].editor_mode()
     }
 
     #[tracing::instrument(skip(self))]

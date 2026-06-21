@@ -1,41 +1,46 @@
 # Base URL of the todoers server. Override in your own config.toml if needed.
 server_url = "http://127.0.0.1:8192"
 
-# Password-less device unlock. Opt in per-device by setting these in your own
-# config.toml. After one normal password login this device seals its keys to
-# `recipient` and enrolls a trusted key with the server; later launches unlock
-# with `identity` and no password. Security note: the protection is only as
-# strong as the local key — prefer an agent/passphrase/hardware-backed key over a
-# plaintext identity file sitting next to the cache.
+# Text-field editing style: "emacs" (default) or "vim". Emacs gives the usual
+# terminal readline motions (Ctrl-A/E/F/B/K/W, Alt-F/B, arrows); Vim gives a
+# modal editor (press `i` to insert, Esc to return to normal mode).
+# editing_mode = "vim"
+
+# Password-less device unlock. Generate a post-quantum (X-Wing) keypair with
+# `todoers keygen <path>`; it writes the hex secret to <path> and prints the hex
+# public key. Set `recipient` to that public key and `identity` to <path>. After
+# one normal password login this device seals its keys to `recipient` and enrolls
+# a trusted key with the server; later launches unlock with `identity` and no
+# password. Security note: the protection is only as strong as the local key file —
+# keep the identity file readable only by you.
 #
 # [device_unlock]
 # enabled = true
-# backend = "age"                          # "age" or "ssh"
-# recipient = "age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p"
-# identity = "/home/you/.config/todoers/age-identity.txt"
+# recipient = "<hex public key from `todoers keygen`>"
+# identity = "/home/you/.config/todoers/device.key"
 
 [keybindings.home]
-q = "quit"
-"?" = "help_modal"
+q = { action = "quit", show = true }
+"?" = { action = "help_modal", show = true }
 ctrl-l = "login_modal"
 ctrl-r = "register_modal"
-ctrl-d = "quit"
-ctrl-c = "quit"
-ctrl-z = "suspend"
-"space+e" = "toggle_sidebar"
+ctrl-d = { action = "quit", show = true }
+ctrl-c = { action = "quit", show = true }
+ctrl-z = { action = "suspend", show = true }
+"space+e" = { action = "toggle_sidebar", show = true }
 
 [keybindings.register]
-"?" = "help_modal"
-ctrl-l = "login_modal"
-ctrl-d = "quit"
-ctrl-c = "quit"
-ctrl-z = "suspend"
-esc = "stop_capture"
+"?" = { action = "help_modal", show = true }
+ctrl-l = { action = "login_modal", show = true }
+ctrl-d = { action = "quit", show = true }
+ctrl-c = { action = "quit", show = true }
+ctrl-z = { action = "suspend", show = true }
+esc = { action = "suspend", show = true }
 
 [keybindings.login]
-"?" = "help_modal"
-ctrl-r = "register_modal"
-ctrl-d = "quit"
-ctrl-c = "quit"
-ctrl-z = "suspend"
-esc = "stop_capture"
+"?" = { action = "help_modal", show = true }
+ctrl-r = { action = "register_modal", show = true }
+ctrl-d = { action = "quit", show = true }
+ctrl-c = { action = "quit", show = true }
+ctrl-z = { action = "suspend", show = true }
+esc = { action = "suspend", show = true }
