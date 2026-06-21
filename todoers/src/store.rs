@@ -27,7 +27,9 @@ use todoers_types::{ListId, Member, MemberId, Role};
 use crate::crypto;
 use crate::db::Db;
 use crate::list_doc::TodoDoc;
-use crate::model::{ListSummary, MetaList, Priority, SortMode, TodoItem, TodoItemInput, ViewTarget};
+use crate::model::{
+    ListSummary, MetaList, Priority, SortMode, TodoItem, TodoItemInput, ViewTarget,
+};
 use crate::session::Session;
 
 /// Signed/AEAD byte-layout version for produced updates. Must match the
@@ -117,7 +119,9 @@ impl Store {
 
         // The list row must exist before rows that FK-reference it (key_slots,
         // list_members, documents).
-        self.db.upsert_list(list_id, Role::Owner, epoch, name).await?;
+        self.db
+            .upsert_list(list_id, Role::Owner, epoch, name)
+            .await?;
 
         // Our own wrapped DEK (the only key slot the client persists locally).
         let wrapped = crypto::seal_to(&dek, &self.session.identity_pub());
@@ -313,10 +317,7 @@ impl Store {
         // Snapshot inputs without holding the borrow across an await.
         let (targets, sort) = {
             let v = view.borrow();
-            (
-                v.panes.iter().map(|p| p.target).collect::<Vec<_>>(),
-                v.sort,
-            )
+            (v.panes.iter().map(|p| p.target).collect::<Vec<_>>(), v.sort)
         };
         let mut summaries = self.list_summaries().await?;
         sort_summaries(&mut summaries, sort);
@@ -404,7 +405,11 @@ impl Store {
     /// DEK to them. The sealed DEK upload + server membership call land in the
     /// sync phase; here we keep the local mirror consistent.
     #[tracing::instrument(skip(self))]
-    pub async fn add_member_local(&mut self, list_id: ListId, member: Member) -> anyhow::Result<()> {
+    pub async fn add_member_local(
+        &mut self,
+        list_id: ListId,
+        member: Member,
+    ) -> anyhow::Result<()> {
         self.db.add_member_row(list_id, &member).await?;
         Ok(())
     }
@@ -610,7 +615,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            view.iter().map(|(_, i)| i.title.as_str()).collect::<Vec<_>>(),
+            view.iter()
+                .map(|(_, i)| i.title.as_str())
+                .collect::<Vec<_>>(),
             vec!["buy milk", "walk dog"]
         );
 

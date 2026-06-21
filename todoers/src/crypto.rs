@@ -374,7 +374,9 @@ pub fn device_open(identity_contents: &str, blob: &[u8]) -> AppResult<Vec<u8>> {
     let dk = DecapsulationKey::from(sk);
 
     if blob.len() < CIPHERTEXT_SIZE + 24 {
-        return Err(AppError::DeviceVault("device cache blob is too short".into()));
+        return Err(AppError::DeviceVault(
+            "device cache blob is too short".into(),
+        ));
     }
     let (ct_bytes, rest) = blob.split_at(CIPHERTEXT_SIZE);
     let (nonce, aead) = rest.split_at(24);

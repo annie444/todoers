@@ -50,7 +50,9 @@ impl Default for TodoDoc {
 impl TodoDoc {
     /// A fresh, empty document with a random peer id.
     pub fn new() -> Self {
-        Self { doc: LoroDoc::new() }
+        Self {
+            doc: LoroDoc::new(),
+        }
     }
 
     /// Rehydrate from a snapshot produced by [`TodoDoc::export_snapshot`].
@@ -246,7 +248,9 @@ impl TodoDoc {
     }
 
     pub fn toggle_subtask(&self, item_id: &str, subtask_id: &str) -> Result<()> {
-        let map = self.item_map(item_id).context("toggle_subtask: unknown item")?;
+        let map = self
+            .item_map(item_id)
+            .context("toggle_subtask: unknown item")?;
         let subs = map.get_or_create_container(SUBTASKS, LoroMovableList::new())?;
         for i in 0..subs.len() {
             let Some(sub) = movable_map_at(&subs, i) else {
@@ -267,7 +271,9 @@ impl TodoDoc {
     }
 
     pub fn remove_subtask(&self, item_id: &str, subtask_id: &str) -> Result<()> {
-        let map = self.item_map(item_id).context("remove_subtask: unknown item")?;
+        let map = self
+            .item_map(item_id)
+            .context("remove_subtask: unknown item")?;
         let subs = map.get_or_create_container(SUBTASKS, LoroMovableList::new())?;
         for i in 0..subs.len() {
             let matches = movable_map_at(&subs, i)

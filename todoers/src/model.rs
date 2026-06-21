@@ -145,7 +145,9 @@ impl MetaList {
             }
             MetaList::DueThisMonth => {
                 let last = time::util::days_in_month(now.month(), now.year()) as u8;
-                Some(end_of_day(now.replace_day(last).expect("valid day-of-month")))
+                Some(end_of_day(
+                    now.replace_day(last).expect("valid day-of-month"),
+                ))
             }
         }
     }
@@ -172,7 +174,11 @@ pub enum SortMode {
 
 impl SortMode {
     pub fn all() -> [SortMode; 3] {
-        [SortMode::Alphabetical, SortMode::DueDate, SortMode::Priority]
+        [
+            SortMode::Alphabetical,
+            SortMode::DueDate,
+            SortMode::Priority,
+        ]
     }
 
     pub fn label(self) -> &'static str {

@@ -143,11 +143,7 @@ impl Db {
 
     /// Store this device's sealed key cache + its server-side device id.
     #[tracing::instrument(skip(self, blob))]
-    pub async fn save_device_cache(
-        &self,
-        device_id: &[u8; 16],
-        blob: &[u8],
-    ) -> anyhow::Result<()> {
+    pub async fn save_device_cache(&self, device_id: &[u8; 16], blob: &[u8]) -> anyhow::Result<()> {
         sqlx::query!(
             r#"
             UPDATE account
@@ -166,19 +162,19 @@ impl Db {
     /// enrolled for password-less unlock.
     #[tracing::instrument(skip(self))]
     pub async fn load_device_cache(&self) -> anyhow::Result<Option<([u8; 16], Vec<u8>)>> {
-        let row = sqlx::query!(
-            "SELECT device_id, device_wrapped_keys FROM account WHERE id = 1"
+        let row = sqlx::query!("SELECT device_id, device_wrapped_keys FROM account WHERE id = 1")
+            .fetch_optional(&*self.pool)
+            .await?;
+        Ok(
+            row.and_then(|r| match (r.device_id, r.device_wrapped_keys) {
+                (Some(id), Some(blob)) if id.len() == 16 => {
+                    let mut device_id = [0u8; 16];
+                    device_id.copy_from_slice(&id);
+                    Some((device_id, blob))
+                }
+                _ => None,
+            }),
         )
-        .fetch_optional(&*self.pool)
-        .await?;
-        Ok(row.and_then(|r| match (r.device_id, r.device_wrapped_keys) {
-            (Some(id), Some(blob)) if id.len() == 16 => {
-                let mut device_id = [0u8; 16];
-                device_id.copy_from_slice(&id);
-                Some((device_id, blob))
-            }
-            _ => None,
-        }))
     }
 
     /// Forget the device cache (e.g. after revocation or a backend change).
@@ -533,7 +529,9 @@ impl Db {
 impl Db {
     /// Build a `Db` around a test-provided pool (e.g. from `#[sqlx::test]`).
     pub(crate) fn from_pool(pool: Pool<Sqlite>) -> Self {
-        Self { pool: Arc::new(pool) }
+        Self {
+            pool: Arc::new(pool),
+        }
     }
 }
 
@@ -563,9 +561,7 @@ fn row_to_item(r: &sqlx::sqlite::SqliteRow) -> TodoItem {
         done: r.get::<i64, _>("done") != 0,
         tags,
         subtasks: Vec::new(),
-        order_key: r
-            .get::<Option<String>, _>("order_key")
-            .unwrap_or_default(),
+        order_key: r.get::<Option<String>, _>("order_key").unwrap_or_default(),
     }
 }
 
