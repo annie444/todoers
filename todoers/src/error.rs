@@ -1,33 +1,4 @@
-use thiserror::Error;
 use tracing::error;
-
-pub type AppResult<T> = core::result::Result<T, AppError>;
-
-#[derive(Debug, Error)]
-pub enum AppError {
-    #[error("error generating key")]
-    Aead,
-    #[error("signature error: {0}")]
-    BadSignature(#[from] ed25519_dalek::SignatureError),
-    #[error("invalid input")]
-    UnknownAuthor,
-    #[error("invalid input")]
-    UnknownEpoch,
-    #[error("invalid list")]
-    WrongList,
-    #[error("runtime error: {0}")]
-    Join(#[from] tokio::task::JoinError),
-    /// OPAQUE registration/login protocol failure (e.g. wrong password).
-    #[error("opaque protocol error")]
-    Opaque(#[from] opaque_ke::errors::ProtocolError),
-    /// Argon2id / key-derivation failure.
-    #[error("key derivation error")]
-    Kdf,
-    /// AGE/SSH local-key vault failure (bad recipient/identity, decrypt failed).
-    /// The message is safe to surface — it never contains secret material.
-    #[error("device key vault error: {0}")]
-    DeviceVault(String),
-}
 
 #[tracing::instrument]
 pub fn init() -> anyhow::Result<()> {
@@ -46,7 +17,6 @@ pub fn init() -> anyhow::Result<()> {
             // prints human-panic message
             print_msg(file_path, &metadata)
                 .expect("human-panic: printing error message to console failed");
-            eprintln!("{}", panic_hook.panic_report(panic_info)); // prints color-eyre stack trace to stderr
         }
 
         if let Some(location) = panic_info.location() {

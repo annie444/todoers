@@ -49,7 +49,7 @@ pub async fn append_update(
         .db
         .insert_update(
             list_id,
-            body.epoch as i64,
+            body.epoch,
             body.author,
             &body.nonce,
             &body.ciphertext,
@@ -61,7 +61,7 @@ pub async fn append_update(
     // pull deliver identical bytes.
     let stored = StoredUpdateDto {
         seq,
-        epoch: body.epoch as i64,
+        epoch: body.epoch,
         author: body.author,
         nonce: body.nonce,
         ciphertext: body.ciphertext,

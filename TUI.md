@@ -1,24 +1,31 @@
 # TUI.md
 
-Architecture outline for **`todoers`** — the ratatui terminal client. It holds
-the keys and does all crypto (see [ENCRYPTION.md](./ENCRYPTION.md)), keeps a
-local-first SQLite store, and talks to the blind relay over HTTP/WS (see
-[API.md](./API.md)). This document covers the **UI architecture**: the event
-loop, the `Component` trait, actions, modes, modals, and how networked work stays
-off the render loop.
+Architecture outline for **`todoers`** — the ratatui terminal client **binary**. It is a
+thin UI shell over the **`todoers-client`** library, which holds the keys and does all crypto
+(see [ENCRYPTION.md](./ENCRYPTION.md)), owns the local-first SQLite store, and talks to the
+blind relay over HTTP/WS (see [API.md](./API.md)). This document covers the **UI
+architecture** in the `todoers` crate: the event loop, the `Component` trait, actions, modes,
+modals, and how networked work stays off the render loop. Anything touching crypto, the DB
+(`db.rs`), networking (`net/`), or session keys lives in `todoers-client/src/`, not here.
 
 ## Build note
 
-The client uses **unchecked runtime `sqlx::query()`** against SQLite, so it
-compiles with no database. It has a `vergen-gix` build script that reads
-git/cargo/build info at compile time (used in `--version`), so a git repo must be
-present to build. Run it with `cargo todoers` (alias for `run -p todoers --`).
+The `todoers` binary depends on `todoers-client`, which uses compile-time-checked
+`sqlx::query!` macros for some queries, so **building needs `CLIENT_DATABASE_URL`** pointing
+at a migrated SQLite DB (see CLAUDE.md → Build & run; one-time: `cd todoers-client && sqlx
+database create && sqlx migrate run --source db/migrations`). The binary also has a
+`vergen-gix` build script that reads git/cargo/build info at compile time (used in
+`--version`), so a git repo must be present to build. Run it with `cargo todoers` (alias for
+`run -p todoers --`).
 
 ## Entry point
 
 `main.rs` builds a multi-thread Tokio runtime, then: init error/logging hooks →
-parse `Cli` (`cli.rs`) → load `Config` (`config.rs`) → open the SQLite `Db`
-(`db.rs`) → load any local `account` → construct `App` and call `App::run`.
+parse `Cli` (`cli.rs`) → load `Config` (`config.rs`) → **unlock the database encryption key**
+(load-or-create the SQLCipher key envelope, then device auto-unlock or, as a fallback, prompt
+for the recovery key on stdin — see [ENCRYPTION.md](./ENCRYPTION.md)) → open the encrypted
+SQLite `Db` (`todoers-client`'s `db.rs`) with that key → on first run print the recovery key
+→ load any local `account` → construct `App` and call `App::run`.
 
 ## The Component architecture (`app.rs`)
 
@@ -38,7 +45,11 @@ select! { Tui event → on_event ; worker WorkerMsg → handle_worker_msg }
 1. **`on_event`** takes the `Event` the select produced and turns it into
    `Action`s on the channel. It also routes the raw event to either the open
    modal *or* the active mode component (never both), so the background stays
-   inert behind an overlay.
+   inert behind an overlay. After the first event, the loop **drains the rest of
+   the buffered terminal events** (`Tui::try_next_event`) in the same turn: the
+   producer emits ~64 events/s (60 Render + 4 Tick) into an unbounded channel, so
+   draining lets a burst collapse into a single coalesced render rather than one
+   render per event — the loop drops stale frames instead of snowballing a backlog.
 2. **`handle_worker_msg`** installs a store-worker reply: a `ViewSnapshot`
    refreshes the shared `ViewModel` (and requests one `Render`); request/reply
    messages (`FullItem`/`Members`) stash data and emit a "ready" action so the
@@ -48,7 +59,12 @@ select! { Tui event → on_event ; worker WorkerMsg → handle_worker_msg }
    state and forwards it to the modal or active component's `update`. **It never
    blocks on the store** — mutations become `StoreCommand`s sent to the worker.
 4. **`render`** draws the active mode in the body, then the modal on top, then the
-   error bar and keybinding footer.
+   error bar and keybinding footer. The background mode is redrawn every frame so
+   a modal floats over the live workspace as a clean backdrop (and switching
+   modals leaves no stale cells). The one exception is the **auth prompt** (no
+   verified account yet): there is no workspace to show behind the login/register
+   dialog, so the background draw is skipped to keep the per-frame cost low
+   instead of redrawing the full `Home` workspace under the dialog every frame.
 
 ### Store-worker (`store_worker.rs`)
 
@@ -124,11 +140,12 @@ the user can quit/suspend/switch forms from inside a field or modal. A bare key
 ## Networked work runs off the UI loop
 
 `App` never blocks the render loop on I/O. Registration, login, and unlock
-`tokio::spawn` a task that calls into `net.rs` and feeds results back as
+`tokio::spawn` a task that calls into the `net/` module and feeds results back as
 `Action`s (`Error`, or `Keys` + `StopCapture` + `CloseModal` + `SetMode`).
-CPU-bound Argon2id KDF work is wrapped in `spawn_blocking`. Key separation:
+CPU-bound Argon2id KDF work is wrapped in `spawn_blocking`. Key separation (both in
+`todoers-client`):
 
-- **`net.rs`** — HTTP transport only (reqwest); the two-message OPAQUE
+- **`net/`** — HTTP transport only (reqwest); the two-message OPAQUE
   register/login flows and the offline fallback path.
 - **`auth.rs`** — pure (builds/consumes wire DTOs, no I/O), so it stays
   unit-testable without a network.
@@ -161,9 +178,10 @@ every mode switch).
 | `Keys` | Persistent keybinding footer. |
 | `ErrorBar` | Transient timed error banner. |
 
-## Local store (`db.rs`)
+## Local store (`todoers-client`'s `db.rs`)
 
-SQLite, local-first: the materialized CRDT, an outbound queue for offline edits,
-sync cursors against the server log, cached wrapped keys, the `account` row, and a
-member directory for offline signature verification. See the at-rest class rules
-in `todoers/db/migrations/0001_init.sql` and [ENCRYPTION.md](./ENCRYPTION.md).
+SQLite, local-first, **SQLCipher-encrypted at rest**: the materialized CRDT, an outbound
+queue for offline edits, sync cursors against the server log, cached wrapped keys, the
+`account` row, and a member directory for offline signature verification. The `Db` and all
+queries live in `todoers-client`; the binary just holds a handle. See the at-rest class rules
+in `todoers-client/db/migrations/0001_init.sql` and [ENCRYPTION.md](./ENCRYPTION.md).

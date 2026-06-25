@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["todoers", "todoers-server", "todoers-types"]
+members = ["todoers", "todoers-client", "todoers-server", "todoers-types"]
 
 [workspace.package]
 version = "0.1.0"
@@ -11,13 +11,19 @@ license = "AGPL-3.0-or-later"
 [workspace.dependencies]
 # Database
 sqlx = "0.9"
+# Pinned to the range sqlx-sqlite 0.9 requires (>=0.30.1, <0.38.0)
+libsqlite3-sys = { version = "0.37", features = [
+  "bundled-sqlcipher-vendored-openssl",
+] }
 
 # Async runtime
 futures-util = "0.3"
 tokio-util = "0.7"
 futures = "0.3"
+
 # WebSocket client (matches the tungstenite axum already pulls in). rustls to
 # match reqwest's TLS backend; no native-tls in the tree.
+http = "1.4"
 tokio-tungstenite = { version = "0.29", default-features = false, features = [
   "connect",
   "rustls-tls-native-roots",
@@ -79,6 +85,9 @@ tui-widgets = { version = "0.7", default-features = false, features = [
 ] }
 crossterm = { version = "0.29", features = ["serde", "event-stream"] }
 unicode-width = "0.2"
+dialoguer = { version = "0.12", default-features = false, features = [
+  "password",
+] }
 
 # Realtime collaboration
 loro = "1.13"
@@ -122,6 +131,14 @@ secrecy = { version = "0.10", features = ["serde"] }
 zeroize = { version = "1.9", features = ["alloc", "derive", "serde"] }
 hmac = "0.13"
 x-wing = { version = "0.1.0-rc", features = ["zeroize", "getrandom"] }
+keyring-core = "1.0"
+windows-native-keyring-store = "1.1.0"
+apple-native-keyring-store = { version = "1.0.0", features = ["keychain"] }
+zbus-secret-service-keyring-store = { version = "1.0.0", features = [
+  "rt-tokio-crypto-rust",
+] }
+tss-esapi = "7.7.0"
+hkdf = "0.13"
 
 # Logging
 tracing = "0.1"
@@ -153,6 +170,7 @@ time = { version = "0.3", features = [
 ] }
 directories = "6.0"
 nohash-hasher = "0.2"
+hybrid-array = "0.4"
 
 # Build
 vergen-gix = { version = "10.0", features = ["build", "cargo"] }

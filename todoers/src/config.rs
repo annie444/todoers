@@ -5,9 +5,11 @@ use directories::{BaseDirs, ProjectDirs, UserDirs};
 use indexmap::IndexMap;
 use ratatui::style::{Color, Modifier, Style};
 use serde::{Deserialize, de::Deserializer};
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
-use crate::{action::Action, app::Mode};
+use todoers_client::get_data_dir;
+
+use crate::app::Mode;
 
 const CONFIG: &str = include_str!("../app_config.toml");
 
@@ -97,11 +99,6 @@ pub struct Config {
 
 pub static PROJECT_NAME: LazyLock<String> =
     LazyLock::new(|| env!("CARGO_CRATE_NAME").to_uppercase().to_string());
-pub static DATA_FOLDER: LazyLock<Option<PathBuf>> = LazyLock::new(|| {
-    env::var(format!("{}_DATA", PROJECT_NAME.clone()))
-        .ok()
-        .map(PathBuf::from)
-});
 pub static CONFIG_FOLDER: LazyLock<Option<PathBuf>> = LazyLock::new(|| {
     env::var(format!("{}_CONFIG", PROJECT_NAME.clone()))
         .ok()
@@ -109,6 +106,14 @@ pub static CONFIG_FOLDER: LazyLock<Option<PathBuf>> = LazyLock::new(|| {
 });
 
 impl Config {
+    /// The built-in default configuration (the embedded `app_config.toml`), with no
+    /// user config files layered on top. Useful for tests that need the default
+    /// keymaps without depending on the host's config directory.
+    #[cfg(test)]
+    pub fn defaults() -> Self {
+        toml::from_str(CONFIG).expect("embedded app_config.toml must be valid")
+    }
+
     #[tracing::instrument]
     pub fn new() -> anyhow::Result<Self, config::ConfigError> {
         let default_config: Config = toml::from_str(CONFIG).unwrap();
@@ -174,29 +179,6 @@ impl Config {
 }
 
 #[tracing::instrument]
-pub fn get_data_dir() -> PathBuf {
-    if let Some(s) = DATA_FOLDER.clone() {
-        s
-    } else if let Some(user) = UserDirs::new().map(|u| {
-        u.home_dir()
-            .join(".local")
-            .join("state")
-            .join(env!("CARGO_PKG_NAME"))
-    }) && user.exists()
-    {
-        user
-    } else if let Some(base) = BaseDirs::new().and_then(|b| b.state_dir().map(|s| s.to_path_buf()))
-        && base.exists()
-    {
-        base
-    } else if let Some(proj_dirs) = project_dir() {
-        proj_dirs.data_local_dir().to_path_buf()
-    } else {
-        PathBuf::from(".").join(".data")
-    }
-}
-
-#[tracing::instrument]
 pub fn get_config_dir() -> PathBuf {
     if let Some(s) = CONFIG_FOLDER.clone() {
         s
@@ -221,39 +203,82 @@ fn project_dir() -> Option<ProjectDirs> {
     ProjectDirs::from("com", "annieehler", env!("CARGO_PKG_NAME"))
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(untagged)]
-pub enum ActionConfig {
-    NoShow(Action),
-    Show { action: Action, show: bool },
+/// The surface a keymap belongs to. A superset of [`Mode`]: besides the three
+/// top-level modes it names the overlay/list surfaces (`modal`, `members`,
+/// `form`) and the app-wide `global` section. Each surface resolves its own
+/// section against an incoming key (see [`resolve`]); only `global` is resolved
+/// at the app level.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyContext {
+    /// App-wide commands, resolved in `App::handle_key_event` with the capture +
+    /// global-chord guard so Ctrl-chords work everywhere.
+    Global,
+    Home,
+    Login,
+    Register,
+    /// A modal's button-row navigation (focus/activate/cancel).
+    Modal,
+    /// The members dialog (select/unshare).
+    Members,
+    /// Shared field navigation for every form body (login/register/todo/list/
+    /// share/unlock).
+    Form,
 }
 
-impl From<Action> for ActionConfig {
-    fn from(action: Action) -> Self {
-        ActionConfig::NoShow(action)
-    }
-}
-
-impl From<ActionConfig> for Action {
-    fn from(config: ActionConfig) -> Self {
-        match config {
-            ActionConfig::NoShow(action) => action,
-            ActionConfig::Show { action, .. } => action,
+impl From<Mode> for KeyContext {
+    fn from(mode: Mode) -> Self {
+        match mode {
+            Mode::Home => KeyContext::Home,
+            Mode::Login => KeyContext::Login,
+            Mode::Register => KeyContext::Register,
         }
     }
 }
 
-impl<'a> From<&'a ActionConfig> for &'a Action {
-    fn from(config: &'a ActionConfig) -> Self {
-        match config {
-            ActionConfig::NoShow(action) => action,
-            ActionConfig::Show { action, .. } => action,
+/// A single keybinding's value: the command name it triggers plus whether it is
+/// surfaced in the help footer. Deserializes from either a bare string
+/// (`"quit"`, never shown) or a table (`{ command = "quit", show = true }`).
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum CommandSpec {
+    Bare(String),
+    Full {
+        // `action` is accepted as an alias for backward compatibility with configs
+        // written before per-surface command names existed.
+        #[serde(alias = "action")]
+        command: String,
+        #[serde(default)]
+        show: bool,
+    },
+}
+
+impl CommandSpec {
+    /// The command name (a [`KeyContext`]-specific verb, parsed by each surface).
+    pub fn command(&self) -> &str {
+        match self {
+            CommandSpec::Bare(s) => s,
+            CommandSpec::Full { command, .. } => command,
+        }
+    }
+    /// Whether to list this binding in the help footer.
+    pub fn show(&self) -> bool {
+        match self {
+            CommandSpec::Bare(_) => false,
+            CommandSpec::Full { show, .. } => *show,
         }
     }
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct KeyBindings(pub HashMap<Mode, IndexMap<Vec<KeyEvent>, ActionConfig>>);
+pub struct KeyBindings(pub HashMap<KeyContext, IndexMap<Vec<KeyEvent>, CommandSpec>>);
+
+impl KeyBindings {
+    /// The raw (string-command) bindings for a surface, if any were configured.
+    pub fn context(&self, ctx: KeyContext) -> Option<&IndexMap<Vec<KeyEvent>, CommandSpec>> {
+        self.0.get(&ctx)
+    }
+}
 
 impl<'de> Deserialize<'de> for KeyBindings {
     #[tracing::instrument(skip(deserializer))]
@@ -262,16 +287,16 @@ impl<'de> Deserialize<'de> for KeyBindings {
         D: Deserializer<'de>,
     {
         let parsed_map =
-            HashMap::<Mode, IndexMap<String, ActionConfig>>::deserialize(deserializer)?;
+            HashMap::<KeyContext, IndexMap<String, CommandSpec>>::deserialize(deserializer)?;
 
         let keybindings = parsed_map
             .into_iter()
-            .map(|(mode, inner_map)| {
+            .map(|(ctx, inner_map)| {
                 let converted_inner_map = inner_map
                     .into_iter()
                     .map(|(key_str, cmd)| (parse_key_sequence(&key_str).unwrap(), cmd))
                     .collect();
-                (mode, converted_inner_map)
+                (ctx, converted_inner_map)
             })
             .collect();
 
@@ -279,11 +304,91 @@ impl<'de> Deserialize<'de> for KeyBindings {
     }
 }
 
+/// A human-readable label for a command name, for the help footer/cheatsheet:
+/// `toggle_sidebar` → `toggle sidebar`.
+pub fn command_label(cmd: &str) -> String {
+    cmd.replace('_', " ")
+}
+
+/// Parse a single command name into a surface's typed verb enum (or [`Action`]
+/// for the `global` surface). Verbs derive `Deserialize` with snake_case names,
+/// so this round-trips through a JSON string scalar.
+pub fn parse_command<V>(cmd: &str) -> Option<V>
+where
+    V: for<'de> Deserialize<'de>,
+{
+    serde_json::from_value(serde_json::Value::String(cmd.to_string())).ok()
+}
+
+/// Compile a surface's raw string-command bindings into a typed `keymap` once,
+/// at config-load. Unknown command names are logged and skipped so a typo in one
+/// binding can't break the rest of the surface.
+#[tracing::instrument(skip(raw, parse))]
+pub fn compile_keymap<V>(
+    raw: Option<&IndexMap<Vec<KeyEvent>, CommandSpec>>,
+    parse: impl Fn(&str) -> Option<V>,
+) -> IndexMap<Vec<KeyEvent>, V> {
+    let mut out = IndexMap::new();
+    let Some(raw) = raw else {
+        return out;
+    };
+    for (keys, spec) in raw {
+        match parse(spec.command()) {
+            Some(v) => {
+                out.insert(keys.clone(), v);
+            }
+            None => warn!("Unknown keybinding command '{}'; skipping", spec.command()),
+        }
+    }
+    out
+}
+
+/// Resolve a key against a compiled `keymap`, supporting multi-key sequences via
+/// a per-surface `pending` buffer. A single-key match fires immediately; a miss
+/// is buffered and retried as a sequence. The buffer self-clears once it can no
+/// longer be the prefix of any binding, so a stray key never wedges it.
+pub fn resolve<V: Clone>(
+    keymap: &IndexMap<Vec<KeyEvent>, V>,
+    pending: &mut Vec<KeyEvent>,
+    key: KeyEvent,
+) -> Option<V> {
+    // Match against the same normalized form the stored bindings use.
+    let key = normalize_key(key);
+    if let Some(v) = keymap.get([key].as_slice()) {
+        pending.clear();
+        return Some(v.clone());
+    }
+    pending.push(key);
+    if let Some(v) = keymap.get(pending.as_slice()) {
+        pending.clear();
+        return Some(v.clone());
+    }
+    let still_prefix = keymap.keys().any(|seq| seq.starts_with(pending.as_slice()));
+    if !still_prefix {
+        pending.clear();
+    }
+    None
+}
+
 #[tracing::instrument]
 fn parse_key_event(raw: &str) -> anyhow::Result<KeyEvent, String> {
     let raw_lower = raw.to_ascii_lowercase();
     let (remaining, modifiers) = extract_modifiers(&raw_lower);
-    parse_key_code_with_modifiers(remaining, modifiers)
+    Ok(normalize_key(parse_key_code_with_modifiers(
+        remaining, modifiers,
+    )?))
+}
+
+/// Normalize a key for binding lookup. A `Char` already encodes its shifted form
+/// (`X`, `<`, `|`), and terminals are inconsistent about *also* reporting
+/// `SHIFT`. Dropping `SHIFT` for char keys lets a binding like `shift-x` or `<`
+/// match whether or not the terminal set the modifier. Non-char keys (so that
+/// `shift-tab`/`BackTab` etc. stay distinct) are untouched.
+pub fn normalize_key(mut key: KeyEvent) -> KeyEvent {
+    if matches!(key.code, KeyCode::Char(_)) {
+        key.modifiers.remove(KeyModifiers::SHIFT);
+    }
+    key
 }
 
 #[tracing::instrument]
@@ -434,6 +539,39 @@ pub fn parse_key_sequence(raw: &str) -> anyhow::Result<Vec<KeyEvent>, String> {
     sequences.into_iter().map(parse_key_event).collect()
 }
 
+/// Render a key sequence back to its config string form (`space+e`). Inverse of
+/// [`parse_key_sequence`]; used to build the on-screen key hints from the live
+/// bindings.
+pub fn key_sequence_to_string(seq: &[KeyEvent]) -> String {
+    seq.iter()
+        .map(key_event_to_string)
+        .collect::<Vec<_>>()
+        .join("+")
+}
+
+/// The first key bound to `verb` in `keymap` (config order), as a display string,
+/// or `None` if the command is unbound. For one-key-per-command hints.
+pub fn first_key_for<V: PartialEq>(
+    keymap: &IndexMap<Vec<KeyEvent>, V>,
+    verb: &V,
+) -> Option<String> {
+    keymap
+        .iter()
+        .find(|(_, v)| *v == verb)
+        .map(|(seq, _)| key_sequence_to_string(seq))
+}
+
+/// Every key bound to `verb`, joined by `/` (e.g. `d/enter`), or `None` if the
+/// command is unbound.
+pub fn all_keys_for<V: PartialEq>(keymap: &IndexMap<Vec<KeyEvent>, V>, verb: &V) -> Option<String> {
+    let keys: Vec<String> = keymap
+        .iter()
+        .filter(|(_, v)| *v == verb)
+        .map(|(seq, _)| key_sequence_to_string(seq))
+        .collect();
+    (!keys.is_empty()).then(|| keys.join("/"))
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Styles(pub HashMap<Mode, HashMap<String, Style>>);
 
@@ -572,6 +710,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
+    use crate::action::Action;
 
     #[test]
     fn test_parse_style_default() {
@@ -623,19 +762,73 @@ mod tests {
     #[test]
     fn test_config() -> anyhow::Result<()> {
         let c = Config::new()?;
-        assert_eq!(
-            c.keybindings
-                .0
-                .get(&Mode::Home)
-                .unwrap()
-                .get(&parse_key_sequence("q").unwrap_or_default())
-                .unwrap(),
-            &ActionConfig::Show {
-                action: Action::Quit,
-                show: true
-            }
-        );
+        let spec = c
+            .keybindings
+            .0
+            .get(&KeyContext::Global)
+            .unwrap()
+            .get(&parse_key_sequence("q").unwrap_or_default())
+            .unwrap();
+        assert_eq!(spec.command(), "quit");
+        assert!(spec.show());
         Ok(())
+    }
+
+    #[test]
+    fn resolve_single_and_multi_key() {
+        let mut km: IndexMap<Vec<KeyEvent>, &'static str> = IndexMap::new();
+        km.insert(parse_key_sequence("q").unwrap(), "quit");
+        km.insert(parse_key_sequence("space+e").unwrap(), "toggle");
+
+        let mut pending = Vec::new();
+        // Single key fires immediately and leaves no pending state.
+        assert_eq!(
+            resolve(&km, &mut pending, parse_key_event("q").unwrap()),
+            Some("quit")
+        );
+        assert!(pending.is_empty());
+
+        // A multi-key sequence buffers the prefix, then fires on completion.
+        assert_eq!(
+            resolve(&km, &mut pending, parse_key_event("space").unwrap()),
+            None
+        );
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            resolve(&km, &mut pending, parse_key_event("e").unwrap()),
+            Some("toggle")
+        );
+        assert!(pending.is_empty());
+
+        // A dead prefix self-clears so a stray key can't wedge the buffer.
+        assert_eq!(
+            resolve(&km, &mut pending, parse_key_event("space").unwrap()),
+            None
+        );
+        assert_eq!(
+            resolve(&km, &mut pending, parse_key_event("x").unwrap()),
+            None
+        );
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn compile_keymap_skips_unknown_commands() {
+        let mut raw: IndexMap<Vec<KeyEvent>, CommandSpec> = IndexMap::new();
+        raw.insert(
+            parse_key_sequence("q").unwrap(),
+            CommandSpec::Bare("quit".into()),
+        );
+        raw.insert(
+            parse_key_sequence("z").unwrap(),
+            CommandSpec::Bare("not_a_command".into()),
+        );
+        let compiled = compile_keymap(Some(&raw), parse_command::<Action>);
+        assert_eq!(
+            compiled.get(&parse_key_sequence("q").unwrap()),
+            Some(&Action::Quit)
+        );
+        assert!(compiled.get(&parse_key_sequence("z").unwrap()).is_none());
     }
 
     #[test]

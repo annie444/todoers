@@ -7,5 +7,5 @@ c = "check"
 t = "test"
 r = "run"
 rr = "run --release"
-todoers = ["run", "--package", "todoers", "--"]
+todoers = ["run", "--release", "--package", "todoers", "--"]
 server = ["run", "--package", "todoers-server", "--"]

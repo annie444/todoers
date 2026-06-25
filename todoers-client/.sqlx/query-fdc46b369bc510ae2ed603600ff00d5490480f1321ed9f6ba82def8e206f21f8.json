@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT applied_through_seq FROM lists WHERE list_id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "applied_through_seq",
+        "ordinal": 0,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "lists",
+            "name": "applied_through_seq"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "fdc46b369bc510ae2ed603600ff00d5490480f1321ed9f6ba82def8e206f21f8"
+}

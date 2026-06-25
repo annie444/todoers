@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT current_epoch FROM lists WHERE list_id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "current_epoch",
+        "ordinal": 0,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "lists",
+            "name": "current_epoch"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "9dae6164931fcddadb0bd2343566ddb8d8dd0fdd077361cea6f66dec81cf143d"
+}

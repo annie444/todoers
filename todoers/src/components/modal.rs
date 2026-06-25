@@ -1,12 +1,26 @@
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
+use indexmap::IndexMap;
 use ratatui::layout::Flex;
 use ratatui::{prelude::*, widgets::*};
+use serde::Deserialize;
 use tokio::sync::mpsc::UnboundedSender;
 
 use super::{Button, Captures, Component};
 use crate::action::Action;
-use crate::config::Config;
+use crate::config::{Config, KeyContext, compile_keymap, parse_command, resolve};
 use crate::tui::Event;
+
+/// A modal's button-row operations, bound via `[keybindings.modal]`. `Esc` is
+/// always a safe cancel (handled before these), but extra keys can be bound to
+/// `cancel`/`activate`/focus movement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModalCmd {
+    FocusNext,
+    FocusPrev,
+    Activate,
+    Cancel,
+}
 
 /// A centered overlay dialog that floats on top of whatever mode is running.
 ///
@@ -32,6 +46,12 @@ pub struct Modal {
     esc_action: Action,
     command_tx: Option<UnboundedSender<Action>>,
     config: Config,
+    /// Compiled `[keybindings.modal]` map + the multi-key sequence buffer.
+    keymap: IndexMap<Vec<KeyEvent>, ModalCmd>,
+    pending: Vec<KeyEvent>,
+    /// One fixed-width slot per button, built once at construction so the
+    /// per-frame `draw` doesn't reallocate it on every render.
+    button_constraints: Vec<Constraint>,
 }
 
 impl Modal {
@@ -46,6 +66,7 @@ impl Modal {
         esc_action: Action,
     ) -> Self {
         let focus_body = body.captures_input();
+        let button_constraints = vec![Constraint::Length(12); buttons.len()];
         let mut modal = Self {
             title: title.into(),
             body,
@@ -55,6 +76,9 @@ impl Modal {
             esc_action,
             command_tx: None,
             config: Config::default(),
+            keymap: IndexMap::new(),
+            pending: Vec::new(),
+            button_constraints,
         };
         modal.sync_focus();
         modal
@@ -157,6 +181,10 @@ impl Component for Modal {
         for button in self.buttons.iter_mut() {
             button.register_config_handler(config.clone())?;
         }
+        self.keymap = compile_keymap(
+            config.keybindings.context(KeyContext::Modal),
+            parse_command::<ModalCmd>,
+        );
         self.config = config;
         Ok(())
     }
@@ -203,6 +231,7 @@ impl Component for Modal {
         // for the auth gate, back-to-chooser for a form, close for an info box).
         // Exception: a focused Vim field mid-edit consumes Esc (Insert→Normal) and
         // the dialog stays open — only a field already in Normal mode lets Esc through.
+        // Hardcoded (not bindable) so Esc is always a safe way out of any modal.
         if key.code == KeyCode::Esc {
             if self.focus_body && self.body.captures_input() && self.body.consumes_escape() {
                 return self.body.handle_key_event(key);
@@ -211,9 +240,9 @@ impl Component for Modal {
         }
 
         // Zone 1 — focus is inside an interactive form body. The form owns
-        // Tab/arrows/Enter/typing for its field navigation. When it returns
-        // `FocusButtons` (Enter on the last field) we move focus onto the button
-        // row and blur the fields, rather than letting the signal escape upward.
+        // field navigation/typing (via its own `[keybindings.form]` map). When it
+        // returns `FocusButtons` (submit on the last field) we move focus onto the
+        // button row and blur the fields, rather than letting the signal escape.
         if self.focus_body && self.body.captures_input() {
             return match self.body.handle_key_event(key)? {
                 Some(Action::FocusButtons) => {
@@ -227,36 +256,37 @@ impl Component for Modal {
             };
         }
 
-        // Zone 2 — the button row has focus.
-        match key.code {
-            KeyCode::Tab | KeyCode::Right => {
-                self.focus_next();
-                return Ok(None);
-            }
-            KeyCode::BackTab | KeyCode::Left => {
-                // Shift-Tab off the first button drops back into the form (if
-                // any), re-focusing its first field so the user can keep editing.
-                if self.focused == 0 && self.body.captures_input() {
-                    self.focus_body = true;
-                    self.body.update(Action::StartCapture)?;
-                    self.sync_focus();
-                } else {
-                    self.focus_prev();
+        // Zone 2 — the button row has focus; navigation/activation is configurable.
+        if let Some(cmd) = resolve(&self.keymap, &mut self.pending, key) {
+            match cmd {
+                ModalCmd::FocusNext => self.focus_next(),
+                ModalCmd::FocusPrev => {
+                    // Focusing past the first button drops back into the form (if
+                    // any), re-focusing its first field so the user can keep editing.
+                    if self.focused == 0 && self.body.captures_input() {
+                        self.focus_body = true;
+                        self.body.update(Action::StartCapture)?;
+                        self.sync_focus();
+                    } else {
+                        self.focus_prev();
+                    }
                 }
-                return Ok(None);
+                ModalCmd::Activate => {
+                    if let Some(button) = self.buttons.get(self.focused) {
+                        return Ok(Some(button.action()));
+                    }
+                }
+                ModalCmd::Cancel => return Ok(Some(self.esc_action.clone())),
             }
-            _ => {}
+            return Ok(None);
         }
         // A non-interactive body (e.g. help) may still react to a key; a form
-        // body is skipped here so a stray Enter activates the focused button
-        // (Submit) instead of re-triggering the form.
+        // body is skipped here so a stray key doesn't re-trigger the form behind
+        // the buttons.
         if !self.body.captures_input()
             && let Some(action) = self.body.handle_key_event(key)?
         {
             return Ok(Some(action));
-        }
-        if let Some(button) = self.buttons.get_mut(self.focused) {
-            return button.handle_key_event(key);
         }
         Ok(None)
     }
@@ -321,8 +351,7 @@ impl Component for Modal {
 
         if !self.buttons.is_empty() {
             // Evenly space fixed-width buttons across the button row.
-            let constraints = vec![Constraint::Length(12); self.buttons.len()];
-            let slots = Layout::horizontal(constraints)
+            let slots = Layout::horizontal(self.button_constraints.iter().copied())
                 .flex(Flex::SpaceAround)
                 .split(buttons_area);
             for (button, slot) in self.buttons.iter_mut().zip(slots.iter()) {
@@ -366,6 +395,7 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut modal = Modal::form("Register", Box::new(Register::new()), Action::AuthChooser);
         modal.register_action_handler(tx).unwrap();
+        modal.register_config_handler(Config::defaults()).unwrap();
         // App sends StartCapture when the form modal opens.
         modal.update(Action::StartCapture).unwrap();
 
@@ -402,6 +432,7 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut modal = Modal::form("Register", Box::new(Register::new()), Action::AuthChooser);
         modal.register_action_handler(tx).unwrap();
+        modal.register_config_handler(Config::defaults()).unwrap();
         modal.update(Action::StartCapture).unwrap();
 
         // Paste the username, then type the two password fields and submit.

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM outbound WHERE local_id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "be2899ed6ea566a9a2fc9ba0241685c2249fd5e5f1ebf3d0647bfa33ec936ec0"
+}

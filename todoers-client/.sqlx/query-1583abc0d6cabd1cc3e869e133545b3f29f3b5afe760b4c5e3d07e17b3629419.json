@@ -1,0 +1,110 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            SELECT\n                item_id   AS \"id!\",\n                text      AS \"title!\",\n                notes     AS \"notes!\",\n                due_at    AS \"due_at: i64\",\n                priority  AS \"priority!: i64\",\n                done      AS \"done!: bool\",\n                tags      AS \"tags!\",\n                order_key AS \"order_key!\"\n            FROM todo_items\n            WHERE list_id = ?\n            ORDER BY order_key",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "todo_items",
+            "name": "item_id"
+          }
+        }
+      },
+      {
+        "name": "title!",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "todo_items",
+            "name": "text"
+          }
+        }
+      },
+      {
+        "name": "notes!",
+        "ordinal": 2,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "todo_items",
+            "name": "notes"
+          }
+        }
+      },
+      {
+        "name": "due_at: i64",
+        "ordinal": 3,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "todo_items",
+            "name": "due_at"
+          }
+        }
+      },
+      {
+        "name": "priority!: i64",
+        "ordinal": 4,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "todo_items",
+            "name": "priority"
+          }
+        }
+      },
+      {
+        "name": "done!: bool",
+        "ordinal": 5,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "todo_items",
+            "name": "done"
+          }
+        }
+      },
+      {
+        "name": "tags!",
+        "ordinal": 6,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "todo_items",
+            "name": "tags"
+          }
+        }
+      },
+      {
+        "name": "order_key!",
+        "ordinal": 7,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "todo_items",
+            "name": "order_key"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "1583abc0d6cabd1cc3e869e133545b3f29f3b5afe760b4c5e3d07e17b3629419"
+}

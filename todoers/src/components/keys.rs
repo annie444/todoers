@@ -1,19 +1,23 @@
+use std::collections::HashSet;
+
 use indexmap::IndexMap;
 use ratatui::layout::Flex;
 use ratatui::{prelude::*, widgets::*};
 use tokio::sync::mpsc::UnboundedSender;
-use tracing::warn;
 
 use super::{Captures, Component};
 use crate::action::Action;
 use crate::app::Mode;
-use crate::config::{ActionConfig, Config, key_event_to_string};
+use crate::config::{Config, KeyContext, command_label, key_event_to_string};
 use crate::tui::Event;
 
 #[derive(Default)]
 pub struct Keys {
     command_tx: Option<UnboundedSender<Action>>,
     keys: IndexMap<String, String>,
+    /// One `Fill(1)` per footer entry, built once when the key map is set so the
+    /// per-frame `draw` doesn't reallocate it on every render.
+    key_constraints: Vec<Constraint>,
     mode: Mode,
     keys_style: Style,
     sep_style: Style,
@@ -51,26 +55,30 @@ impl Component for Keys {
     #[tracing::instrument(skip(self, config))]
 
     fn register_config_handler(&mut self, config: Config) -> anyhow::Result<()> {
-        if let Some(keybinds) = config.keybindings.0.get(&self.mode) {
-            let mut key_strs: IndexMap<String, Vec<String>> = IndexMap::new();
-            for (keys, action_cfg) in keybinds {
-                if let ActionConfig::Show { action, show } = action_cfg
-                    && *show
-                {
+        // The footer surfaces the app-wide `global` bindings plus the bindings for
+        // this mode's own surface, keeping only those flagged `show = true`.
+        let contexts = [KeyContext::Global, KeyContext::from(self.mode)];
+        let mut key_strs: IndexMap<String, HashSet<String>> = IndexMap::new();
+        for ctx in contexts {
+            let Some(keybinds) = config.keybindings.context(ctx) else {
+                continue;
+            };
+            for (keys, spec) in keybinds {
+                if spec.show() {
                     for key in keys {
                         key_strs
-                            .entry(action.to_string())
+                            .entry(command_label(spec.command()))
                             .or_default()
-                            .push(key_event_to_string(key));
+                            .insert(key_event_to_string(key));
                     }
                 }
             }
-            for (action, keys) in key_strs.into_iter() {
-                self.keys.insert(keys.join("/"), action);
-            }
-        } else {
-            warn!("No keybindings found for mode: {:?}", self.mode);
-        };
+        }
+        for (action, keys) in key_strs.into_iter() {
+            self.keys
+                .insert(keys.into_iter().collect::<Vec<_>>().join("/"), action);
+        }
+        self.key_constraints = vec![Constraint::Fill(1); self.keys.len()];
         Ok(())
     }
 
@@ -109,7 +117,7 @@ impl Component for Keys {
             .vertical_margin(0)
             .areas(area);
         frame.render_widget(Fill::new("─").style(self.line_style), line);
-        let key_areas = Layout::horizontal(vec![Constraint::Fill(1); self.keys.len()])
+        let key_areas = Layout::horizontal(self.key_constraints.iter().copied())
             .flex(Flex::SpaceBetween)
             .split(keys_vert);
         for (i, (keys, action)) in self.keys.iter().enumerate() {

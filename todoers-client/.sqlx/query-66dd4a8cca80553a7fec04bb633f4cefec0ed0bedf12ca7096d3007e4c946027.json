@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            INSERT INTO lists (list_id, role, current_epoch, name_plaintext)\n            VALUES (?, ?, ?, ?)\n            ON CONFLICT(list_id) DO UPDATE SET\n                role = excluded.role,\n                current_epoch = excluded.current_epoch,\n                name_plaintext = excluded.name_plaintext,\n                updated_at = unixepoch()\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "66dd4a8cca80553a7fec04bb633f4cefec0ed0bedf12ca7096d3007e4c946027"
+}

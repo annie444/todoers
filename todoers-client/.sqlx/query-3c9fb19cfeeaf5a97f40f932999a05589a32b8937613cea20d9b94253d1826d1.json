@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE lists SET server_snapshot_seq = ?, updated_at = unixepoch() WHERE list_id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "3c9fb19cfeeaf5a97f40f932999a05589a32b8937613cea20d9b94253d1826d1"
+}

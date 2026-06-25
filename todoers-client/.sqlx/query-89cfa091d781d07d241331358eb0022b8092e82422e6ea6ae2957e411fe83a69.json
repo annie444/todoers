@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT device_id, device_wrapped_keys FROM account WHERE id = 1",
+  "describe": {
+    "columns": [
+      {
+        "name": "device_id",
+        "ordinal": 0,
+        "type_info": "Blob",
+        "origin": {
+          "Table": {
+            "table": "account",
+            "name": "device_id"
+          }
+        }
+      },
+      {
+        "name": "device_wrapped_keys",
+        "ordinal": 1,
+        "type_info": "Blob",
+        "origin": {
+          "Table": {
+            "table": "account",
+            "name": "device_wrapped_keys"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      true,
+      true
+    ]
+  },
+  "hash": "89cfa091d781d07d241331358eb0022b8092e82422e6ea6ae2957e411fe83a69"
+}

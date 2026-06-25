@@ -3,31 +3,35 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crossterm::event::{KeyEvent, KeyModifiers};
+use indexmap::IndexMap;
 use nohash_hasher::BuildNoHashHasher;
 use ratatui::prelude::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::widgets::Paragraph;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
-use tokio::time::Duration;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 use zeroize::Zeroizing;
 
+use todoers_client::auth::{self, AccountRow, UnlockedKeys};
+use todoers_client::db::Db;
+use todoers_client::model::TodoItem;
+use todoers_client::model::{MetaList, ViewTarget};
+use todoers_client::net;
+use todoers_client::session::Session;
+use todoers_types::{ListId, Member, MemberId};
+
 use crate::action::{Action, DeleteTarget};
-use crate::auth::{AccountRow, UnlockedKeys};
-#[cfg(debug_assertions)]
+#[cfg(feature = "fps")]
 use crate::components::FpsCounter;
 use crate::components::{
     Button, Captures, Component, EditorMode, ErrorBar, Help, Home, Keys, ListForm, Login, Members,
     Modal, Prompt, Register, ShareForm, TodoForm, Unlock,
 };
-use crate::config::Config;
-use crate::db::Db;
-use crate::model::{MetaList, ViewTarget};
-use crate::net;
-use crate::session::Session;
+use crate::config::{Config, KeyContext, compile_keymap, parse_command, resolve};
 use crate::store::{SharedView, Store, ViewModel};
 use crate::store_worker::{CommandTx, StoreCommand, WorkerMsg, WorkerRx, run_store_worker};
+use crate::sync::SyncCommand;
 use crate::tui::{Event, Tui};
 
 pub struct App {
@@ -48,12 +52,21 @@ pub struct App {
     /// input. Mode-agnostic: not part of the `modes` map (see `components::Modal`).
     modal: Option<Modal>,
     last_tick_key_events: Vec<KeyEvent>,
+    /// The app-wide `[keybindings.global]` map, compiled once. Resolved on every
+    /// key (with the capture + global-chord guard) so commands like quit/suspend/
+    /// help and the form switches work from any surface, even over a modal.
+    global_keys: IndexMap<Vec<KeyEvent>, Action>,
     action_tx: mpsc::UnboundedSender<Action>,
     action_rx: mpsc::UnboundedReceiver<Action>,
     keys: Keys,
     errorbar: ErrorBar,
     acct_keys: Option<Zeroizing<UnlockedKeys>>,
     account_verified: bool,
+    /// Whether the one-time "is there a local account on disk?" lookup has run.
+    /// The auth gate fires every tick while unauthenticated; without this it
+    /// would re-issue an (awaited) encrypted-SQLCipher query on the UI loop on
+    /// every tick for a brand-new user with no account row yet.
+    account_checked: bool,
     /// Ensures the password-less device-unlock path is attempted at most once per
     /// run (otherwise every tick would re-spawn the unlock task).
     device_unlock_attempted: bool,
@@ -65,15 +78,11 @@ pub struct App {
     worker_rx: Option<WorkerRx>,
     /// Stashed while waiting on the worker so the modal can be opened on the next
     /// `dispatch_action` pass (which has `tui`). See [`Self::handle_worker_msg`].
-    pending_edit: Option<(todoers_types::ListId, crate::model::TodoItem)>,
-    pending_members: Option<(
-        todoers_types::ListId,
-        Vec<todoers_types::Member>,
-        todoers_types::MemberId,
-    )>,
+    pending_edit: Option<(ListId, TodoItem)>,
+    pending_members: Option<(ListId, Vec<Member>, MemberId)>,
     /// Render-side snapshot shared with the workspace component.
     view: SharedView,
-    #[cfg(debug_assertions)]
+    #[cfg(feature = "fps")]
     fps: FpsCounter,
 }
 
@@ -176,8 +185,13 @@ impl App {
         let mut modes: HashMap<Mode, Box<dyn Component>, BuildNoHashHasher<u8>> =
             HashMap::with_capacity_and_hasher(1, BuildNoHashHasher::default());
         modes.insert(Mode::Home, Box::new(Home::new(view.clone())));
+        let global_keys = compile_keymap(
+            config.keybindings.context(KeyContext::Global),
+            parse_command::<Action>,
+        );
         Ok(Self {
             modes,
+            global_keys,
             mode: Mode::default(),
             prev_mode: Mode::default(),
             should_quit: false,
@@ -194,13 +208,14 @@ impl App {
             account,
             errorbar: ErrorBar::new(),
             account_verified: false,
+            account_checked: false,
             device_unlock_attempted: false,
             cmd_tx: None,
             worker_rx: None,
             pending_edit: None,
             pending_members: None,
             view,
-            #[cfg(debug_assertions)]
+            #[cfg(feature = "fps")]
             fps: FpsCounter::new(),
         })
     }
@@ -243,7 +258,7 @@ impl App {
             sync_rx,
         ));
         // Discover lists we belong to, pull their logs, and go live.
-        let _ = sync_tx.send(crate::sync::SyncCommand::InitialSync);
+        let _ = sync_tx.send(SyncCommand::InitialSync);
 
         self.cmd_tx = Some(cmd_tx);
         self.worker_rx = Some(out_rx);
@@ -284,7 +299,7 @@ impl App {
             return;
         }
         let base = self.config.config.server_url.clone();
-        if let Err(e) = crate::net::auth::logout(&base, &keys.token).await {
+        if let Err(e) = net::auth::logout(&base, &keys.token).await {
             tracing::warn!(error = ?e, "logout on exit failed");
         }
     }
@@ -311,9 +326,17 @@ impl App {
             self.modes.get_mut(&Mode::default()).unwrap()
         };
 
+        // Initialize the main component
         component.register_action_handler(self.action_tx.clone())?;
         component.register_config_handler(self.config.clone())?;
         component.init(tui.size()?)?;
+
+        // Initialize the error bar component
+        self.errorbar
+            .register_action_handler(self.action_tx.clone())?;
+        self.errorbar.register_config_handler(self.config.clone())?;
+        self.errorbar.init(tui.size()?)?;
+
         // Populate the keybinding footer for the starting mode (a bare
         // `Keys::new` in `App::new` has no config and renders empty).
         self.refresh_keys()?;
@@ -326,6 +349,16 @@ impl App {
             tokio::select! {
                 Some(event) = tui.next_event() => {
                     self.on_event(event).await?;
+                    // Drain the rest of the buffered terminal events this turn.
+                    // The producer emits ~64 events/s (60 Render + 4 Tick) into
+                    // an unbounded channel; processing one per loop turn means a
+                    // slow turn snowballs an ever-growing backlog. Draining lets
+                    // a burst of Render/Tick events collapse into a single render
+                    // (handle_actions coalesces renders) so stale frames are
+                    // dropped instead of each being drawn.
+                    while let Some(event) = tui.try_next_event() {
+                        self.on_event(event).await?;
+                    }
                 }
                 Some(msg) = recv_opt(&mut self.worker_rx) => {
                     self.handle_worker_msg(msg)?;
@@ -357,10 +390,17 @@ impl App {
                 // unless a modal (the chooser or a form) is already up. Keep
                 // ticking regardless so capture/multi-key state stays fresh.
                 if !self.account_verified && self.modal.is_none() {
-                    if self.account.is_none()
-                        && self.acct_keys.is_none()
-                        && self.load_account().await?
-                    {
+                    // Hit the encrypted store at most once to discover whether a
+                    // local account exists; `load_account` then short-circuits on
+                    // its cached `self.account`. Doing this before the branch chain
+                    // keeps the "account found → unlock" path firing on the same
+                    // tick, while no longer querying SQLCipher on every tick when
+                    // there is no account row (the initial register/login window).
+                    if self.account.is_none() && self.acct_keys.is_none() && !self.account_checked {
+                        self.account_checked = true;
+                        self.load_account().await?;
+                    }
+                    if self.account.is_none() && self.acct_keys.is_none() {
                         action_tx.send(Action::AuthChooser)?;
                     } else if self.account.is_some() && self.acct_keys.is_none() {
                         // We have a local account but no in-memory keys (fresh
@@ -436,34 +476,15 @@ impl App {
     fn handle_key_event(&mut self, key: KeyEvent) -> anyhow::Result<()> {
         // While a text field is capturing, only global chords (Ctrl/Alt) act as
         // commands; every other key falls through to the focused input so it can
-        // be typed instead of triggering a keybinding.
+        // be typed instead of triggering a keybinding. Per-surface bindings
+        // (home/modal/members/forms) are resolved by the focused component itself;
+        // here the app only owns the app-wide `global` section.
         if self.capturing && !is_global_chord(&key) {
             return Ok(());
         }
-        let action_tx = self.action_tx.clone();
-        let Some(keymap) = self.config.keybindings.0.get(&self.mode) else {
-            warn!(
-                "No keybindings found for mode {}, skipping key event handling",
-                self.mode
-            );
-            return Ok(());
-        };
-        match keymap.get(&vec![key]) {
-            Some(action) => {
-                info!("Got action: {action:?}");
-                action_tx.send(action.clone().into())?;
-            }
-            _ => {
-                // If the key was not handled as a single key action,
-                // then consider it for multi-key combinations.
-                self.last_tick_key_events.push(key);
-
-                // Check for multi-key combinations
-                if let Some(action) = keymap.get(&self.last_tick_key_events) {
-                    info!("Got action: {action:?}");
-                    action_tx.send(action.clone().into())?;
-                }
-            }
+        if let Some(action) = resolve(&self.global_keys, &mut self.last_tick_key_events, key) {
+            info!("Got global action: {action:?}");
+            self.action_tx.send(action)?;
         }
         Ok(())
     }
@@ -472,17 +493,12 @@ impl App {
     fn handle_actions(&mut self, tui: &mut Tui) -> anyhow::Result<()> {
         let mut should_render = false;
         for action in drain(&mut self.action_rx) {
-            // Coalesce renders: note the request and draw once after draining the
-            // whole backlog, so a burst of actions costs at most one frame.
+            self.dispatch_action(action.clone(), tui)?;
             if matches!(action, Action::Render) {
                 should_render = true;
-                continue;
             }
-            self.dispatch_action(action, tui)?;
         }
         if should_render {
-            #[cfg(debug_assertions)]
-            self.fps.update(Action::Render)?;
             self.render(tui)?;
         }
         Ok(())
@@ -518,7 +534,8 @@ impl App {
                 self.action_tx.send(Action::OpenMembersReady)?;
             }
             WorkerMsg::Error(e) => {
-                self.errorbar.show_error(e, Duration::from_secs(5));
+                self.action_tx
+                    .send(Action::Error(format!("Worker error: {e:#}")))?;
             }
         }
         Ok(())
@@ -540,7 +557,6 @@ impl App {
             Action::Tick => {
                 self.last_tick_key_events.drain(..);
             }
-            Action::ToggleSidebar => {}
             Action::Quit => self.should_quit = true,
             Action::Suspend => self.should_suspend = true,
             Action::Resume => self.should_suspend = false,
@@ -548,16 +564,9 @@ impl App {
             Action::Resize(w, h) => self.handle_resize(tui, w, h)?,
             // Coalesced in `handle_actions`; unreachable here but kept so
             // the match stays exhaustive over `Action`.
-            Action::Render => {}
             Action::SetMode(mode) => self.handle_switch_mode(mode, tui)?,
             Action::StartCapture => self.capturing = true,
             Action::StopCapture => self.capturing = false,
-            // Submit rides the message bus down into the open form modal's
-            // body (forwarded below); no app-level state changes here.
-            Action::SubmitForm => {}
-            // Normally consumed by the `Modal` to shift focus onto its
-            // buttons; if it reaches the app it's a harmless no-op.
-            Action::FocusButtons => {}
             Action::Keys(ref keys) => {
                 info!("Received cryptographic keys");
                 self.acct_keys = Some(keys.to_owned());
@@ -580,7 +589,7 @@ impl App {
             }
             Action::DeviceUnlock => {
                 // Password-less unlock: decrypt the on-disk cache with the
-                // configured local AGE/SSH key, then device-login for a
+                // configured local key, then device-login for a
                 // fresh token. On any failure, fall back to the password
                 // prompt. Runs off the UI loop; result returns as actions.
                 let tx = self.action_tx.clone();
@@ -596,7 +605,10 @@ impl App {
                         let identity = du.identity.clone().ok_or_else(|| {
                             anyhow::anyhow!("no device-unlock identity configured")
                         })?;
-                        net::auth::unlock_via_device(&base_url, &identity, device_id, blob).await
+                        anyhow::Ok(
+                            net::auth::unlock_via_device(&base_url, &identity, device_id, blob)
+                                .await?,
+                        )
                     }
                     .await;
                     match attempt {
@@ -653,16 +665,10 @@ impl App {
                     self.login(account.username.clone(), password.clone());
                 } else {
                     error!("Attempted to unlock without a local account");
-                    self.errorbar.show_error(
+                    self.action_tx.send(Action::Error(
                         "No local account found; please register or log in.".to_string(),
-                        Duration::from_secs(5),
-                    );
+                    ))?;
                 }
-            }
-            Action::Error(ref err) => {
-                error!("Error action received: {err}");
-                self.errorbar
-                    .show_error(err.clone(), Duration::from_secs(5));
             }
             Action::HelpModal => {
                 // Build a help overlay for the *current* mode's bindings.
@@ -937,6 +943,7 @@ impl App {
                     self.modal = Some(modal);
                 }
             }
+            _ => {}
         }
         // Forward the action to the modal while it is open, otherwise to
         // the active mode component — never both, so the background mode
@@ -954,14 +961,12 @@ impl App {
                 self.modes.get_mut(&Mode::default()).unwrap()
             };
             if let Some(action) = component.update(action.clone())? {
-                #[cfg(debug_assertions)]
                 self.action_tx.send(action.clone())?;
-                #[cfg(not(debug_assertions))]
-                self.action_tx.send(action)?;
             };
         }
-        #[cfg(debug_assertions)]
-        self.fps.update(action)?;
+        #[cfg(feature = "fps")]
+        self.fps.update(action.clone())?;
+        self.errorbar.update(action.clone())?;
         Ok(())
     }
 
@@ -1025,6 +1030,7 @@ impl App {
         } else {
             self.modes.get_mut(&Mode::default()).unwrap()
         };
+
         component.register_action_handler(self.action_tx.clone())?;
         component.register_config_handler(self.config.clone())?;
         component.init(tui.size()?)?;
@@ -1046,17 +1052,27 @@ impl App {
             ])
             .areas(frame.area());
 
-            let component = if let Some(comp) = self.modes.get_mut(&self.mode) {
-                comp
-            } else if let Some(comp) = self.modes.get_mut(&self.prev_mode) {
-                comp
-            } else {
-                self.modes.get_mut(&Mode::default()).unwrap()
-            };
-            if let Err(err) = component.draw(frame, body) {
-                let _ = self
-                    .action_tx
-                    .send(Action::Error(format!("Failed to draw screen: {:?}", err)));
+            // Draw the background mode under the modal *unless* this is the auth
+            // prompt (no verified account yet). Authenticated modals — edit,
+            // members, share, help — are overlays on the live workspace, so the
+            // background must keep being redrawn every frame to act as a clean
+            // backdrop and to wipe the previous modal's cells when switching
+            // modals. The only case with nothing worth showing behind the dialog
+            // is the initial login/register prompt, where redrawing the full
+            // `Home` workspace every frame is pure wasted work on the hot path.
+            if self.modal.is_none() || self.account_verified {
+                let component = if let Some(comp) = self.modes.get_mut(&self.mode) {
+                    comp
+                } else if let Some(comp) = self.modes.get_mut(&self.prev_mode) {
+                    comp
+                } else {
+                    self.modes.get_mut(&Mode::default()).unwrap()
+                };
+                if let Err(err) = component.draw(frame, body) {
+                    let _ = self
+                        .action_tx
+                        .send(Action::Error(format!("Failed to draw screen: {:?}", err)));
+                }
             }
             // Draw the modal last so it overlays the active mode. The modal
             // centers itself and `Clear`s its region, so the screen behind it
@@ -1092,7 +1108,7 @@ impl App {
                 );
             }
 
-            #[cfg(debug_assertions)]
+            #[cfg(feature = "fps")]
             {
                 let [fps, _] =
                     Layout::vertical([Constraint::Length(2), Constraint::Fill(1)]).areas(body);
@@ -1138,7 +1154,8 @@ impl App {
                 let pw = password.clone();
                 let keys_for_acct = Zeroizing::new((*keys).clone());
                 let built = tokio::task::spawn_blocking(move || {
-                    crate::auth::build_local_account(&uname, &pw, &keys_for_acct)
+                    let acct = auth::build_local_account(&uname, &pw, &keys_for_acct)?;
+                    anyhow::Ok(acct)
                 })
                 .await;
                 match built {

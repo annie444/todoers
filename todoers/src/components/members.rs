@@ -1,24 +1,38 @@
-use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
+use crossterm::event::{KeyEvent, MouseEvent};
+use indexmap::IndexMap;
 use ratatui::prelude::*;
 use ratatui::widgets::*;
+use serde::Deserialize;
 use tokio::sync::mpsc::UnboundedSender;
 
 use todoers_types::{ListId, Member, MemberId, Role};
 
 use super::{Captures, Component};
 use crate::action::Action;
-use crate::config::Config;
+use crate::config::{Config, KeyContext, compile_keymap, parse_command, resolve};
 use crate::tui::Event;
 
+/// The members dialog's key-triggerable operations, bound via
+/// `[keybindings.members]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MembersCmd {
+    SelectNext,
+    SelectPrev,
+    Unshare,
+}
+
 /// An interactive list of a list's members. Lives in a [`Modal::message`]
-/// (Close button, Esc closes); `d`/Enter on a member (other than yourself)
-/// emits [`Action::Unshare`], which rotates the list's DEK.
+/// (Close button, Esc closes); the `unshare` command on a member (other than
+/// yourself) emits [`Action::Unshare`], which rotates the list's DEK.
 pub struct Members {
     list_id: ListId,
     members: Vec<Member>,
     me: MemberId,
     selected: usize,
     command_tx: Option<UnboundedSender<Action>>,
+    keymap: IndexMap<Vec<KeyEvent>, MembersCmd>,
+    pending: Vec<KeyEvent>,
 }
 
 impl Captures for Members {
@@ -35,7 +49,17 @@ impl Members {
             me,
             selected: 0,
             command_tx: None,
+            keymap: IndexMap::new(),
+            pending: Vec::new(),
         }
+    }
+
+    fn select(&mut self, delta: isize) {
+        if self.members.is_empty() {
+            return;
+        }
+        let len = self.members.len();
+        self.selected = (self.selected as isize + delta).rem_euclid(len as isize) as usize;
     }
 
     fn unshare_selected(&self) {
@@ -61,7 +85,11 @@ impl Component for Members {
         Ok(())
     }
 
-    fn register_config_handler(&mut self, _config: Config) -> anyhow::Result<()> {
+    fn register_config_handler(&mut self, config: Config) -> anyhow::Result<()> {
+        self.keymap = compile_keymap(
+            config.keybindings.context(KeyContext::Members),
+            parse_command::<MembersCmd>,
+        );
         Ok(())
     }
 
@@ -74,18 +102,12 @@ impl Component for Members {
     }
 
     fn handle_key_event(&mut self, key: KeyEvent) -> anyhow::Result<Option<Action>> {
-        if self.members.is_empty() {
-            return Ok(None);
-        }
-        match key.code {
-            KeyCode::Char('j') | KeyCode::Down => {
-                self.selected = (self.selected + 1) % self.members.len();
+        if let Some(cmd) = resolve(&self.keymap, &mut self.pending, key) {
+            match cmd {
+                MembersCmd::SelectNext => self.select(1),
+                MembersCmd::SelectPrev => self.select(-1),
+                MembersCmd::Unshare => self.unshare_selected(),
             }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.selected = (self.selected + self.members.len() - 1) % self.members.len();
-            }
-            KeyCode::Char('d') | KeyCode::Enter => self.unshare_selected(),
-            _ => {}
         }
         Ok(None)
     }
@@ -116,9 +138,12 @@ impl Component for Members {
                 ListItem::new(format!(" {role}  {}…{you}", &short[..8]))
             })
             .collect();
+        let hint = crate::config::all_keys_for(&self.keymap, &MembersCmd::Unshare)
+            .map(|keys| format!(" {keys}: remove "))
+            .unwrap_or_default();
         let block = Block::default()
             .title("Members")
-            .title_bottom(Line::from(" d/Enter: remove ").right_aligned())
+            .title_bottom(Line::from(hint).right_aligned())
             .borders(Borders::ALL);
         let list = List::new(rows).block(block).highlight_style(
             Style::default()

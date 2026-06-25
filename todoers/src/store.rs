@@ -22,15 +22,14 @@ use ratatui::layout::Direction;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use todoers_types::{Ed25519Pub, Epoch, ListId, Member, MemberId, Role, X25519Pub};
-
-use crate::crypto;
-use crate::db::Db;
-use crate::list_doc::TodoDoc;
-use crate::model::{
+use todoers_client::crypto;
+use todoers_client::db::Db;
+use todoers_client::list_doc::TodoDoc;
+use todoers_client::model::{
     ListSummary, MetaList, Priority, SortMode, TodoItem, TodoItemInput, ViewTarget,
 };
-use crate::session::Session;
+use todoers_client::session::Session;
+use todoers_types::{Ed25519Pub, Epoch, ListId, Member, MemberId, Role, X25519Pub};
 
 /// Signed/AEAD byte-layout version for produced updates. Must match the
 /// `signing_view`/`aead_aad` version on both ends (see [`crate::crypto`]).
@@ -173,7 +172,8 @@ impl Store {
     #[tracing::instrument(skip(self))]
     pub async fn rename_list(&mut self, list_id: ListId, name: &str) -> anyhow::Result<()> {
         self.db.rename_list(list_id, name).await?;
-        self.edit_doc(list_id, |d| d.set_title(name)).await
+        self.edit_doc(list_id, |d| d.set_title(name)).await?;
+        Ok(())
     }
 
     #[tracing::instrument(skip(self))]
@@ -337,7 +337,7 @@ impl Store {
     pub async fn snapshot_for(
         &self,
         targets: &[Option<ViewTarget>],
-        sort: crate::model::SortMode,
+        sort: SortMode,
     ) -> anyhow::Result<crate::store_worker::ViewSnapshot> {
         let mut lists = self.list_summaries().await?;
         sort_summaries(&mut lists, sort);
@@ -397,7 +397,8 @@ impl Store {
 
     #[tracing::instrument(skip(self))]
     pub async fn members(&self, list_id: ListId) -> anyhow::Result<Vec<Member>> {
-        self.db.list_members(list_id).await
+        let mems = self.db.list_members(list_id).await?;
+        Ok(mems)
     }
 
     // ── membership ─────────────────────────────────────────────────────────────
@@ -632,11 +633,14 @@ impl Store {
     }
 
     /// Run a closure that mutates the document, then run the persist pipeline.
-    async fn edit_doc<R>(
+    async fn edit_doc<R, E>(
         &mut self,
         list_id: ListId,
-        f: impl FnOnce(&TodoDoc) -> anyhow::Result<R>,
-    ) -> anyhow::Result<R> {
+        f: impl FnOnce(&TodoDoc) -> Result<R, E>,
+    ) -> anyhow::Result<R>
+    where
+        E: Into<anyhow::Error> + std::error::Error + Send + Sync + 'static,
+    {
         self.ensure_doc(list_id).await?;
         let doc = self.docs.get(&list_id).expect("ensured");
         let vv = doc.version();
@@ -705,18 +709,14 @@ fn to_32_vec(bytes: &[u8]) -> anyhow::Result<[u8; 32]> {
 /// due/priority (nearest due first; highest top-priority first).
 fn sort_summaries(lists: &mut [ListSummary], sort: SortMode) {
     match sort {
-        SortMode::Alphabetical => {
-            lists.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-        }
+        SortMode::Alphabetical => lists.sort_by_key(|a| a.name.to_lowercase()),
         SortMode::DueDate => lists.sort_by(|a, b| match (a.next_due, b.next_due) {
             (Some(x), Some(y)) => x.cmp(&y),
             (Some(_), None) => std::cmp::Ordering::Less,
             (None, Some(_)) => std::cmp::Ordering::Greater,
             (None, None) => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
         }),
-        SortMode::Priority => {
-            lists.sort_by(|a, b| b.top_priority.rank().cmp(&a.top_priority.rank()))
-        }
+        SortMode::Priority => lists.sort_by_key(|a| std::cmp::Reverse(a.top_priority.rank())),
     }
 }
 
@@ -724,9 +724,7 @@ fn sort_summaries(lists: &mut [ListSummary], sort: SortMode) {
 /// where they want to); `next()`-cycle order matches [`SortMode`].
 fn sort_items(items: &mut [(ListId, TodoItem)], sort: SortMode) {
     match sort {
-        SortMode::Alphabetical => {
-            items.sort_by(|(_, a), (_, b)| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
-        }
+        SortMode::Alphabetical => items.sort_by_key(|(_, a)| a.title.to_lowercase()),
         SortMode::DueDate => items.sort_by(|(_, a), (_, b)| match (a.due, b.due) {
             (Some(x), Some(y)) => x.cmp(&y),
             (Some(_), None) => std::cmp::Ordering::Less, // dated before undated
@@ -734,9 +732,7 @@ fn sort_items(items: &mut [(ListId, TodoItem)], sort: SortMode) {
             (None, None) => std::cmp::Ordering::Equal,
         }),
         // Highest priority first.
-        SortMode::Priority => {
-            items.sort_by(|(_, a), (_, b)| b.priority.rank().cmp(&a.priority.rank()))
-        }
+        SortMode::Priority => items.sort_by_key(|(_, a)| std::cmp::Reverse(a.priority.rank())),
     }
 }
 
@@ -744,10 +740,9 @@ fn sort_items(items: &mut [(ListId, TodoItem)], sort: SortMode) {
 mod tests {
     use super::*;
     use sqlx::{Pool, Sqlite};
-    use time::OffsetDateTime;
     use todoers_types::MemberId;
 
-    use crate::auth::UnlockedKeys;
+    use todoers_client::auth::UnlockedKeys;
 
     /// Build a Store over a migrated test pool with a fresh random identity.
     fn store_with(db: Pool<Sqlite>) -> Store {
@@ -772,7 +767,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test(migrations = "db/migrations")]
+    #[sqlx::test(migrations = "../todoers-client/db/migrations")]
     async fn create_list_seeds_summary_and_outbound(db: Pool<Sqlite>) {
         let mut store = store_with(db);
         let id = store.create_list("Groceries").await.unwrap();
@@ -789,7 +784,7 @@ mod tests {
         assert_eq!(store.members(id).await.unwrap().len(), 1);
     }
 
-    #[sqlx::test(migrations = "db/migrations")]
+    #[sqlx::test(migrations = "../todoers-client/db/migrations")]
     async fn todo_crud_round_trips_through_read_model(db: Pool<Sqlite>) {
         let mut store = store_with(db);
         let list = store.create_list("L").await.unwrap();
@@ -843,7 +838,7 @@ mod tests {
         assert_eq!(after[0].1.title, "walk dog");
     }
 
-    #[sqlx::test(migrations = "db/migrations")]
+    #[sqlx::test(migrations = "../todoers-client/db/migrations")]
     async fn meta_list_due_today_aggregates_across_lists(db: Pool<Sqlite>) {
         let mut store = store_with(db);
         let a = store.create_list("A").await.unwrap();
@@ -894,7 +889,7 @@ mod tests {
         assert_eq!(all.len(), 2, "AllTasks spans both lists");
     }
 
-    #[sqlx::test(migrations = "db/migrations")]
+    #[sqlx::test(migrations = "../todoers-client/db/migrations")]
     async fn data_survives_a_fresh_store(db: Pool<Sqlite>) {
         // First store creates and populates.
         let id;
@@ -913,7 +908,7 @@ mod tests {
         assert_eq!(view[0].1.title, "remember me");
     }
 
-    #[sqlx::test(migrations = "db/migrations")]
+    #[sqlx::test(migrations = "../todoers-client/db/migrations")]
     async fn remove_member_rotates_epoch(db: Pool<Sqlite>) {
         let mut store = store_with(db);
         let list = store.create_list("Shared").await.unwrap();
@@ -945,11 +940,14 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!("db/migrations").run(&pool).await.unwrap();
+        sqlx::migrate!("../todoers-client/db/migrations")
+            .run(&pool)
+            .await
+            .unwrap();
         pool
     }
 
-    #[sqlx::test(migrations = "db/migrations")]
+    #[sqlx::test(migrations = "../todoers-client/db/migrations")]
     async fn remote_updates_apply_on_a_second_device(db: Pool<Sqlite>) {
         // Author A produces updates on their device.
         let mut a = store_with(db);
@@ -1003,7 +1001,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrations = "db/migrations")]
+    #[sqlx::test(migrations = "../todoers-client/db/migrations")]
     async fn remote_update_with_bad_signature_is_skipped(db: Pool<Sqlite>) {
         let mut a = store_with(db);
         let list = a.create_list("Shared").await.unwrap();

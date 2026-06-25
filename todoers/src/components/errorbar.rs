@@ -1,6 +1,6 @@
 use ratatui::{prelude::*, widgets::*};
 use tokio::time::{Duration, Instant};
-use tracing::warn;
+use tracing::{error, warn};
 
 use super::{Captures, Component};
 use crate::action::Action;
@@ -11,6 +11,7 @@ pub struct ErrorBar {
     style: Style,
     duration: Duration,
     show_time: Instant,
+    history: Vec<String>,
 }
 
 impl Default for ErrorBar {
@@ -21,6 +22,7 @@ impl Default for ErrorBar {
             style: Style::default().fg(Color::Red),
             duration: Duration::from_secs(0),
             show_time: Instant::now(),
+            history: Vec::new(),
         }
     }
 }
@@ -31,11 +33,22 @@ impl ErrorBar {
         Self::default()
     }
 
-    pub fn show_error(&mut self, msg: String, duration: Duration) {
+    fn show_error(&mut self, msg: String, duration: Duration) {
         self.text = msg;
         self.duration = duration;
         self.show_time = Instant::now();
         self.show = true;
+    }
+
+    fn clear(&mut self) {
+        self.show = false;
+        self.history.push(self.text.clone());
+        self.text.clear();
+        self.duration = Duration::from_secs(0);
+    }
+
+    fn is_showing(&self) -> bool {
+        self.show && self.show_time.elapsed() <= self.duration
     }
 }
 
@@ -45,9 +58,13 @@ impl Component for ErrorBar {
     #[tracing::instrument(skip(self, action))]
     fn update(&mut self, action: Action) -> anyhow::Result<Option<Action>> {
         match action {
+            Action::ClearScreen => self.clear(),
             Action::Tick if self.show && self.show_time.elapsed() >= self.duration => {
-                self.show = false;
-                self.text.clear();
+                self.clear();
+            }
+            Action::Error(e) => {
+                error!("Error received: {e}");
+                self.show_error(e, Duration::from_secs(5));
             }
             _ => {}
         }
@@ -56,7 +73,7 @@ impl Component for ErrorBar {
 
     #[tracing::instrument(skip(self))]
     fn placement(&self) -> Constraint {
-        if self.show {
+        if self.is_showing() {
             Constraint::Length(2)
         } else {
             Constraint::Length(0)

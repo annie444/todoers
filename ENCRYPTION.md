@@ -12,15 +12,22 @@ client-side except the one narrowly-scoped check noted under *Signatures*.
 
 ## Where the code lives
 
+> The client crypto lives in the **`todoers-client`** library; the `todoers` crate is the
+> TUI binary on top of it (only `main.rs` — the startup bootstrap — is crypto-relevant there).
+
 | Concern | File |
 | --- | --- |
 | Wire + key schema, `signing_view` / `aead_aad` (the canonical layout) | `todoers-types/src/lib.rs` |
-| All client crypto: AEAD, sealing, KDFs, key wrapping, membership ops | `todoers/src/crypto.rs` |
-| OPAQUE auth driver (register / login / unlock), key escrow | `todoers/src/auth.rs` |
+| All client crypto: AEAD, sealing, KDFs, key wrapping, membership ops | `todoers-client/src/crypto.rs` |
+| OPAQUE auth driver (register / login / unlock), key escrow | `todoers-client/src/auth.rs` |
+| DB-at-rest key envelope: SQLCipher key wrap/unwrap, recovery key | `todoers-client/src/sqlcipher.rs` |
+| Device key store (OS keyring) + `RecipientEnvelope` schema | `todoers-client/src/device_key/` |
+| DB open with `PRAGMA key` (SQLCipher) | `todoers-client/src/db.rs` (`Db::new`/`Db::init`) |
+| First-run recovery-key display + recovery prompt (pre-TUI) | `todoers/src/main.rs` |
 | Server OPAQUE wrapper + `ServerSetup` persistence | `todoers-server/src/crypto.rs` |
 | Server-side optional signature verification | `todoers-server/src/routes/updates.rs` |
 | Blindness contract (at rest, server) | `todoers-server/db/migrations/0001_init.sql` (header) |
-| Class-(1/2/3) at-rest rules (client) | `todoers/db/migrations/0001_init.sql` (header) |
+| Class-(1/2/3) at-rest rules (client) | `todoers-client/db/migrations/0001_init.sql` (header) |
 
 ## Primitives
 
@@ -89,6 +96,44 @@ enroll/revoke require step-up (a recent password, never a device, session).
 Unwrapped private keys and DEKs are **class-3** material: in memory only
 (`UnlockedKeys`), never written to disk.
 
+## Database encryption at rest (SQLCipher)
+
+The whole local SQLite DB is encrypted with **SQLCipher**, a layer *underneath*
+everything above: it protects even the class-2 plaintext-for-convenience columns
+on disk. It is independent of the account keys (escrow) and the per-list DEKs.
+
+- A random **32-byte SQLCipher key** is generated on first run and never derived
+  from a password — it is a raw CSPRNG key. `Db::new` passes it as
+  `PRAGMA key = "x'<64-hex>'"` (the `x'...'` raw form skips SQLCipher's own KDF).
+  sqlx 0.9 pre-seeds `key` first in its pragma map, so it runs before
+  `journal_mode`/`page_size`, as SQLCipher requires.
+- That key is wrapped in a **`TodoersKeyEnvelope`** (`sqlcipher.rs`), persisted as
+  JSON at `{data_dir}/db_keys.json`. The envelope lives **outside** the DB because
+  it must be read *before* the DB can be opened (chicken-and-egg). It holds two
+  `RecipientEnvelope`s, each an independent wrapping of the same 32-byte key:
+  1. **Device recipient** — an **X-Wing** (hybrid X25519 + ML-KEM) KEM encapsulation
+     to a per-database keypair; the private (decapsulation) key is stored in the OS
+     keyring (`device_key/`, via `keyring-core`). This is the everyday auto-unlock.
+  2. **Password recipient** — Argon2id over a generated **recovery key** (grouped
+     Crockford base32, ~128-bit). Shown once on first run; the only fallback if the
+     device key is lost. Input is canonicalized (`sqlcipher::canonical`) so the
+     user's dashes/spacing/case don't matter.
+  Each wrapping derives a KEK (HKDF-SHA512 over the KEM shared secret / Argon2
+  output, domain-separated by `database_id` + label) and seals the SQLCipher key
+  with XChaCha20-Poly1305 (AAD binds `database_id`/recipient id/label).
+- **Bootstrap** (`todoers/src/main.rs`, before the TUI starts): load-or-create the
+  envelope → try `unlock_with_device` → on failure prompt for the recovery key on
+  stdin (`unlock_with_password`) → open the DB with the recovered key → on first run
+  print the recovery key with an acknowledgement gate.
+
+> **Build gotcha:** SQLCipher only compiles in because `todoers-client` depends on
+> `libsqlite3-sys` **explicitly** with `bundled-sqlcipher-vendored-openssl` (pinned to
+> the version sqlx-sqlite allows). A `[workspace.dependencies]` template entry does **not**
+> activate the feature; without the explicit dep, plain SQLite ignores `PRAGMA key` and
+> writes the DB in **cleartext**. The regression test
+> `db::tests::keyed_database_is_encrypted_on_disk` fails on the plaintext header if this
+> ever regresses.
+
 ## Per-list encryption — DEKs and epochs
 
 Each list has a **Data Encryption Key (DEK)** per `Epoch` (a `u32` generation
@@ -130,7 +175,7 @@ member can't lift a valid ciphertext into a different list/epoch/author. All
 fields are fixed-width, so plain concatenation is unambiguous.
 
 **This layout is duplicated** in `todoers-types/src/lib.rs` (`signing_view` /
-`aead_aad`, used by the server) and `todoers/src/crypto.rs` (the private
+`aead_aad`, used by the server) and `todoers-client/src/crypto.rs` (the private
 `signing_view` / `aead_aad`, used by the client). When you touch the
 update/signature path, **change both together** or signature verification rejects
 every valid update.
@@ -149,16 +194,27 @@ by a UNIQUE constraint on the signature.
 - **Server** (`todoers-server/db/migrations/0001_init.sql`): every `_pub` column
   is public; every `ciphertext` / `wrapped_*` / `opaque_*` column is opaque bytes.
   No plaintext ever touches the DB.
-- **Client** (`todoers/db/migrations/0001_init.sql`): class-(1) already-encrypted
-  or public (safe on plain SQLite), class-(2) plaintext-for-convenience (safe only
-  under SQLCipher), class-(3) never persisted (DEKs / private keys, memory only).
+- **Client** (`todoers-client/db/migrations/0001_init.sql`): class-(1) already-encrypted
+  or public (safe on plain SQLite), class-(2) plaintext-for-convenience (safe because the
+  whole DB is now SQLCipher-encrypted at rest — see [Database encryption at rest](#database-encryption-at-rest-sqlcipher)),
+  class-(3) never persisted (DEKs / private keys, memory only).
 
 ## Tests to run
 
 ```sh
-cargo test -p todoers escrow_round_trip_recovers_identity   # full register→login→unlock cycle
-cargo test -p todoers wrong_password_fails_login
+export CLIENT_DATABASE_URL="sqlite://$PWD/dbs/cli.sqlite"     # needed to *build* the crate
+
+# Account keys (OPAQUE server played in-process; no DB or network at runtime):
+cargo test -p todoers-client escrow_round_trip_recovers_identity   # register→login→unlock
+cargo test -p todoers-client wrong_password_fails_login
+
+# DB-at-rest layer (mock keyring; runs without the real OS keychain):
+cargo test -p todoers-client --lib sqlcipher
+cargo test -p todoers-client keyed_database_is_encrypted_on_disk   # proves on-disk encryption
 ```
 
-These play the OPAQUE server side in-process and need no DB or network
-(`todoers/src/auth.rs`).
+The auth/sqlcipher round-trips need no DB or network at runtime
+(`todoers-client/src/auth.rs`, `sqlcipher.rs`); the keyring-backed tests use
+`keyring-core`'s in-memory mock store, selected automatically under `#[cfg(test)]`.
+Building the crate still needs `CLIENT_DATABASE_URL` for the checked `sqlx::query!`
+macros (see CLAUDE.md → Build & run).

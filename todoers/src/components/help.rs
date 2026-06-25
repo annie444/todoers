@@ -4,9 +4,8 @@ use crossterm::event::KeyModifiers;
 use ratatui::{prelude::*, widgets::*};
 
 use super::{Captures, Component};
-use crate::action::Action;
 use crate::app::Mode;
-use crate::config::Config;
+use crate::config::{Config, KeyContext, command_label};
 
 /// Read-only help body: a keybindings cheatsheet for a single [`Mode`].
 ///
@@ -64,20 +63,26 @@ impl Captures for Help {}
 impl Component for Help {
     #[tracing::instrument(skip(self, config))]
     fn register_config_handler(&mut self, config: Config) -> anyhow::Result<()> {
-        if let Some(keybinds) = config.keybindings.0.get(&self.mode) {
-            let mut key_strs: HashMap<String, Vec<String>> = HashMap::new();
-            for (keys, action_cfg) in keybinds {
-                let action: &Action = action_cfg.into();
+        // The cheatsheet lists the app-wide `global` bindings plus those for this
+        // mode's own surface, so it reflects everything reachable from here.
+        let contexts = [KeyContext::Global, KeyContext::from(self.mode)];
+        let mut key_strs: HashMap<String, Vec<String>> = HashMap::new();
+        for ctx in contexts {
+            let Some(keybinds) = config.keybindings.context(ctx) else {
+                continue;
+            };
+            for (keys, spec) in keybinds {
+                let label = command_label(spec.command());
                 for key in keys {
                     key_strs
-                        .entry(action.to_string())
+                        .entry(label.clone())
                         .or_default()
                         .push(Self::key_label(key));
                 }
             }
-            for (action, keys) in key_strs.into_iter() {
-                self.keys.insert(keys.join("/"), action);
-            }
+        }
+        for (action, keys) in key_strs.into_iter() {
+            self.keys.insert(keys.join("/"), action);
         }
         Ok(())
     }

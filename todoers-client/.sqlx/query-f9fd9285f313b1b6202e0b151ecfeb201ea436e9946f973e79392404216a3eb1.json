@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE outbound SET status = 'inflight', attempts = attempts + 1, last_attempt_at = unixepoch() WHERE local_id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "f9fd9285f313b1b6202e0b151ecfeb201ea436e9946f973e79392404216a3eb1"
+}

@@ -7,7 +7,8 @@ use crate::{action::Action, config::Config, tui::Event};
 
 mod button;
 mod errorbar;
-#[cfg(debug_assertions)]
+mod form_keys;
+#[cfg(feature = "fps")]
 mod fps;
 mod help;
 mod home;
@@ -25,7 +26,8 @@ mod unlock;
 
 pub use button::Button;
 pub use errorbar::ErrorBar;
-#[cfg(debug_assertions)]
+pub use form_keys::{FormAction, FormKeys};
+#[cfg(feature = "fps")]
 pub use fps::FpsCounter;
 pub use help::Help;
 pub use home::Home;
@@ -189,4 +191,40 @@ pub trait Component: Captures {
     ///
     /// * [`anyhow::Result<()>`] - An Ok result or an error.
     fn draw(&mut self, frame: &mut Frame, area: Rect) -> anyhow::Result<()>;
+}
+
+#[cfg(test)]
+mod keybinding_default_tests {
+    use crate::action::Action;
+    use crate::config::{Config, KeyContext, compile_keymap, parse_command};
+
+    /// Every command name in the shipped `app_config.toml` must be a valid verb for
+    /// its surface — otherwise `compile_keymap` silently drops it and the default
+    /// binding is dead. Compile each surface and assert nothing was dropped, which
+    /// catches a typo in either the config or a verb enum.
+    fn assert_all_compile<V>(ctx: KeyContext)
+    where
+        V: for<'de> serde::Deserialize<'de>,
+    {
+        let cfg = Config::defaults();
+        let raw = cfg
+            .keybindings
+            .context(ctx)
+            .unwrap_or_else(|| panic!("default config is missing the {ctx:?} section"));
+        let compiled = compile_keymap(Some(raw), parse_command::<V>);
+        assert_eq!(
+            compiled.len(),
+            raw.len(),
+            "some default {ctx:?} bindings did not compile to a known command",
+        );
+    }
+
+    #[test]
+    fn default_keymaps_compile_for_every_surface() {
+        assert_all_compile::<Action>(KeyContext::Global);
+        assert_all_compile::<super::home::HomeCmd>(KeyContext::Home);
+        assert_all_compile::<super::modal::ModalCmd>(KeyContext::Modal);
+        assert_all_compile::<super::members::MembersCmd>(KeyContext::Members);
+        assert_all_compile::<super::form_keys::FormCmd>(KeyContext::Form);
+    }
 }

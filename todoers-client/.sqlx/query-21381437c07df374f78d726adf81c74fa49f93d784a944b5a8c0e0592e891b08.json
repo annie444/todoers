@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            INSERT OR REPLACE INTO account\n                (id, member_id, username, identity_pub, signing_pub,\n                wrapped_secret_keys, kdf_salt, kdf_mem_kib, kdf_iters, kdf_parallelism)\n            VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?)\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 9
+    },
+    "nullable": []
+  },
+  "hash": "21381437c07df374f78d726adf81c74fa49f93d784a944b5a8c0e0592e891b08"
+}

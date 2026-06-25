@@ -1,14 +1,46 @@
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::KeyEvent;
+use indexmap::IndexMap;
 use ratatui::{prelude::*, widgets::*};
+use serde::Deserialize;
 use tokio::sync::mpsc::UnboundedSender;
 
+use todoers_client::model::{MetaList, Priority, ViewTarget};
 use todoers_types::ListId;
 
 use super::{Captures, Component};
 use crate::action::{Action, DeleteTarget};
-use crate::config::{Config, IconType};
-use crate::model::{MetaList, Priority, ViewTarget};
+use crate::config::{Config, IconType, KeyContext, compile_keymap, parse_command, resolve};
 use crate::store::SharedView;
+
+/// The workspace's key-triggerable operations. Bound to keys via
+/// `[keybindings.home]`; the component resolves a key to one of these and runs
+/// it against its current focus/selection (so e.g. `share` targets whatever the
+/// sidebar/pane currently points at).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HomeCmd {
+    FocusSidebar,
+    FocusPane,
+    CycleFocus,
+    SelectNext,
+    SelectPrev,
+    OpenSelected,
+    SplitHorizontal,
+    SplitVertical,
+    CyclePane,
+    ClosePane,
+    GrowPane,
+    ShrinkPane,
+    NewList,
+    CycleSort,
+    Share,
+    Members,
+    AddTodo,
+    EditTodo,
+    ToggleDone,
+    Rename,
+    Delete,
+}
 
 const LIST_ICON_NF: char = '\u{f0ca}';
 const LIST_ICON_UTF: char = '📋';
@@ -40,6 +72,9 @@ pub struct Home {
     active_pane: usize,
     /// Per-pane selected item index.
     pane_sel: [usize; 2],
+    /// Compiled `[keybindings.home]` map + the multi-key sequence buffer.
+    keymap: IndexMap<Vec<KeyEvent>, HomeCmd>,
+    pending: Vec<KeyEvent>,
 }
 
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,6 +123,8 @@ impl Home {
             sidebar_idx: 0,
             active_pane: 0,
             pane_sel: [0, 0],
+            keymap: IndexMap::new(),
+            pending: Vec::new(),
         }
     }
 
@@ -199,32 +236,79 @@ impl Home {
         }
     }
 
-    /// Map a command key to an intent action, given current focus/selection.
-    fn command(&self, c: char) -> Option<Action> {
-        match c {
-            'n' => Some(Action::NewListModal),
-            'o' => Some(Action::CycleSort),
-            's' => self.command_list().map(Action::ShareModal),
-            'm' => self.command_list().map(Action::MembersModal),
-            'a' => self.current_list().map(Action::AddTodoModal),
-            'e' if self.focus == Focus::Pane => self
-                .selected_item()
-                .map(|(list_id, item_id)| Action::EditTodoModal { list_id, item_id }),
-            'x' if self.focus == Focus::Pane => self
-                .selected_item()
-                .map(|(list_id, item_id)| Action::ToggleDone { list_id, item_id }),
-            'R' => self
-                .selected_user_list()
-                .map(|(list_id, name)| Action::RenameListModal { list_id, name }),
-            'd' => match self.focus {
-                Focus::Sidebar => self
-                    .selected_user_list()
-                    .map(|(id, _)| Action::ConfirmDelete(DeleteTarget::List(id))),
-                Focus::Pane => self.selected_item().map(|(list_id, item_id)| {
-                    Action::ConfirmDelete(DeleteTarget::Todo { list_id, item_id })
-                }),
+    /// Run a resolved [`HomeCmd`] against the current focus/selection. Layout and
+    /// focus verbs mutate local view state; command verbs build the same intent
+    /// [`Action`]s the app already fulfills and emit them on the action channel.
+    fn execute(&mut self, cmd: HomeCmd) {
+        use HomeCmd::*;
+        match cmd {
+            FocusSidebar => self.focus = Focus::Sidebar,
+            FocusPane => self.focus = Focus::Pane,
+            CycleFocus => self.cycle_focus(),
+            SelectNext => self.move_selection(1),
+            SelectPrev => self.move_selection(-1),
+            OpenSelected => {
+                if self.focus == Focus::Sidebar {
+                    self.open_selected();
+                }
+            }
+            SplitHorizontal => self.split(Direction::Horizontal),
+            SplitVertical => self.split(Direction::Vertical),
+            CyclePane => self.cycle_pane(),
+            ClosePane => self.close_pane(),
+            GrowPane => self.resize(5),
+            ShrinkPane => self.resize(-5),
+            NewList => self.send(Action::NewListModal),
+            CycleSort => self.send(Action::CycleSort),
+            Share => {
+                if let Some(action) = self.command_list().map(Action::ShareModal) {
+                    self.send(action);
+                }
+            }
+            Members => {
+                if let Some(action) = self.command_list().map(Action::MembersModal) {
+                    self.send(action);
+                }
+            }
+            AddTodo => {
+                if let Some(action) = self.current_list().map(Action::AddTodoModal) {
+                    self.send(action);
+                }
+            }
+            EditTodo => {
+                if self.focus == Focus::Pane
+                    && let Some((list_id, item_id)) = self.selected_item()
+                {
+                    self.send(Action::EditTodoModal { list_id, item_id });
+                }
+            }
+            ToggleDone => {
+                if self.focus == Focus::Pane
+                    && let Some((list_id, item_id)) = self.selected_item()
+                {
+                    self.send(Action::ToggleDone { list_id, item_id });
+                }
+            }
+            Rename => {
+                if let Some((list_id, name)) = self.selected_user_list() {
+                    self.send(Action::RenameListModal { list_id, name });
+                }
+            }
+            Delete => match self.focus {
+                Focus::Sidebar => {
+                    if let Some((id, _)) = self.selected_user_list() {
+                        self.send(Action::ConfirmDelete(DeleteTarget::List(id)));
+                    }
+                }
+                Focus::Pane => {
+                    if let Some((list_id, item_id)) = self.selected_item() {
+                        self.send(Action::ConfirmDelete(DeleteTarget::Todo {
+                            list_id,
+                            item_id,
+                        }));
+                    }
+                }
             },
-            _ => None,
         }
     }
 
@@ -292,6 +376,42 @@ impl Home {
 
     // ── rendering ──────────────────────────────────────────────────────────────
 
+    /// Build a ` key:label key:label ` hint line from the live bindings, skipping
+    /// any command the user has left unbound.
+    fn hint(&self, items: &[(HomeCmd, &str)]) -> String {
+        let parts: Vec<String> = items
+            .iter()
+            .filter_map(|(verb, label)| {
+                crate::config::first_key_for(&self.keymap, verb).map(|k| format!("{k}:{label}"))
+            })
+            .collect();
+        format!(" {} ", parts.join(" "))
+    }
+
+    /// Pane-layout hint shown on the sidebar (split/stack/cycle/close).
+    fn layout_hint(&self) -> String {
+        self.hint(&[
+            (HomeCmd::SplitHorizontal, "split"),
+            (HomeCmd::SplitVertical, "stack"),
+            (HomeCmd::CyclePane, "pane"),
+            (HomeCmd::ClosePane, "close"),
+        ])
+    }
+
+    /// Command hint shown on a todo pane.
+    fn command_hint(&self) -> String {
+        self.hint(&[
+            (HomeCmd::NewList, "new"),
+            (HomeCmd::AddTodo, "add"),
+            (HomeCmd::EditTodo, "edit"),
+            (HomeCmd::ToggleDone, "done"),
+            (HomeCmd::Delete, "del"),
+            (HomeCmd::CycleSort, "sort"),
+            (HomeCmd::Share, "share"),
+            (HomeCmd::Members, "members"),
+        ])
+    }
+
     fn draw_sidebar(&self, frame: &mut Frame, area: Rect) {
         let view = self.view.borrow();
         let mut rows: Vec<ListItem> = Vec::with_capacity(self.sidebar_len());
@@ -316,7 +436,7 @@ impl Home {
         let focused = self.focus == Focus::Sidebar;
         let block = Block::default()
             .title("Lists")
-            .title_bottom(Line::from(" |:split -:stack w:pane X:close ").right_aligned())
+            .title_bottom(Line::from(self.layout_hint()).right_aligned())
             .borders(Borders::ALL)
             .border_style(border_style(focused));
         let list = List::new(rows)
@@ -375,10 +495,7 @@ impl Home {
         ];
         let block = Block::default()
             .title(title)
-            .title_bottom(
-                Line::from(" n:new a:add e:edit x:done d:del o:sort s:share m:members ")
-                    .right_aligned(),
-            )
+            .title_bottom(Line::from(self.command_hint()).right_aligned())
             .borders(Borders::ALL)
             .border_style(border_style(focused));
         let table = Table::new(rows, widths)
@@ -461,46 +578,34 @@ impl Component for Home {
             IconType::Emojis => ListIcon::utf(),
             IconType::Basic => ListIcon::basic(),
         };
+        self.keymap = compile_keymap(
+            self.config.keybindings.context(KeyContext::Home),
+            parse_command::<HomeCmd>,
+        );
         Ok(())
     }
 
     #[tracing::instrument(skip(self))]
     fn handle_key_event(&mut self, key: KeyEvent) -> anyhow::Result<Option<Action>> {
-        match key.code {
-            KeyCode::Tab | KeyCode::BackTab => self.cycle_focus(),
-            KeyCode::Char('h') | KeyCode::Left => self.focus = Focus::Sidebar,
-            KeyCode::Char('l') | KeyCode::Right => self.focus = Focus::Pane,
-            KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
-            KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
-            // Pane layout: side-by-side / stacked / cycle / close / resize.
-            KeyCode::Char('|') => self.split(Direction::Horizontal),
-            KeyCode::Char('-') => self.split(Direction::Vertical),
-            KeyCode::Char('w') => self.cycle_pane(),
-            KeyCode::Char('X') => self.close_pane(),
-            KeyCode::Char('<') => self.resize(-5),
-            KeyCode::Char('>') => self.resize(5),
-            KeyCode::Enter => {
-                if self.focus == Focus::Sidebar {
-                    self.open_selected();
-                }
-            }
-            KeyCode::Char(c) => {
-                if let Some(action) = self.command(c) {
-                    self.send(action);
-                }
-            }
-            _ => {}
+        if let Some(cmd) = resolve(&self.keymap, &mut self.pending, key) {
+            self.execute(cmd);
         }
         Ok(None)
     }
 
     #[tracing::instrument(skip(self))]
     fn update(&mut self, action: Action) -> anyhow::Result<Option<Action>> {
-        if let Action::ToggleSidebar = action {
-            self.sidebar_visible = !self.sidebar_visible;
-            if !self.sidebar_visible {
-                self.focus = Focus::Pane;
+        match action {
+            Action::ToggleSidebar => {
+                self.sidebar_visible = !self.sidebar_visible;
+                if !self.sidebar_visible {
+                    self.focus = Focus::Pane;
+                }
             }
+            // Drop any half-typed multi-key sequence on the tick boundary, mirroring
+            // the app-level global buffer.
+            Action::Tick => self.pending.clear(),
+            _ => {}
         }
         Ok(None)
     }
@@ -516,5 +621,82 @@ impl Component for Home {
             self.draw_panes(frame, area);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crossterm::event::{KeyCode, KeyModifiers};
+    use pretty_assertions::assert_eq;
+    use tokio::sync::mpsc;
+
+    fn ch(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty())
+    }
+
+    /// With the default `[keybindings.home]` map loaded, command keys resolve to
+    /// their `HomeCmd` and emit the matching intent action on the channel.
+    #[test]
+    fn default_command_keys_emit_actions() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut home = Home::new(SharedView::default());
+        home.register_action_handler(tx).unwrap();
+        home.register_config_handler(Config::defaults()).unwrap();
+
+        home.handle_key_event(ch('n')).unwrap();
+        assert_eq!(rx.try_recv().unwrap(), Action::NewListModal);
+
+        home.handle_key_event(ch('o')).unwrap();
+        assert_eq!(rx.try_recv().unwrap(), Action::CycleSort);
+    }
+
+    /// Focus/navigation keys mutate local view state rather than emitting actions.
+    #[test]
+    fn default_focus_keys_mutate_local_state() {
+        let mut home = Home::new(SharedView::default());
+        home.register_config_handler(Config::defaults()).unwrap();
+
+        home.handle_key_event(ch('l')).unwrap();
+        assert_eq!(home.focus, Focus::Pane);
+        home.handle_key_event(ch('h')).unwrap();
+        assert_eq!(home.focus, Focus::Sidebar);
+    }
+
+    /// The on-screen hints are derived from the live bindings and, with defaults,
+    /// reproduce the original hardcoded strings.
+    #[test]
+    fn hints_derive_from_default_bindings() {
+        let mut home = Home::new(SharedView::default());
+        home.register_config_handler(Config::defaults()).unwrap();
+        assert_eq!(home.layout_hint(), " |:split -:stack w:pane X:close ");
+        assert_eq!(
+            home.command_hint(),
+            " n:new a:add e:edit x:done d:del o:sort s:share m:members "
+        );
+    }
+
+    /// A rebound key takes effect: map `a` to `new_list` and it now emits the new
+    /// list action instead of add-todo.
+    #[test]
+    fn rebinding_a_key_changes_the_command() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut cfg = Config::defaults();
+        cfg.keybindings
+            .0
+            .get_mut(&KeyContext::Home)
+            .unwrap()
+            .insert(
+                crate::config::parse_key_sequence("a").unwrap(),
+                crate::config::CommandSpec::Bare("new_list".into()),
+            );
+
+        let mut home = Home::new(SharedView::default());
+        home.register_action_handler(tx).unwrap();
+        home.register_config_handler(cfg).unwrap();
+
+        home.handle_key_event(ch('a')).unwrap();
+        assert_eq!(rx.try_recv().unwrap(), Action::NewListModal);
     }
 }

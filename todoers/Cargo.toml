@@ -6,8 +6,13 @@ authors.workspace = true
 license.workspace = true
 build = "build.rs"
 
+[features]
+default = ["fps"]
+fps = []
+
 [dependencies]
 todoers-types = { path = "../todoers-types" }
+todoers-client = { path = "../todoers-client" }
 
 sqlx = { workspace = true, features = [
   "derive",
@@ -64,6 +69,7 @@ x-wing = { workspace = true }
 hex = { workspace = true }
 loro = { workspace = true }
 time = { workspace = true }
+dialoguer = { workspace = true }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }

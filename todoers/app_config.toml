@@ -20,28 +20,88 @@ icon_theme = "nerd-fonts"
 # recipient = "<hex public key from `todoers keygen`>"
 # identity = "/home/you/.config/todoers/device.key"
 
-[keybindings.home]
-q = { action = "quit", show = true }
-"?" = { action = "help_modal", show = true }
+# ── Keybindings ──────────────────────────────────────────────────────────────
+#
+# Every interactive surface has its own `[keybindings.<context>]` section mapping a
+# key (or a `+`-joined chord sequence like "space+e") to a command name. Values are
+# either a bare string ("quit") or a table to surface the binding in the footer:
+# `{ command = "quit", show = true }`. Modifiers: ctrl-/alt-/shift-. Multiple keys
+# may map to the same command. Unknown command names are ignored (logged on start).
+#
+# Contexts: `global` (app-wide, works over modals/forms — Ctrl-chords always, bare
+# keys only when not typing), `home` (the workspace), `modal` (dialog buttons),
+# `members`, and `form` (shared field navigation for every form). Esc always cancels
+# a modal (and leaves a Vim field's insert mode); it is not rebindable, by design.
+#
+# Note: in-field text editing motions (vim/emacs) are governed by `editing_mode`
+# above, not by these sections.
+
+[keybindings.global]
+q = { command = "quit", show = true }
+"?" = { command = "help_modal", show = true }
 ctrl-l = "login_modal"
 ctrl-r = "register_modal"
-ctrl-d = { action = "quit", show = true }
-ctrl-c = { action = "quit", show = true }
-ctrl-z = { action = "suspend", show = true }
-"space+e" = { action = "toggle_sidebar", show = true }
+ctrl-d = { command = "quit", show = true }
+ctrl-c = { command = "quit", show = true }
+ctrl-z = { command = "suspend", show = true }
+"space+e" = { command = "toggle_sidebar", show = true }
 
-[keybindings.register]
-"?" = { action = "help_modal", show = true }
-ctrl-l = { action = "login_modal", show = true }
-ctrl-d = { action = "quit", show = true }
-ctrl-c = { action = "quit", show = true }
-ctrl-z = { action = "suspend", show = true }
-esc = { action = "suspend", show = true }
+[keybindings.home]
+# Focus & selection
+h = "focus_sidebar"
+left = "focus_sidebar"
+l = "focus_pane"
+right = "focus_pane"
+tab = "cycle_focus"
+backtab = "cycle_focus"
+j = "select_next"
+down = "select_next"
+k = "select_prev"
+up = "select_prev"
+enter = "open_selected"
+# Pane layout
+"|" = "split_horizontal"
+"-" = "split_vertical"
+w = "cycle_pane"
+shift-x = "close_pane"
+"<" = "shrink_pane"
+">" = "grow_pane"
+# Commands (operate on the current selection/focus)
+n = "new_list"
+o = "cycle_sort"
+s = "share"
+m = "members"
+a = "add_todo"
+e = "edit_todo"
+x = "toggle_done"
+shift-r = "rename"
+d = "delete"
 
-[keybindings.login]
-"?" = { action = "help_modal", show = true }
-ctrl-r = { action = "register_modal", show = true }
-ctrl-d = { action = "quit", show = true }
-ctrl-c = { action = "quit", show = true }
-ctrl-z = { action = "suspend", show = true }
-esc = { action = "suspend", show = true }
+[keybindings.modal]
+tab = "focus_next"
+right = "focus_next"
+backtab = "focus_prev"
+left = "focus_prev"
+enter = "activate"
+space = "activate"
+
+[keybindings.members]
+j = "select_next"
+down = "select_next"
+k = "select_prev"
+up = "select_prev"
+d = "unshare"
+enter = "unshare"
+
+[keybindings.form]
+tab = "field_next"
+down = "field_next"
+backtab = "field_prev"
+up = "field_prev"
+enter = "submit"
+# Todo form's priority cycler (ignored — typed normally — in other forms/fields)
+space = "cycle_priority_next"
+right = "cycle_priority_next"
+l = "cycle_priority_next"
+left = "cycle_priority_prev"
+h = "cycle_priority_prev"

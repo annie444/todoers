@@ -1,0 +1,65 @@
+[package]
+name = "todoers-client"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[features]
+default = []
+tpm = []
+
+[dependencies]
+todoers-types = { path = "../todoers-types" }
+
+sqlx = { workspace = true, features = [
+  "derive",
+  "runtime-tokio",
+  "macros",
+  "migrate",
+  "regexp",
+  "time",
+  "sqlite",
+  "sqlx-toml",
+] }
+# Explicit dependency so the `bundled-sqlcipher` feature actually compiles
+# SQLCipher into the linked libsqlite3-sys; without this the `PRAGMA key` used in
+# `Db::new` is silently ignored and the database is written in cleartext.
+libsqlite3-sys = { workspace = true }
+thiserror = { workspace = true }
+reqwest = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+zeroize = { workspace = true }
+old_rand_core = { workspace = true }
+opaque-ke = { workspace = true }
+serde = { workspace = true }
+argon2 = { workspace = true }
+chacha20poly1305 = { workspace = true }
+dryoc = { workspace = true }
+ed25519-dalek = { workspace = true }
+sha2 = { workspace = true }
+x-wing = { workspace = true }
+loro = { workspace = true }
+hex = { workspace = true }
+serde_json = { workspace = true }
+tokio-tungstenite = { workspace = true }
+tokio = { workspace = true }
+x25519-dalek = { workspace = true }
+futures = { workspace = true }
+http = { workspace = true }
+time = { workspace = true }
+directories = { workspace = true }
+hybrid-array = { workspace = true }
+keyring-core = { workspace = true }
+hkdf = { workspace = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-native-keyring-store = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus-secret-service-keyring-store = { workspace = true }
+tss-esapi = { workspace = true }

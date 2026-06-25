@@ -202,9 +202,17 @@ impl Tui {
         Ok(())
     }
 
-    #[tracing::instrument(skip(self))]
     pub async fn next_event(&mut self) -> Option<Event> {
         self.event_rx.recv().await
+    }
+
+    /// Non-blocking sibling of [`next_event`](Self::next_event): return a
+    /// buffered event if one is ready, otherwise `None`. The event channel is
+    /// unbounded and the producer runs at a fixed 60 Hz render / 4 Hz tick, so
+    /// the UI loop uses this to *drain* a burst in one turn and coalesce the
+    /// redundant renders rather than processing (and drawing) each one.
+    pub fn try_next_event(&mut self) -> Option<Event> {
+        self.event_rx.try_recv().ok()
     }
 }
 

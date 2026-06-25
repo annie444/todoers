@@ -1,11 +1,11 @@
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
+use todoers_client::auth::UnlockedKeys;
+use todoers_client::model::{TodoItemInput, ViewTarget};
 use todoers_types::{ListId, Member, MemberId};
 
 use crate::app::Mode;
-use crate::auth::UnlockedKeys;
-use crate::model::{TodoItemInput, ViewTarget};
 
 /// What a [`Action::ConfirmDelete`] is about to delete.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

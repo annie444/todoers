@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            INSERT INTO documents (list_id, loro_snapshot)\n            VALUES (?, ?)\n            ON CONFLICT(list_id) DO UPDATE SET\n                loro_snapshot = excluded.loro_snapshot,\n                updated_at = unixepoch()\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "550e54fd29187d1c8b276fb66f61834e585fb24d58149440ec8fce82a647daad"
+}

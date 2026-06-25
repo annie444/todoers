@@ -19,15 +19,15 @@
 
 use std::time::Duration;
 
+use futures::StreamExt;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tracing::{error, warn};
 use uuid::Uuid;
 
-use futures::StreamExt;
+use todoers_client::db::Db;
+use todoers_client::net;
 use todoers_types::{AddMemberRequest, AppendUpdate, ListId, RemoveMemberRequest, UpdatePayload};
 
-use crate::db::Db;
-use crate::net;
 use crate::store_worker::{CommandTx, StoreCommand};
 
 /// How many updates to pull/push per round-trip.
@@ -104,10 +104,12 @@ async fn handle(
             Ok(())
         }
         SyncCommand::AddMember { list_id, body } => {
-            net::list::add_member(base, token, uuid(list_id), &body).await
+            net::list::add_member(base, token, uuid(list_id), &body).await?;
+            Ok(())
         }
         SyncCommand::RemoveMember { list_id, body } => {
-            net::list::remove_member(base, token, uuid(list_id), &body).await
+            net::list::remove_member(base, token, uuid(list_id), &body).await?;
+            Ok(())
         }
         SyncCommand::InitialSync => initial_sync(base, token, store_tx, self_tx).await,
         SyncCommand::Pull(list_id) => pull(base, token, db, store_tx, list_id).await,
@@ -141,7 +143,7 @@ async fn push(base: &str, token: &str, db: &Db, list_id: ListId) -> anyhow::Resu
                 Ok(_) => db.ack_outbound(row.local_id).await?,
                 Err(e) => {
                     db.release_outbound(row.local_id).await?;
-                    return Err(e);
+                    return Err(e.into());
                 }
             }
         }

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE lists SET current_epoch = ?, updated_at = unixepoch() WHERE list_id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "2dc5a9cf109f2c335c3c5adabc3a871adb0619b216c451dfbe65cfe31ad94752"
+}

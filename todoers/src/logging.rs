@@ -4,6 +4,8 @@ use tracing_appender::non_blocking::WorkerGuard;
 use tracing_error::ErrorLayer;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
+use todoers_client::get_data_dir;
+
 use crate::config;
 
 pub static LOG_ENV: LazyLock<String> =
@@ -19,7 +21,7 @@ pub static LOG_FILE: LazyLock<String> = LazyLock::new(|| format!("{}.log", env!(
 /// `console_subscriber` (tokio-console) is heavy and only attaches when
 /// `TODOERS_TOKIO_CONSOLE=1` is set.
 pub fn init() -> anyhow::Result<WorkerGuard> {
-    let directory = config::get_data_dir();
+    let directory = get_data_dir();
     std::fs::create_dir_all(directory.clone())?;
     let log_path = directory.join(LOG_FILE.clone());
     let log_file = std::fs::File::create(log_path)?;

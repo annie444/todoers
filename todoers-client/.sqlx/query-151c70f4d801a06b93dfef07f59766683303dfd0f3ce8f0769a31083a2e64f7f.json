@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            INSERT INTO outbound (list_id, epoch, payload, signature)\n            VALUES (?, ?, ?, ?)\n            ON CONFLICT(signature) DO NOTHING\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "151c70f4d801a06b93dfef07f59766683303dfd0f3ce8f0769a31083a2e64f7f"
+}

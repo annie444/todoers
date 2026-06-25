@@ -1,4 +1,4 @@
-use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{prelude::*, widgets::*};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -46,6 +46,13 @@ impl Button {
         self.focused = focused;
     }
 
+    /// The action this button emits when activated. The containing
+    /// [`Modal`](super::Modal) owns the (configurable) activation key and calls
+    /// this on the focused button, so the button no longer handles keys itself.
+    pub fn action(&self) -> Action {
+        self.action.clone()
+    }
+
     /// Whether a mouse position falls inside the button's last drawn area.
     #[tracing::instrument(skip(self))]
     fn hit(&self, column: u16, row: u16) -> bool {
@@ -66,17 +73,6 @@ impl Component for Button {
     fn register_config_handler(&mut self, config: Config) -> anyhow::Result<()> {
         self.config = config;
         Ok(())
-    }
-
-    #[tracing::instrument(skip(self))]
-    fn handle_key_event(&mut self, key: KeyEvent) -> anyhow::Result<Option<Action>> {
-        if !self.focused {
-            return Ok(None);
-        }
-        Ok(match key.code {
-            KeyCode::Enter | KeyCode::Char(' ') => Some(self.action.clone()),
-            _ => None,
-        })
     }
 
     #[tracing::instrument(skip(self))]
@@ -125,43 +121,13 @@ impl Component for Button {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyEventKind, KeyEventState, KeyModifiers};
+    use crossterm::event::KeyModifiers;
     use pretty_assertions::assert_eq;
 
-    fn key(code: KeyCode) -> KeyEvent {
-        KeyEvent {
-            code,
-            modifiers: KeyModifiers::NONE,
-            kind: KeyEventKind::Press,
-            state: KeyEventState::NONE,
-        }
-    }
-
     #[test]
-    fn focused_enter_emits_action() {
-        let mut b = Button::new("Close", Action::CloseModal);
-        b.set_focused(true);
-        assert_eq!(
-            b.handle_key_event(key(KeyCode::Enter)).unwrap(),
-            Some(Action::CloseModal)
-        );
-        assert_eq!(
-            b.handle_key_event(key(KeyCode::Char(' '))).unwrap(),
-            Some(Action::CloseModal)
-        );
-    }
-
-    #[test]
-    fn unfocused_button_ignores_keys() {
-        let mut b = Button::new("Close", Action::CloseModal);
-        assert_eq!(b.handle_key_event(key(KeyCode::Enter)).unwrap(), None);
-    }
-
-    #[test]
-    fn focused_button_ignores_unrelated_keys() {
-        let mut b = Button::new("Close", Action::CloseModal);
-        b.set_focused(true);
-        assert_eq!(b.handle_key_event(key(KeyCode::Char('x'))).unwrap(), None);
+    fn action_getter_returns_stored_action() {
+        let b = Button::new("Close", Action::CloseModal);
+        assert_eq!(b.action(), Action::CloseModal);
     }
 
     #[test]

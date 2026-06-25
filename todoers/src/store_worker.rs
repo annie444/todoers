@@ -5,9 +5,9 @@
 
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
-use todoers_types::{KeySlotDto, ListId, MetadataResponse, Member, MemberId, StoredUpdateDto};
+use todoers_client::model::{ListSummary, MetaList, SortMode, TodoItem, TodoItemInput, ViewTarget};
+use todoers_types::{KeySlotDto, ListId, Member, MemberId, MetadataResponse, StoredUpdateDto};
 
-use crate::model::{ListSummary, SortMode, TodoItem, TodoItemInput, ViewTarget};
 use crate::store::Store;
 
 /// What the UI asks the worker to do. Layout (split/ratio/focus/selection) stays
@@ -120,7 +120,7 @@ pub async fn run_store_worker(mut store: Store, mut cmd_rx: CommandRx, out: Work
                 StoreCommand::DeleteList(list_id) => {
                     store.delete_list(list_id).await?;
                     // Any pane showing the deleted list falls back to All Tasks.
-                    let fallback = ViewTarget::Meta(crate::model::MetaList::AllTasks);
+                    let fallback = ViewTarget::Meta(MetaList::AllTasks);
                     for t in targets.iter_mut() {
                         if *t == Some(ViewTarget::List(list_id)) {
                             *t = Some(fallback);
@@ -204,11 +204,11 @@ mod tests {
     use sqlx::{Pool, Sqlite};
     use tokio::sync::mpsc::unbounded_channel;
 
-    use crate::auth::UnlockedKeys;
-    use crate::crypto;
-    use crate::db::Db;
-    use crate::model::MetaList;
-    use crate::session::Session;
+    use todoers_client::auth::UnlockedKeys;
+    use todoers_client::crypto;
+    use todoers_client::db::Db;
+    use todoers_client::model::MetaList;
+    use todoers_client::session::Session;
 
     fn test_store(db: Pool<Sqlite>) -> Store {
         let db = Db::from_pool(db);
@@ -225,7 +225,7 @@ mod tests {
         Store::new(db, Session::new(&keys))
     }
 
-    #[sqlx::test(migrations = "db/migrations")]
+    #[sqlx::test(migrations = "../todoers-client/db/migrations")]
     async fn create_then_add_emits_snapshots(db: Pool<Sqlite>) {
         let store = test_store(db);
         let (cmd_tx, cmd_rx) = unbounded_channel();

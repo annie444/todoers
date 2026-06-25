@@ -1,10 +1,10 @@
-use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
+use crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::prelude::*;
 use ratatui::widgets::Paragraph;
 use tokio::sync::mpsc::UnboundedSender;
 use zeroize::Zeroizing;
 
-use super::{Captures, Component, TextInput};
+use super::{Captures, Component, FormAction, FormKeys, TextInput};
 use crate::action::Action;
 use crate::config::Config;
 use crate::tui::Event;
@@ -29,6 +29,7 @@ pub struct Register {
     /// True while a registration request is in flight.
     busy: bool,
     command_tx: Option<UnboundedSender<Action>>,
+    keys: FormKeys,
 }
 
 impl Captures for Register {
@@ -51,6 +52,7 @@ impl Register {
             error: None,
             busy: false,
             command_tx: None,
+            keys: FormKeys::default(),
         }
     }
 
@@ -133,6 +135,7 @@ impl Component for Register {
         for field in &mut self.fields {
             field.register_config_handler(config.clone())?;
         }
+        self.keys.configure(&config);
         Ok(())
     }
 
@@ -160,16 +163,16 @@ impl Component for Register {
 
     #[tracing::instrument(skip(self))]
     fn handle_key_event(&mut self, key: KeyEvent) -> anyhow::Result<Option<Action>> {
-        match key.code {
-            KeyCode::Tab | KeyCode::Down => {
+        match self.keys.classify(key) {
+            FormAction::Next => {
                 self.focus_next();
                 Ok(None)
             }
-            KeyCode::BackTab | KeyCode::Up => {
+            FormAction::Prev => {
                 self.focus_prev();
                 Ok(None)
             }
-            KeyCode::Enter => {
+            FormAction::Submit => {
                 if self.focused < CONFIRM {
                     self.focus_next();
                     Ok(None)
@@ -180,18 +183,9 @@ impl Component for Register {
                     Ok(Some(Action::FocusButtons))
                 }
             }
-            // In Vim mode, Esc while editing returns the field to Normal mode; let
-            // it consume the key instead of clearing the error / closing the modal.
-            KeyCode::Esc if self.fields[self.focused].consumes_escape() => {
-                self.fields[self.focused].handle_key_event(key)
-            }
-            KeyCode::Esc => {
-                self.error = None;
-                Ok(None)
-            }
-            // Everything else (chars, Backspace, Left/Right/Home/End, Delete) edits
-            // only the focused field.
-            _ => self.fields[self.focused].handle_key_event(key),
+            // Everything else (Esc to leave a Vim field, chars, Backspace,
+            // Left/Right/Home/End, Delete) edits only the focused field.
+            FormAction::PassToField => self.fields[self.focused].handle_key_event(key),
         }
     }
 
@@ -306,6 +300,7 @@ mod tests {
     #[test]
     fn typing_only_affects_focused_field() {
         let mut screen = Register::new();
+        screen.register_config_handler(Config::defaults()).unwrap();
         screen.update(Action::StartCapture).unwrap();
 
         typed(&mut screen, "alice");
@@ -327,6 +322,7 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut screen = Register::new();
         screen.register_action_handler(tx).unwrap();
+        screen.register_config_handler(Config::defaults()).unwrap();
         screen.update(Action::StartCapture).unwrap();
 
         typed(&mut screen, "alice");
@@ -360,6 +356,7 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut screen = Register::new();
         screen.register_action_handler(tx).unwrap();
+        screen.register_config_handler(Config::defaults()).unwrap();
         screen.update(Action::StartCapture).unwrap();
 
         typed(&mut screen, "alice");

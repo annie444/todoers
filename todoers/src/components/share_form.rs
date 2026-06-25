@@ -1,11 +1,11 @@
-use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
+use crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::prelude::*;
 use ratatui::widgets::Paragraph;
 use tokio::sync::mpsc::UnboundedSender;
 
 use todoers_types::ListId;
 
-use super::{Captures, Component, TextInput};
+use super::{Captures, Component, FormAction, FormKeys, TextInput};
 use crate::action::Action;
 use crate::config::Config;
 use crate::tui::Event;
@@ -18,6 +18,7 @@ pub struct ShareForm {
     field: TextInput,
     error: Option<String>,
     command_tx: Option<UnboundedSender<Action>>,
+    keys: FormKeys,
 }
 
 impl Captures for ShareForm {
@@ -33,6 +34,7 @@ impl ShareForm {
             field: TextInput::new().label("Username to share with"),
             error: None,
             command_tx: None,
+            keys: FormKeys::default(),
         }
     }
 
@@ -60,7 +62,9 @@ impl Component for ShareForm {
     }
 
     fn register_config_handler(&mut self, config: Config) -> anyhow::Result<()> {
-        self.field.register_config_handler(config)
+        self.field.register_config_handler(config.clone())?;
+        self.keys.configure(&config);
+        Ok(())
     }
 
     fn init(&mut self, area: Size) -> anyhow::Result<()> {
@@ -79,14 +83,12 @@ impl Component for ShareForm {
     }
 
     fn handle_key_event(&mut self, key: KeyEvent) -> anyhow::Result<Option<Action>> {
-        match key.code {
-            KeyCode::Enter => Ok(Some(Action::FocusButtons)),
-            KeyCode::Esc if self.field.consumes_escape() => self.field.handle_key_event(key),
-            KeyCode::Esc => {
-                self.error = None;
-                Ok(None)
-            }
-            _ => self.field.handle_key_event(key),
+        match self.keys.classify(key) {
+            // Single field: field movement is a no-op; submit hands focus to the
+            // modal's Submit button.
+            FormAction::Next | FormAction::Prev => Ok(None),
+            FormAction::Submit => Ok(Some(Action::FocusButtons)),
+            FormAction::PassToField => self.field.handle_key_event(key),
         }
     }
 

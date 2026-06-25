@@ -2,6 +2,11 @@ todoers-db := "todoers"
 todoers-db-user := "todoers"
 todoers-db-password := "todoers"
 
+# macOS code-signing identity. Sign local binaries with a *stable* identity so the
+# keychain trusts the app across rebuilds (no repeated "allow access" prompts).
+# One-time: create a self-signed "Code Signing" cert named below in Keychain Access.
+signing-identity := env_var_or_default("TODOERS_SIGN_ID", "Todoers Dev")
+
 [default]
 [private]
 default:
@@ -77,26 +82,61 @@ check-server: db-up setup-server
     (cd todoers-server && cargo sqlx prepare --check -- --all-targets)
 
 [group("TUI")]
-run-tui: setup-tui
+run-tui: setup-client setup-server (_sign "debug")
     just run-server >server.log 2>&1 &
-    cargo run -p todoers
+    ./target/debug/todoers
 
-[group("TUI")]
-setup-tui:
-    (cd todoers && cargo sqlx database setup --sqlite-create-db-wal=true)
+[group("Client")]
+build-client: setup-client
+    cargo build -p todoers
 
-[group("TUI")]
-prepare-tui: setup-tui
-    (cd todoers && cargo sqlx prepare --sqlite-create-db-wal=true -- --all-targets)
+# Run just the TUI client
+[group("Client")]
+run-client: setup-client
+    ./target/debug/todoers
 
-[group("TUI")]
-check-tui: setup-tui
-    (cd todoers && cargo sqlx prepare --check --sqlite-create-db-wal=true -- --all-targets)
+[group("Client")]
+setup-client:
+    (cd todoers-client && cargo sqlx database setup --sqlite-create-db-wal=true)
+
+[group("Client")]
+prepare-client: setup-client
+    (cd todoers-client && cargo sqlx prepare --sqlite-create-db-wal=true -- --all-targets)
+
+[group("Client")]
+check-client: setup-client
+    (cd todoers-client && cargo sqlx prepare --check --sqlite-create-db-wal=true -- --all-targets)
 
 [group("Workspace")]
 [parallel]
-prepare: prepare-server prepare-tui
+prepare: prepare-server prepare-client
 
 [group("Workspace")]
 [parallel]
-setup: setup-server setup-tui
+setup: setup-server setup-client
+
+[group("Signing")]
+[macos]
+[private]
+_sign bindir:
+    #!/usr/bin/env bash
+    set -Eeuo pipefail
+    bin="target/{{ bindir }}/todoers"
+    codesign --force --timestamp=none --sign "{{ signing-identity }}" "$bin"
+    codesign --verify --verbose "$bin"
+    echo "Signed $bin as \"{{ signing-identity }}\""
+
+# Build + sign the debug binary
+[group("Signing")]
+[macos]
+sign-dev: (_sign "debug")
+
+# Build + sign the release binary
+[group("Signing")]
+[macos]
+sign-release: (_sign "release")
+
+# Build + sign both binaries
+[group("Signing")]
+[macos]
+sign: sign-dev sign-release
