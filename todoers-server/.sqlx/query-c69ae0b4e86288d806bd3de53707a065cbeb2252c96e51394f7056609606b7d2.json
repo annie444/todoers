@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT epoch, covers_seq, nonce, ciphertext, signature\n            FROM snapshots\n            WHERE list_id = $1\n            ",
+  "query": "\n            SELECT\n                epoch,\n                covers_seq,\n                nonce AS \"nonce: Nonce\",\n                ciphertext,\n                signature AS \"signature: Signature\"\n            FROM snapshots\n            WHERE list_id = $1\n            ",
   "describe": {
     "columns": [
       {
@@ -27,7 +27,7 @@
       },
       {
         "ordinal": 2,
-        "name": "nonce",
+        "name": "nonce: Nonce",
         "type_info": "Bytea",
         "origin": {
           "Table": {
@@ -49,7 +49,7 @@
       },
       {
         "ordinal": 4,
-        "name": "signature",
+        "name": "signature: Signature",
         "type_info": "Bytea",
         "origin": {
           "Table": {
@@ -61,7 +61,7 @@
     ],
     "parameters": {
       "Left": [
-        "Uuid"
+        "Bytea"
       ]
     },
     "nullable": [
@@ -72,5 +72,5 @@
       false
     ]
   },
-  "hash": "8f98746ffbe278a0cb0b5169402c01f341950852c656c050601f41d1fb5bbad1"
+  "hash": "c69ae0b4e86288d806bd3de53707a065cbeb2252c96e51394f7056609606b7d2"
 }

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n                SELECT l.state, l.member_id\n                FROM login_cache l\n                WHERE l.login_id = $1 AND l.expires_at > $2\n                ",
+  "query": "\n                SELECT l.state, l.member_id AS \"member_id: MemberId\"\n                FROM login_cache l\n                WHERE l.login_id = $1 AND l.expires_at > $2\n                ",
   "describe": {
     "columns": [
       {
@@ -16,8 +16,8 @@
       },
       {
         "ordinal": 1,
-        "name": "member_id",
-        "type_info": "Uuid",
+        "name": "member_id: MemberId",
+        "type_info": "Bytea",
         "origin": {
           "Table": {
             "table": "login_cache",
@@ -37,5 +37,5 @@
       true
     ]
   },
-  "hash": "db43df245cce17d953b4c7626c48cb991c5342db6f2214bbfd5c45245426d9dd"
+  "hash": "2622495d94065e8aedd1f4d82899191cf39746a57d7c2aaf6d5747b95d942c4d"
 }

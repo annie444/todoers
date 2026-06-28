@@ -1,12 +1,12 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT member_id, opaque_record\n            FROM users\n            WHERE username = $1\n            ",
+  "query": "\n            SELECT\n                member_id AS \"member_id: MemberId\",\n                opaque_record\n            FROM users\n            WHERE username = $1\n            ",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "member_id",
-        "type_info": "Uuid",
+        "name": "member_id: MemberId",
+        "type_info": "Bytea",
         "origin": {
           "Table": {
             "table": "users",
@@ -36,5 +36,5 @@
       false
     ]
   },
-  "hash": "a3ed6f0d423bca9983d93d2f120a78223978ad2867682d74de7467b065604918"
+  "hash": "4a3a794bbabc3acfb80eb9e28c19b7760e1406e1c6a1ca497b5f869de30c6108"
 }

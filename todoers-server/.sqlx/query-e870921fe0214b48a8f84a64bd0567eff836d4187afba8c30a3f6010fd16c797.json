@@ -6,9 +6,9 @@
     "parameters": {
       "Left": [
         "Bytea",
-        "Uuid",
+        "Bytea",
         "Timestamptz",
-        "Uuid"
+        "Bytea"
       ]
     },
     "nullable": []

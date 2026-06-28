@@ -17,9 +17,9 @@
     ],
     "parameters": {
       "Left": [
-        "Uuid",
+        "Bytea",
         "Int8",
-        "Uuid",
+        "Bytea",
         "Bytea",
         "Bytea",
         "Bytea"

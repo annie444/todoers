@@ -1,12 +1,12 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT device_id, label, created_at, revoked_at\n            FROM trusted_device_keys\n            WHERE member_id = $1\n            ORDER BY created_at\n            ",
+  "query": "\n            SELECT\n                device_id AS \"device_id: DeviceId\",\n                label,\n                created_at,\n                revoked_at IS NOT NULL AS \"revoked!\"\n            FROM trusted_device_keys\n            WHERE member_id = $1\n            ORDER BY created_at\n            ",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "device_id",
-        "type_info": "Uuid",
+        "name": "device_id: DeviceId",
+        "type_info": "Bytea",
         "origin": {
           "Table": {
             "table": "trusted_device_keys",
@@ -38,27 +38,22 @@
       },
       {
         "ordinal": 3,
-        "name": "revoked_at",
-        "type_info": "Timestamptz",
-        "origin": {
-          "Table": {
-            "table": "trusted_device_keys",
-            "name": "revoked_at"
-          }
-        }
+        "name": "revoked!",
+        "type_info": "Bool",
+        "origin": "Expression"
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid"
+        "Bytea"
       ]
     },
     "nullable": [
       false,
       false,
       false,
-      true
+      null
     ]
   },
-  "hash": "55226c0b25437d71fd9e049f495badd95b47aecd3df6b903ecdc25a766cf500d"
+  "hash": "6e596f2ca0d2a24da79bf060f37d848fc375cfcf41699dcb87b0807b49f91349"
 }

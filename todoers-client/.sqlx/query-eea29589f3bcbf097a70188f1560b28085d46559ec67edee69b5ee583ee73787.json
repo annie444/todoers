@@ -1,10 +1,10 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT member_id as 'id!', identity_pub, signing_pub, role FROM list_members WHERE list_id = ?",
+  "query": "\n            SELECT\n                member_id AS \"id: MemberId\",\n                identity_pub AS \"identity_pub: X25519Pub\",\n                signing_pub AS \"signing_pub: Ed25519Pub\",\n                role AS \"role: Role\"\n            FROM list_members\n            WHERE list_id = ?",
   "describe": {
     "columns": [
       {
-        "name": "id!",
+        "name": "id: MemberId",
         "ordinal": 0,
         "type_info": "Blob",
         "origin": {
@@ -15,7 +15,7 @@
         }
       },
       {
-        "name": "identity_pub",
+        "name": "identity_pub: X25519Pub",
         "ordinal": 1,
         "type_info": "Blob",
         "origin": {
@@ -26,7 +26,7 @@
         }
       },
       {
-        "name": "signing_pub",
+        "name": "signing_pub: Ed25519Pub",
         "ordinal": 2,
         "type_info": "Blob",
         "origin": {
@@ -37,7 +37,7 @@
         }
       },
       {
-        "name": "role",
+        "name": "role: Role",
         "ordinal": 3,
         "type_info": "Text",
         "origin": {
@@ -58,5 +58,5 @@
       false
     ]
   },
-  "hash": "11405fe45add5655d409575ef4683391d17e858cf8aca48aa16554daf0157ada"
+  "hash": "eea29589f3bcbf097a70188f1560b28085d46559ec67edee69b5ee583ee73787"
 }

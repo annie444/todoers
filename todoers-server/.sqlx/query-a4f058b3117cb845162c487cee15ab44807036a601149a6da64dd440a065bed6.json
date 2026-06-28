@@ -5,8 +5,8 @@
     "columns": [],
     "parameters": {
       "Left": [
-        "Uuid",
-        "Uuid",
+        "Bytea",
+        "Bytea",
         {
           "Custom": {
             "name": "member_role",

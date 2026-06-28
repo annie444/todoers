@@ -1,10 +1,10 @@
 {
   "db_name": "SQLite",
-  "query": "\n            SELECT list_id, local_id, payload FROM outbound\n            WHERE list_id = ? AND status = 'pending'\n            ORDER BY local_id\n            LIMIT ?\n            ",
+  "query": "\n            SELECT\n                list_id AS \"list_id: ListId\",\n                local_id,\n                payload FROM outbound\n            WHERE list_id = ? AND status = 'pending'\n            ORDER BY local_id\n            LIMIT ?\n            ",
   "describe": {
     "columns": [
       {
-        "name": "list_id",
+        "name": "list_id: ListId",
         "ordinal": 0,
         "type_info": "Blob",
         "origin": {
@@ -46,5 +46,5 @@
       false
     ]
   },
-  "hash": "34d549f7735aeaa18eb7486613d34b0492985abdcbbb6ceff7373b7eeaa565a2"
+  "hash": "26c42429e1ca17a40e4ea75045b3801cf38e7b01828710c197ba3931388bc418"
 }

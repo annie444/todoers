@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "INSERT INTO lists (list_id, current_epoch) VALUES ($1, 1)",
+  "query": "DELETE FROM lists WHERE list_id = $1",
   "describe": {
     "columns": [],
     "parameters": {
@@ -10,5 +10,5 @@
     },
     "nullable": []
   },
-  "hash": "edbd4c23de02d7b113ac5a21f269705991d5aeb22a9be171231979242bceebcc"
+  "hash": "366325082fc679d12b0b5b268d96a56bb8040ebe721ba495ed9e32041af86336"
 }

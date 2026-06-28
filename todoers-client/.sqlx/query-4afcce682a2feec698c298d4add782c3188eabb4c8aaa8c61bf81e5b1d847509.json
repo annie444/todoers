@@ -1,10 +1,10 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT list_id, role, current_epoch, name_plaintext AS name FROM lists ORDER BY name_plaintext",
+  "query": "\n            SELECT\n                list_id AS \"list_id: ListId\",\n                role,\n                current_epoch,\n                name_plaintext AS name\n            FROM lists\n            ORDER BY name_plaintext\n            ",
   "describe": {
     "columns": [
       {
-        "name": "list_id",
+        "name": "list_id: ListId",
         "ordinal": 0,
         "type_info": "Blob",
         "origin": {
@@ -58,5 +58,5 @@
       true
     ]
   },
-  "hash": "e81154a70dbbe1c57b218458f40d59a2111a658d454eaff8c47c0d7df1b93fb7"
+  "hash": "4afcce682a2feec698c298d4add782c3188eabb4c8aaa8c61bf81e5b1d847509"
 }

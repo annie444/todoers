@@ -1,10 +1,10 @@
 {
   "db_name": "SQLite",
-  "query": "\n            SELECT member_id, username, identity_pub, signing_pub,\n                wrapped_secret_keys, kdf_salt, kdf_mem_kib, kdf_iters, kdf_parallelism\n            FROM account WHERE id = 1\n            ",
+  "query": "\n            SELECT\n                member_id AS \"member_id: MemberId\",\n                username,\n                identity_pub AS \"identity_pub: X25519Pub\",\n                signing_pub AS \"signing_pub: Ed25519Pub\",\n                wrapped_secret_keys,\n                kdf_salt AS \"kdf_salt: KdfSalt\",\n                kdf_mem_kib,\n                kdf_iters,\n                kdf_parallelism\n            FROM account WHERE id = 1\n            ",
   "describe": {
     "columns": [
       {
-        "name": "member_id",
+        "name": "member_id: MemberId",
         "ordinal": 0,
         "type_info": "Blob",
         "origin": {
@@ -26,7 +26,7 @@
         }
       },
       {
-        "name": "identity_pub",
+        "name": "identity_pub: X25519Pub",
         "ordinal": 2,
         "type_info": "Blob",
         "origin": {
@@ -37,7 +37,7 @@
         }
       },
       {
-        "name": "signing_pub",
+        "name": "signing_pub: Ed25519Pub",
         "ordinal": 3,
         "type_info": "Blob",
         "origin": {
@@ -59,7 +59,7 @@
         }
       },
       {
-        "name": "kdf_salt",
+        "name": "kdf_salt: KdfSalt",
         "ordinal": 5,
         "type_info": "Blob",
         "origin": {
@@ -118,5 +118,5 @@
       false
     ]
   },
-  "hash": "ab811acf3dbab6521b3587e875f1781a1e50496fb2a78fad7f6cd33c7542b3a3"
+  "hash": "585c260e6b8bfdc24b338abe18126313548c1886fea9d8ebae23f0d902613b6a"
 }

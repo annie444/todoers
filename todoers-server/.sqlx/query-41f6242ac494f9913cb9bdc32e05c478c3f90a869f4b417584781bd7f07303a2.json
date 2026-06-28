@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT seq, epoch, author, nonce, ciphertext, signature\n            FROM updates\n            WHERE list_id = $1 AND seq > $2\n            ORDER BY seq\n            LIMIT $3\n            ",
+  "query": "\n            SELECT\n                seq,\n                epoch,\n                author AS \"author: MemberId\",\n                nonce AS \"nonce: Nonce\",\n                ciphertext,\n                signature AS \"signature: Signature\"\n            FROM updates\n            WHERE list_id = $1 AND seq > $2\n            ORDER BY seq\n            LIMIT $3\n            ",
   "describe": {
     "columns": [
       {
@@ -27,8 +27,8 @@
       },
       {
         "ordinal": 2,
-        "name": "author",
-        "type_info": "Uuid",
+        "name": "author: MemberId",
+        "type_info": "Bytea",
         "origin": {
           "Table": {
             "table": "updates",
@@ -38,7 +38,7 @@
       },
       {
         "ordinal": 3,
-        "name": "nonce",
+        "name": "nonce: Nonce",
         "type_info": "Bytea",
         "origin": {
           "Table": {
@@ -60,7 +60,7 @@
       },
       {
         "ordinal": 5,
-        "name": "signature",
+        "name": "signature: Signature",
         "type_info": "Bytea",
         "origin": {
           "Table": {
@@ -72,7 +72,7 @@
     ],
     "parameters": {
       "Left": [
-        "Uuid",
+        "Bytea",
         "Int8",
         "Int8"
       ]
@@ -86,5 +86,5 @@
       false
     ]
   },
-  "hash": "3ed4af0f5de16c5cb1995ef9808d78b00d0e4687b98640488867539b0e9083ce"
+  "hash": "41f6242ac494f9913cb9bdc32e05c478c3f90a869f4b417584781bd7f07303a2"
 }

@@ -17,8 +17,8 @@
     ],
     "parameters": {
       "Left": [
-        "Uuid",
-        "Uuid"
+        "Bytea",
+        "Bytea"
       ]
     },
     "nullable": [
