@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use sqlx::sqlite::{
-    SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode, SqliteLockingMode, SqliteSynchronous,
+    SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode, SqliteLockingMode,
+    SqlitePoolOptions, SqliteSynchronous,
 };
 use sqlx::{Pool, Row, Sqlite};
 use time::OffsetDateTime;
@@ -103,10 +105,16 @@ impl Db {
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
             .locking_mode(SqliteLockingMode::Normal)
+            .busy_timeout(Duration::from_secs(5))
             .filename(data_dir.as_ref().join("todoers.db"));
 
         Ok(Self {
-            pool: Arc::new(Pool::connect_with(opts).await?),
+            pool: Arc::new(
+                SqlitePoolOptions::new()
+                    .max_connections(1)
+                    .connect_with(opts)
+                    .await?,
+            ),
         })
     }
 
@@ -557,6 +565,9 @@ impl Db {
 
     // ── key slots (cached wrapped DEKs) ────────────────────────────────────────
 
+    /// Save a list's wrapped DEK for a given epoch. If the row already exists, update
+    /// it (e.g. after a membership rotation). The `wrapped_dek` is the class-1 sealed
+    /// data from the server, which is rehydrated into the in-memory DEK map at unlock.
     #[tracing::instrument(skip(self, wrapped_dek))]
     pub async fn save_key_slot(
         &self,

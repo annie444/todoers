@@ -1,4 +1,6 @@
-//! The sync engine: the one task that talks to the server over time.
+//! # Sync engine
+//!
+//! > The one task that talks to the server over time.
 //!
 //! It is deliberately key-free. The store actor ([`crate::store_worker`]) owns
 //! the DEKs and Loro docs and does every crypto step; this task only moves
@@ -7,7 +9,7 @@
 //! (so UI-driven edits never wait on a socket) and keeps secret material out of
 //! the component that holds a bearer token.
 //!
-//! Flow:
+//! ## Flow:
 //! - **Push** drains the local `outbound` queue (pre-signed envelopes) to the
 //!   append endpoint, acking each row the server accepts.
 //! - **Pull** walks the server log after our cursor and forwards batches to the
@@ -17,22 +19,25 @@
 //! - **Control-plane** (create list, add/remove member) ships request bodies the
 //!   store pre-built with sealed DEKs.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
-use tracing::{error, warn};
+use tracing::{debug, error, info, warn};
 
-use crate::net::{Net, ws};
-use crate::{db::Db, error::TodoersResult};
 use todoers_types::{AddMemberRequest, AppendUpdate, ListId, RemoveMemberRequest, UpdatePayload};
 
+use crate::db::Db;
+use crate::error::TodoersResult;
+use crate::net::{Net, ws};
 use crate::worker::{CommandTx, StoreCommand};
 
 /// How many updates to pull/push per round-trip.
 const BATCH: i64 = 500;
 
 /// What the UI / store asks the sync engine to do.
+#[derive(Debug)]
 pub enum SyncCommand {
     /// Local edits for this list were enqueued — drain & upload them.
     Push(ListId),
@@ -67,17 +72,18 @@ pub type SyncRx = UnboundedReceiver<SyncCommand>;
 pub struct SyncEngine {
     net: Net,
     token: String,
-    db: Db,
+    db: Arc<Db>,
     store_tx: CommandTx,
     tx: SyncTx,
     rx: SyncRx,
 }
 
 impl SyncEngine {
+    #[tracing::instrument(skip(token, db, store_tx, tx, rx))]
     pub fn new(
-        base_url: impl Into<String>,
+        base_url: impl Into<String> + std::fmt::Debug,
         token: impl Into<String>,
-        db: Db,
+        db: Arc<Db>,
         store_tx: CommandTx,
         tx: SyncTx,
         rx: SyncRx,
@@ -96,7 +102,9 @@ impl SyncEngine {
 
     /// Run the sync engine until its command channel closes. `self_tx` lets a
     /// command enqueue follow-ups (e.g. InitialSync → Pull/Subscribe per list).
+    #[tracing::instrument(skip(self))]
     pub async fn run_sync(&mut self) -> TodoersResult<()> {
+        info!("Sync engine started");
         // Kick discovery ourselves so the UI layer never speaks SyncCommand.
         // `initial_sync` enqueues Pull/Subscribe via `self.tx`; the loop drains them.
         if let Err(e) = self.handle(SyncCommand::InitialSync).await {
@@ -109,7 +117,10 @@ impl SyncEngine {
         }
         Ok(())
     }
+
+    #[tracing::instrument(skip(self))]
     async fn handle(&self, cmd: SyncCommand) -> TodoersResult<()> {
+        debug!(?cmd, "handling sync command");
         match cmd {
             SyncCommand::Push(list_id) => self.push(list_id).await,
             SyncCommand::CreateList {
@@ -147,6 +158,7 @@ impl SyncEngine {
     /// Drain the outbound queue for a list, uploading each pre-signed envelope. A
     /// row the server accepts is acked (deleted); a failed upload is released back
     /// to `pending` and the drain stops (the next Push retries).
+    #[tracing::instrument(skip(self))]
     async fn push(&self, list_id: ListId) -> TodoersResult<()> {
         loop {
             let rows = self.db.take_outbound(&list_id, BATCH).await?;
@@ -154,7 +166,7 @@ impl SyncEngine {
                 return Ok(());
             }
             for row in rows {
-                let payload: UpdatePayload = serde_json::from_slice(&row.payload)?;
+                let payload: UpdatePayload = postcard::from_bytes(&row.payload)?;
                 let body = AppendUpdate {
                     list_id,
                     version: payload.version,
@@ -177,6 +189,7 @@ impl SyncEngine {
 
     /// Pull updates with `seq > cursor` in pages and forward each page to the store,
     /// which decrypts/merges and advances the persistent cursor.
+    #[tracing::instrument(skip(self))]
     async fn pull(&self, list_id: ListId) -> TodoersResult<()> {
         let mut cursor = self.db.applied_through_seq(&list_id).await?;
         loop {
@@ -202,6 +215,7 @@ impl SyncEngine {
 
     /// Discover every list we belong to and bring each up to date: seed its members
     /// + key slots (so the store can decrypt), pull the log, then go live.
+    #[tracing::instrument(skip(self))]
     async fn initial_sync(&self) -> TodoersResult<()> {
         let ids = self.net.fetch_lists(&self.token).await?;
         for id in ids {
@@ -220,6 +234,7 @@ impl SyncEngine {
     /// Hold a live subscription on its own task. Each frame is forwarded to the
     /// store as a one-element batch; when the socket closes (e.g. server-side lag),
     /// fall back to a pull and reconnect after a short delay.
+    #[tracing::instrument(skip(self))]
     fn subscribe(&self, list_id: ListId) {
         let base = self.net.base_url.clone();
         let token = self.token.clone();

@@ -49,10 +49,19 @@ impl Session {
     #[tracing::instrument(skip(self, db))]
     pub async fn rehydrate(&mut self, db: &Db) -> TodoersResult<()> {
         for slot in db.load_key_slots().await? {
-            if let Ok(dek) =
-                crypto::open_sealed(&slot.wrapped_dek, &self.identity_pub, &self.identity_secret)
+            match crypto::open_sealed(&slot.wrapped_dek, &self.identity_pub, &self.identity_secret)
             {
-                self.deks.insert((slot.list_id, slot.epoch), dek);
+                Ok(dek) => {
+                    self.deks.insert((slot.list_id, slot.epoch), dek);
+                }
+                // A slot that won't unseal means the current identity key can't open
+                // a DEK it should (e.g. a stale slot sealed to a now-defunct key, or a
+                // retired epoch). Skipping it silently surfaces later as the opaque
+                // "no DEK for current epoch"; log it so the cause is diagnosable.
+                Err(e) => tracing::warn!(
+                    list_id = ?slot.list_id, epoch = ?slot.epoch, error = ?e,
+                    "rehydrate: key slot failed to unseal; DEK skipped"
+                ),
             }
         }
         Ok(())

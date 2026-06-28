@@ -4,13 +4,12 @@
 //! `ViewSnapshot`s of plain `Send` data it installs into the view-model.
 
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tracing::info;
 
-use crate::{
-    error::TodoersResult,
-    model::{ListSummary, MetaList, SortMode, TodoItem, TodoItemInput, ViewTarget},
-};
 use todoers_types::{KeySlotDto, ListId, Member, MemberId, MetadataResponse, StoredUpdateDto};
 
+use crate::error::TodoersResult;
+use crate::model::{ListSummary, MetaList, SortMode, TodoItem, TodoItemInput, ViewTarget};
 use crate::store::Store;
 
 /// What the UI asks the worker to do. Layout (split/ratio/focus/selection) stays
@@ -99,6 +98,8 @@ pub type WorkerRx = UnboundedReceiver<WorkerMsg>;
 pub async fn run_store_worker(mut store: Store, mut cmd_rx: CommandRx, out: WorkerTx) {
     let mut targets: Vec<Option<ViewTarget>> = vec![None];
     let mut sort = SortMode::default();
+
+    info!("store worker started");
 
     while let Some(cmd) = cmd_rx.recv().await {
         // Returns true if the command changed list/todo state (snapshot needed).
@@ -204,6 +205,8 @@ pub async fn run_store_worker(mut store: Store, mut cmd_rx: CommandRx, out: Work
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
     use sqlx::{Pool, Sqlite};
     use tokio::sync::mpsc::unbounded_channel;
 
@@ -225,7 +228,7 @@ mod tests {
             signing_pub,
             token: String::new(),
         };
-        Store::new(db, Session::new(&keys))
+        Store::new(Arc::new(db), Session::new(&keys))
     }
 
     #[sqlx::test(migrations = "../todoers-client/db/migrations")]

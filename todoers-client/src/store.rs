@@ -1,4 +1,6 @@
-//! The store facade: the single API the UI calls for list/todo operations.
+//! # The store facade
+//!
+//! > The single API the UI calls for list/todo operations.
 //!
 //! It ties together local persistence ([`crate::db`]), the CRDT documents
 //! ([`crate::list_doc`]), the in-memory keys/DEKs ([`crate::session::Session`]),
@@ -13,10 +15,16 @@
 //! they render data and emit intent, never touching crypto or the wire format.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use loro::VersionVector;
 use old_rand_core::OsRng;
 use time::OffsetDateTime;
+use tracing::{debug, error};
+
+use todoers_types::{
+    Dek, Epoch, KeySlotDto, ListId, Member, MemberId, MetadataResponse, Role, StoredUpdateDto,
+};
 
 use crate::crypto;
 use crate::db::Db;
@@ -26,11 +34,8 @@ use crate::model::{
     ListSummary, MetaList, Priority, SortMode, TodoItem, TodoItemInput, ViewTarget,
 };
 use crate::session::Session;
-use crate::sync::SyncTx;
+use crate::sync::{SyncCommand, SyncTx};
 use crate::worker::ViewSnapshot;
-use todoers_types::{
-    Dek, Epoch, KeySlotDto, ListId, Member, MemberId, MetadataResponse, Role, StoredUpdateDto,
-};
 
 /// Signed/AEAD byte-layout version for produced updates. Must match the
 /// `signing_view`/`aead_aad` version on both ends (see [`todoers_client::crypto`]).
@@ -38,7 +43,7 @@ const UPDATE_VERSION: u8 = 1;
 
 /// Owns the session and a cache of open CRDT documents.
 pub struct Store {
-    db: Db,
+    db: Arc<Db>,
     session: Session,
     /// Open documents, keyed by list. Kept across edits so version vectors stay
     /// continuous and we avoid re-importing the snapshot every mutation.
@@ -50,7 +55,8 @@ pub struct Store {
 }
 
 impl Store {
-    pub fn new(db: Db, session: Session) -> Self {
+    #[tracing::instrument(skip(db, session))]
+    pub fn new(db: Arc<Db>, session: Session) -> Self {
         Self {
             db,
             session,
@@ -61,14 +67,19 @@ impl Store {
 
     /// Attach the sync engine so mutations are pushed to the server. Call once,
     /// right after the sync task is spawned.
+    #[tracing::instrument(skip(self, tx))]
     pub fn set_sync_tx(&mut self, tx: SyncTx) {
         self.sync_tx = Some(tx);
     }
 
     /// Emit a sync command (no-op when offline / unwired).
-    fn sync(&self, cmd: crate::sync::SyncCommand) {
+    #[tracing::instrument(skip(self, cmd))]
+    fn sync(&self, cmd: SyncCommand) {
         if let Some(tx) = &self.sync_tx {
+            debug!(?cmd, "sync command sent");
             let _ = tx.send(cmd);
+        } else {
+            error!(?cmd, "no sync_tx; command dropped");
         }
     }
 
@@ -93,15 +104,15 @@ impl Store {
             .await?;
 
         // Our own wrapped DEK (the only key slot the client persists locally).
-        let wrapped = crypto::seal_to(&dek, &self.session.identity_pub());
-        self.db.save_key_slot(&list_id, epoch, &wrapped).await?;
+        let wrapped_dek = crypto::seal_to(&dek, &self.session.identity_pub());
+        self.db.save_key_slot(&list_id, epoch, &wrapped_dek).await?;
         self.session.insert_dek(list_id, epoch, dek);
 
         // Create the list server-side under our client-minted id (local-first:
         // the row already exists locally even if this upload is deferred).
-        self.sync(crate::sync::SyncCommand::CreateList {
+        self.sync(SyncCommand::CreateList {
             list_id,
-            wrapped_dek: wrapped,
+            wrapped_dek,
         });
 
         self.db
@@ -136,6 +147,7 @@ impl Store {
     pub async fn delete_list(&mut self, list_id: &ListId) -> TodoersResult<()> {
         self.db.delete_list(list_id).await?;
         self.docs.remove(list_id);
+        self.sync(SyncCommand::DeleteList(*list_id));
         Ok(())
     }
 
@@ -380,7 +392,7 @@ impl Store {
         let wrapped = crypto::seal_to(&dek, &member.identity_pub);
 
         self.db.add_member_row(list_id, &member).await?;
-        self.sync(crate::sync::SyncCommand::AddMember {
+        self.sync(SyncCommand::AddMember {
             list_id: *list_id,
             body: Box::new(todoers_types::AddMemberRequest {
                 list_id: *list_id,
@@ -437,7 +449,7 @@ impl Store {
         self.db.set_epoch(list_id, new_epoch).await?;
         self.db.remove_member_row(list_id, &member_id).await?;
 
-        self.sync(crate::sync::SyncCommand::RemoveMember {
+        self.sync(SyncCommand::RemoveMember {
             list_id: *list_id,
             body: Box::new(todoers_types::RemoveMemberRequest {
                 list_id: *list_id,
@@ -583,6 +595,7 @@ impl Store {
     }
 
     /// Run a closure that mutates the document, then run the persist pipeline.
+    #[tracing::instrument(skip(self, f))]
     async fn edit_doc<R, E>(
         &mut self,
         list_id: &ListId,
@@ -602,6 +615,7 @@ impl Store {
 
     /// Encrypt+sign the delta since `vv_before`, enqueue it, then persist the
     /// snapshot and rebuild the read model.
+    #[tracing::instrument(skip(self, doc, vv_before))]
     async fn persist(
         &self,
         list_id: &ListId,
@@ -629,12 +643,12 @@ impl Store {
                 &self.session.signing_key(),
                 &update,
             )?;
-            let bytes = serde_json::to_vec(&payload)?;
+            let bytes = postcard::to_stdvec(&payload)?;
             self.db
                 .enqueue_outbound(list_id, epoch, &bytes, &payload.signature)
                 .await?;
             // Nudge the sync engine to drain the queue for this list.
-            self.sync(crate::sync::SyncCommand::Push(*list_id));
+            self.sync(SyncCommand::Push(*list_id));
         }
 
         let snap = doc.export_snapshot()?;
@@ -701,7 +715,7 @@ mod tests {
             signing_pub,
             token: String::new(),
         };
-        Store::new(db, Session::new(&keys))
+        Store::new(Arc::new(db), Session::new(&keys))
     }
 
     fn input(title: &str) -> TodoItemInput {
@@ -924,7 +938,7 @@ mod tests {
         // Apply each relayed update in seq order; B should reconstruct the item.
         for (i, row) in rows.iter().enumerate() {
             let payload: todoers_types::UpdatePayload =
-                serde_json::from_slice(&row.payload).unwrap();
+                postcard::from_bytes(&row.payload).unwrap();
             let dto = todoers_types::StoredUpdateDto {
                 seq: (i + 1) as i64,
                 epoch: payload.epoch,
@@ -971,7 +985,7 @@ mod tests {
         // Tamper with the signature: the blind relay can corrupt bytes, and a
         // forged update must be rejected (skipped), never merged or fatal.
         let payload: todoers_types::UpdatePayload =
-            serde_json::from_slice(&rows[0].payload).unwrap();
+            postcard::from_bytes(&rows[0].payload).unwrap();
         let mut bad_sig = payload.signature.to_vec();
         bad_sig[0] ^= 0xff;
         let bad_sig = bad_sig.try_into().unwrap();

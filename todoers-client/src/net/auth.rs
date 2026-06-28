@@ -142,10 +142,12 @@ impl Net {
             }
         };
 
-        match tokio::task::spawn_blocking(move || auth::unlock_from_escrow(&export_key, finish_resp))
-            .await
-            .map_err(TodoersError::from)
-            .and_then(|r| r)
+        match tokio::task::spawn_blocking(move || {
+            auth::unlock_from_escrow(&export_key, finish_resp)
+        })
+        .await
+        .map_err(TodoersError::from)
+        .and_then(|r| r)
         {
             Ok(keys) => Ok(keys),
             Err(e) => {

@@ -8,7 +8,7 @@ use todoers_types::{
 };
 
 use super::{Net, decode, unit};
-use crate::error::{TodoersError, TodoersResult};
+use crate::error::TodoersResult;
 
 impl Net {
     /// Create a server-side list seated to the caller under the client-minted
@@ -21,10 +21,12 @@ impl Net {
         id: &ListId,
         wrapped_dek: &[u8],
     ) -> TodoersResult<ListId> {
-        let dek: [u8; 32] = wrapped_dek.try_into().map_err(|_| TodoersError::Aead)?;
+        // `wrapped_dek` is a sealed box (`crypto::seal_to`), ~80 bytes — NOT a raw
+        // 32-byte DEK. Send it verbatim; the server stores it opaquely as our epoch-1
+        // key slot and echoes it back via `get_my_keys`.
         let req = CreateListRequest {
             list_id: *id,
-            wrapped_dek: dek.to_vec(),
+            wrapped_dek: wrapped_dek.to_vec(),
         };
         decode(
             self.req(Method::POST, "lists", Some(token))

@@ -684,7 +684,7 @@ impl Db {
             let row = sqlx::query_as!(
                 LoginDto,
                 r#"
-                SELECT l.state, l.member_id AS "member_id: Option<MemberId>"
+                SELECT l.state, l.member_id AS "member_id: MemberId"
                 FROM login_cache l
                 WHERE l.login_id = $1 AND l.expires_at > $2
                 "#,

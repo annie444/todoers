@@ -23,6 +23,3 @@ pub async fn get_user_pubkeys(
         .ok_or(AppError::NotFound)?;
     Ok(Bytes::from(postcard::to_stdvec(&pubkeys)?))
 }
-
-
-
