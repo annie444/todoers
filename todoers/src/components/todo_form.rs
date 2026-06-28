@@ -354,16 +354,15 @@ impl Component for TodoForm {
 
     fn placement(&self) -> Constraint {
         // 3 text fields (3 rows each) + calendar block + priority list + status.
-        Constraint::Length(3 * 3 + CAL_HEIGHT + PRIO_HEIGHT + 1)
+        Constraint::Length(3 * 3 + CAL_HEIGHT + 1)
     }
 
     fn draw(&mut self, frame: &mut Frame, area: Rect) -> anyhow::Result<()> {
-        let [title, notes, tags, due, prio, status] = Layout::vertical([
+        let [title, notes, tags, due_prio, status] = Layout::vertical([
             self.fields[TITLE].placement(),
             self.fields[NOTES].placement(),
             self.fields[TAGS].placement(),
-            Constraint::Length(CAL_HEIGHT),
-            Constraint::Length(PRIO_HEIGHT),
+            Constraint::Length(CAL_HEIGHT.max(PRIO_HEIGHT)),
             Constraint::Length(1),
         ])
         .areas(area);
@@ -411,12 +410,14 @@ impl Component for TodoForm {
                     .title(due_title)
                     .border_style(Style::default().fg(due_border)),
             );
-        let [_, due, _] = Layout::horizontal([
-            Constraint::Fill(1),
-            Constraint::Length(calendar.width()),
-            Constraint::Fill(1),
+        let [_, due, _, prio, _] = Layout::horizontal([
+            Constraint::Fill(3),
+            Constraint::Length(calendar.width().saturating_add(2)),
+            Constraint::Fill(2),
+            Constraint::Length(calendar.width().saturating_add(2)),
+            Constraint::Fill(3),
         ])
-        .areas(due);
+        .areas(due_prio);
         frame.render_widget(calendar, due);
 
         // Priority list; the highlighted row is the chosen priority.

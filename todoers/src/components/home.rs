@@ -48,7 +48,7 @@ const LIST_ICON_BASIC: char = 'L';
 
 /// Which panel currently has keyboard focus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum Focus {
+pub enum Focus {
     #[default]
     Sidebar,
     Pane,
@@ -75,6 +75,11 @@ pub struct Home {
     /// Compiled `[keybindings.home]` map + the multi-key sequence buffer.
     keymap: IndexMap<Vec<KeyEvent>, HomeCmd>,
     pending: Vec<KeyEvent>,
+    /// Footer hint lines, derived from the live bindings. Rebuilt only when the
+    /// keymap changes (`register_config_handler`) so `draw` never reformats them
+    /// per frame — it just borrows the cached strings.
+    layout_hint: String,
+    command_hint: String,
 }
 
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,6 +130,8 @@ impl Home {
             pane_sel: [0, 0],
             keymap: IndexMap::new(),
             pending: Vec::new(),
+            layout_hint: String::new(),
+            command_hint: String::new(),
         }
     }
 
@@ -388,19 +395,18 @@ impl Home {
         format!(" {} ", parts.join(" "))
     }
 
-    /// Pane-layout hint shown on the sidebar (split/stack/cycle/close).
-    fn layout_hint(&self) -> String {
-        self.hint(&[
+    /// Rebuild the cached footer hints from the current bindings. Called whenever
+    /// the keymap changes (`register_config_handler`); `draw` only reads the cache.
+    /// `layout_hint` is the sidebar's split/stack/cycle/close line; `command_hint`
+    /// is the todo pane's command line.
+    fn rebuild_hints(&mut self) {
+        self.layout_hint = self.hint(&[
             (HomeCmd::SplitHorizontal, "split"),
             (HomeCmd::SplitVertical, "stack"),
             (HomeCmd::CyclePane, "pane"),
             (HomeCmd::ClosePane, "close"),
-        ])
-    }
-
-    /// Command hint shown on a todo pane.
-    fn command_hint(&self) -> String {
-        self.hint(&[
+        ]);
+        self.command_hint = self.hint(&[
             (HomeCmd::NewList, "new"),
             (HomeCmd::AddTodo, "add"),
             (HomeCmd::EditTodo, "edit"),
@@ -409,7 +415,7 @@ impl Home {
             (HomeCmd::CycleSort, "sort"),
             (HomeCmd::Share, "share"),
             (HomeCmd::Members, "members"),
-        ])
+        ]);
     }
 
     fn draw_sidebar(&self, frame: &mut Frame, area: Rect) {
@@ -436,7 +442,7 @@ impl Home {
         let focused = self.focus == Focus::Sidebar;
         let block = Block::default()
             .title("Lists")
-            .title_bottom(Line::from(self.layout_hint()).right_aligned())
+            .title_bottom(Line::from(self.layout_hint.as_str()).right_aligned())
             .borders(Borders::ALL)
             .border_style(border_style(focused));
         let list = List::new(rows)
@@ -480,10 +486,12 @@ impl Home {
             } else {
                 Style::default()
             };
+            // `it.title` is borrowed (not cloned): the `view` borrow is held for the
+            // whole of `draw_pane`, so the `Cell` can reference it for free.
             Row::new(vec![
                 Cell::from(check),
                 Cell::from(it.priority.label()).style(priority_style(it.priority)),
-                Cell::from(it.title.clone()).style(title_style),
+                Cell::from(it.title.as_str()).style(title_style),
                 Cell::from(due).style(Style::default().fg(Color::DarkGray)),
             ])
         });
@@ -495,7 +503,7 @@ impl Home {
         ];
         let block = Block::default()
             .title(title)
-            .title_bottom(Line::from(self.command_hint()).right_aligned())
+            .title_bottom(Line::from(self.command_hint.as_str()).right_aligned())
             .borders(Borders::ALL)
             .border_style(border_style(focused));
         let table = Table::new(rows, widths)
@@ -533,7 +541,7 @@ impl Home {
     }
 }
 
-fn border_style(focused: bool) -> Style {
+pub fn border_style(focused: bool) -> Style {
     if focused {
         Style::default().fg(Color::Yellow)
     } else {
@@ -541,7 +549,7 @@ fn border_style(focused: bool) -> Style {
     }
 }
 
-fn highlight_style(focused: bool) -> Style {
+pub fn highlight_style(focused: bool) -> Style {
     if focused {
         Style::default()
             .fg(Color::Black)
@@ -552,7 +560,7 @@ fn highlight_style(focused: bool) -> Style {
     }
 }
 
-fn priority_style(p: Priority) -> Style {
+pub fn priority_style(p: Priority) -> Style {
     match p {
         Priority::High => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         Priority::Med => Style::default().fg(Color::Yellow),
@@ -582,6 +590,9 @@ impl Component for Home {
             self.config.keybindings.context(KeyContext::Home),
             parse_command::<HomeCmd>,
         );
+        // The footer hints derive from the (now-updated) keymap; cache them so the
+        // per-frame `draw` only borrows them.
+        self.rebuild_hints();
         Ok(())
     }
 
@@ -614,7 +625,7 @@ impl Component for Home {
     fn draw(&mut self, frame: &mut Frame, area: Rect) -> anyhow::Result<()> {
         if self.sidebar_visible {
             let [sidebar, panes] =
-                Layout::horizontal([Constraint::Length(30), Constraint::Fill(1)]).areas(area);
+                Layout::horizontal([Constraint::Length(35), Constraint::Fill(1)]).areas(area);
             self.draw_sidebar(frame, sidebar);
             self.draw_panes(frame, panes);
         } else {
@@ -670,9 +681,9 @@ mod tests {
     fn hints_derive_from_default_bindings() {
         let mut home = Home::new(SharedView::default());
         home.register_config_handler(Config::defaults()).unwrap();
-        assert_eq!(home.layout_hint(), " |:split -:stack w:pane X:close ");
+        assert_eq!(home.layout_hint, " |:split -:stack w:pane X:close ");
         assert_eq!(
-            home.command_hint(),
+            home.command_hint,
             " n:new a:add e:edit x:done d:del o:sort s:share m:members "
         );
     }

@@ -152,8 +152,12 @@ impl Tui {
         Ok(())
     }
 
+    /// Grab the host terminal: raw mode + alternate screen (+ optional mouse /
+    /// bracketed-paste). Pure terminal state — does **not** touch the event
+    /// loop, so both `enter` (cold start) and `resume` (after a suspend) can
+    /// reuse it.
     #[tracing::instrument(skip(self))]
-    pub fn enter(&mut self) -> anyhow::Result<()> {
+    fn acquire_terminal(&mut self) -> anyhow::Result<()> {
         crossterm::terminal::enable_raw_mode()?;
         crossterm::execute!(stdout(), EnterAlternateScreen, cursor::Hide)?;
         if self.mouse {
@@ -162,13 +166,13 @@ impl Tui {
         if self.paste {
             crossterm::execute!(stdout(), EnableBracketedPaste)?;
         }
-        self.start();
         Ok(())
     }
 
+    /// Hand the terminal back to the shell: undo everything `acquire_terminal`
+    /// set. Also event-loop-agnostic, shared by `exit` (shutdown) and `suspend`.
     #[tracing::instrument(skip(self))]
-    pub fn exit(&mut self) -> anyhow::Result<()> {
-        self.stop()?;
+    fn restore_terminal(&mut self) -> anyhow::Result<()> {
         if crossterm::terminal::is_raw_mode_enabled()? {
             self.flush()?;
             if self.paste {
@@ -183,23 +187,50 @@ impl Tui {
         Ok(())
     }
 
+    /// Cold start: grab the terminal *and* spin up the event loop.
+    #[tracing::instrument(skip(self))]
+    pub fn enter(&mut self) -> anyhow::Result<()> {
+        self.acquire_terminal()?;
+        self.start();
+        Ok(())
+    }
+
+    /// Full shutdown: stop the event loop, then release the terminal.
+    #[tracing::instrument(skip(self))]
+    pub fn exit(&mut self) -> anyhow::Result<()> {
+        self.stop()?;
+        self.restore_terminal()?;
+        Ok(())
+    }
+
     #[tracing::instrument(skip(self))]
     pub fn cancel(&self) {
         self.cancellation_token.cancel();
     }
 
+    /// Drop to the shell (Ctrl-Z). Restore the terminal but **leave the event
+    /// loop running**: `SIGTSTP` freezes the whole process, so the loop task —
+    /// and its single long-lived crossterm `EventStream` — freezes with it and
+    /// thaws intact on `SIGCONT` (`fg`). We deliberately do *not* `stop()` here;
+    /// re-creating the `EventStream` on resume leaves the input reader wedged
+    /// (no key/tick/render events → a frozen frame). Blocks at `raise` until
+    /// the process is foregrounded again.
     #[tracing::instrument(skip(self))]
     pub fn suspend(&mut self) -> anyhow::Result<()> {
-        self.exit()?;
+        self.restore_terminal()?;
         #[cfg(not(windows))]
         signal_hook::low_level::raise(signal_hook::consts::signal::SIGTSTP)?;
         Ok(())
     }
 
+    /// Counterpart to [`suspend`](Self::suspend), run after `fg`. Re-grab the
+    /// terminal only — the event loop from [`enter`](Self::enter) is still
+    /// alive, so we must **not** `start()` a second one. The caller follows this
+    /// with an `Action::ClearScreen` so ratatui forgets its cached buffer and
+    /// repaints the (now-blank) alternate screen in full.
     #[tracing::instrument(skip(self))]
     pub fn resume(&mut self) -> anyhow::Result<()> {
-        self.enter()?;
-        Ok(())
+        self.acquire_terminal()
     }
 
     pub async fn next_event(&mut self) -> Option<Event> {

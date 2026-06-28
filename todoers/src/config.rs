@@ -17,8 +17,6 @@ const CONFIG: &str = include_str!("../app_config.toml");
 pub struct AppConfig {
     #[serde(default)]
     pub data_dir: PathBuf,
-    #[serde(default)]
-    pub config_dir: PathBuf,
     /// Base URL of the todoers server used for registration/login.
     #[serde(default = "default_server_url")]
     pub server_url: String,

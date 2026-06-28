@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use clap::Parser;
 use dialoguer::{Confirm, Password};
 use tokio::runtime::Builder;
@@ -13,6 +15,7 @@ mod components;
 mod config;
 mod error;
 mod logging;
+mod prompt;
 mod tui;
 mod view;
 
@@ -74,7 +77,7 @@ Save this public key in your configuration as:
         }
     };
 
-    let db = Db::init(&config.config.data_dir, &key, envelope.cipher).await?;
+    let db = Arc::new(Db::init(&config.config.data_dir, &key, envelope.cipher).await?);
     if let Some(recovery) = recovery {
         show_recovery_key(&recovery)?;
     }

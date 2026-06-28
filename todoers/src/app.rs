@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use crossterm::event::{KeyEvent, KeyModifiers};
 use indexmap::IndexMap;
@@ -10,13 +11,12 @@ use ratatui::style::{Color, Style};
 use ratatui::widgets::Paragraph;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use zeroize::Zeroizing;
 
 use todoers_client::auth::{self, AccountRow, UnlockedKeys};
 use todoers_client::db::Db;
-use todoers_client::model::TodoItem;
-use todoers_client::model::{MetaList, ViewTarget};
+use todoers_client::model::{MetaList, TodoItem, ViewTarget};
 use todoers_client::net::Net;
 use todoers_client::session::Session;
 use todoers_client::store::Store;
@@ -37,7 +37,7 @@ use crate::view::{SharedView, ViewModel};
 
 pub struct App {
     config: Config,
-    db: Db,
+    db: Arc<Db>,
     net: Net,
     account: Option<Zeroizing<AccountRow>>,
     modes: HashMap<Mode, Box<dyn Component>, BuildNoHashHasher<u8>>,
@@ -159,21 +159,22 @@ async fn recv_opt(rx: &mut Option<WorkerRx>) -> Option<WorkerMsg> {
 }
 
 /// Convert a `users/{username}/pubkeys` response into a [`Member`] to seal a list
-/// DEK to. Rejects keys of the wrong length rather than panicking.
-fn resolved_member(dto: todoers_types::UserPubkeysDto) -> anyhow::Result<todoers_types::Member> {
-    Ok(Member {
+/// DEK to. The pubkey fields are already length-checked newtypes, so this is a pure
+/// field shuffle — no validation needed here.
+fn resolved_member(dto: todoers_types::UserPubkeysDto) -> Member {
+    Member {
         id: dto.member_id,
         identity_pub: dto.identity_pub,
         signing_pub: dto.signing_pub,
         role: Role::Member,
-    })
+    }
 }
 
 impl App {
     #[tracing::instrument(skip(config, db))]
     pub async fn new(
         config: Config,
-        db: Db,
+        db: Arc<Db>,
         account: Option<Zeroizing<AccountRow>>,
         acct_keys: Option<Zeroizing<UnlockedKeys>>,
     ) -> anyhow::Result<Self> {
@@ -238,7 +239,7 @@ impl App {
 
         let mut session = Session::new(keys);
         session.rehydrate(&self.db).await?;
-        let mut store = Store::new(self.db.clone(), session);
+        let mut store = Store::new(Arc::clone(&self.db), session);
 
         // The store owns `Send` state (keys + Loro docs), so it can run on its
         // own task; the UI talks to it only over channels and never blocks.
@@ -249,7 +250,7 @@ impl App {
         let (sync_tx, sync_rx) = mpsc::unbounded_channel();
 
         store.set_sync_tx(sync_tx.clone());
-        let sync_db = self.db.clone();
+        let sync_db = Arc::clone(&self.db);
         let sync_cmd_tx = cmd_tx.clone();
         let sync_sync_tx = sync_tx.clone();
 
@@ -323,22 +324,43 @@ impl App {
             .unwrap_or_default()
     }
 
+    /// The mode whose component should currently be driven: the active `mode`, or
+    /// `prev_mode`, or `Mode::default()` — whichever the `modes` map actually holds.
+    /// (Today the map only ever contains `Home`, so this resolves to it; the
+    /// fallback chain keeps the lookup total if more modes are ever inserted.)
+    fn active_mode(&self) -> Mode {
+        if self.modes.contains_key(&self.mode) {
+            self.mode
+        } else if self.modes.contains_key(&self.prev_mode) {
+            self.prev_mode
+        } else {
+            Mode::default()
+        }
+    }
+
+    /// The active mode's component (see [`Self::active_mode`]). `Mode::default()`
+    /// is always present in the map, so the lookup can't fail.
+    fn active_component_mut(&mut self) -> &mut Box<dyn Component> {
+        let mode = self.active_mode();
+        self.modes
+            .get_mut(&mode)
+            .expect("default mode component is always present")
+    }
+
     #[tracing::instrument(skip(self))]
     pub async fn run(&mut self) -> anyhow::Result<()> {
         let mut tui = Tui::new()?.mouse(true).paste(true);
         tui.enter()?;
-        let component = if let Some(comp) = self.modes.get_mut(&self.mode) {
-            comp
-        } else if let Some(comp) = self.modes.get_mut(&self.prev_mode) {
-            comp
-        } else {
-            self.modes.get_mut(&Mode::default()).unwrap()
-        };
 
-        // Initialize the main component
-        component.register_action_handler(self.action_tx.clone())?;
-        component.register_config_handler(self.config.clone())?;
-        component.init(tui.size()?)?;
+        // Initialize the main component. Clone the shared handles before borrowing
+        // the component mutably so the two borrows don't overlap.
+        let tx = self.action_tx.clone();
+        let config = self.config.clone();
+        let size = tui.size()?;
+        let component = self.active_component_mut();
+        component.register_action_handler(tx)?;
+        component.register_config_handler(config)?;
+        component.init(size)?;
 
         // Initialize the error bar component
         self.errorbar
@@ -378,7 +400,7 @@ impl App {
                 tui.suspend()?;
                 action_tx.send(Action::Resume)?;
                 action_tx.send(Action::ClearScreen)?;
-                tui.enter()?;
+                tui.resume()?;
             } else if self.should_quit {
                 tui.stop()?;
                 self.logout_best_effort().await;
@@ -413,7 +435,7 @@ impl App {
                     // keeps the "account found → unlock" path firing on the same
                     // tick, while no longer querying SQLCipher on every tick when
                     // there is no account row (the initial register/login window).
-                    if self.account.is_none() && self.acct_keys.is_none() && !self.account_checked {
+                    if self.account.is_none() && !self.account_checked {
                         self.account_checked = true;
                         self.load_account().await?;
                     }
@@ -451,24 +473,15 @@ impl App {
             }
             _ => {}
         }
-        // Route input to the modal when one is open; otherwise to the active
-        // mode component. This keeps the background mode from reacting to keys
-        // or clicks meant for the overlay.
+        // Route input to the modal when one is open, otherwise to the active mode
+        // component — never both, so the background stays inert behind an overlay.
+        // `event` is moved here (its last use): exactly one branch runs.
         if let Some(modal) = self.modal.as_mut() {
-            if let Some(action) = modal.handle_events(Some(event.clone()))? {
+            if let Some(action) = modal.handle_events(Some(event))? {
                 action_tx.send(action)?;
             }
-        } else {
-            let component = if let Some(comp) = self.modes.get_mut(&self.mode) {
-                comp
-            } else if let Some(comp) = self.modes.get_mut(&self.prev_mode) {
-                comp
-            } else {
-                self.modes.get_mut(&Mode::default()).unwrap()
-            };
-            if let Some(action) = component.handle_events(Some(event.clone()))? {
-                action_tx.send(action)?;
-            }
+        } else if let Some(action) = self.active_component_mut().handle_events(Some(event))? {
+            action_tx.send(action)?;
         }
         Ok(())
     }
@@ -579,14 +592,18 @@ impl App {
             Action::Resume => self.should_suspend = false,
             Action::ClearScreen => tui.terminal.clear()?,
             Action::Resize(w, h) => self.handle_resize(tui, w, h)?,
-            // Coalesced in `handle_actions`; unreachable here but kept so
-            // the match stays exhaustive over `Action`.
             Action::SetMode(mode) => self.handle_switch_mode(mode, tui)?,
             Action::StartCapture => self.capturing = true,
             Action::StopCapture => self.capturing = false,
             Action::Keys(ref keys) => {
                 info!("Received cryptographic keys");
                 self.acct_keys = Some(keys.to_owned());
+                // login/register persisted the account to disk before sending this;
+                // clear the one-shot guard so the next tick reloads it into memory,
+                // letting the init_session gate (account + keys) fire.
+                if self.account.is_none() {
+                    self.account_checked = false;
+                }
             }
             Action::UnlockModal => {
                 // The user has a local account but no keys (e.g. first launch
@@ -653,9 +670,14 @@ impl App {
                     match net.register(&username, &password).await {
                         Ok(account) => match db.save_account(&account).await {
                             Ok(()) => {
+                                // OPAQUE registration issues no session token, so log in
+                                // to recover keys+token from escrow. Login emits
+                                // Keys + CloseModal + SetMode(Home).
                                 let _ = tx.send(Action::StopCapture);
-                                let _ = tx.send(Action::CloseModal);
-                                let _ = tx.send(Action::SetMode(Mode::Home));
+                                let _ = tx.send(Action::Login {
+                                    username: username.clone(),
+                                    password: password.clone(),
+                                });
                             }
                             Err(e) => {
                                 let _ =
@@ -897,15 +919,10 @@ impl App {
                 let net = self.net.clone();
                 tokio::spawn(async move {
                     match net.lookup_pubkeys(&token, &username).await {
-                        Ok(dto) => match resolved_member(dto) {
-                            Ok(member) => {
-                                let _ = tx.send(Action::AddResolvedMember { list_id, member });
-                            }
-                            Err(e) => {
-                                let _ =
-                                    tx.send(Action::Error(format!("Invalid keys for user: {e}")));
-                            }
-                        },
+                        Ok(dto) => {
+                            let member = resolved_member(dto);
+                            let _ = tx.send(Action::AddResolvedMember { list_id, member });
+                        }
                         Err(e) => {
                             let _ = tx.send(Action::Error(format!("Share failed: {e:#}")));
                         }
@@ -961,22 +978,14 @@ impl App {
         }
         // Forward the action to the modal while it is open, otherwise to
         // the active mode component — never both, so the background mode
-        // stays inert behind the overlay.
+        // stays inert behind the overlay. A component may return a follow-up
+        // action, which we re-queue.
         if let Some(modal) = self.modal.as_mut() {
-            if let Some(action) = modal.update(action.clone())? {
-                self.action_tx.send(action)?
-            };
-        } else {
-            let component = if let Some(comp) = self.modes.get_mut(&self.mode) {
-                comp
-            } else if let Some(comp) = self.modes.get_mut(&self.prev_mode) {
-                comp
-            } else {
-                self.modes.get_mut(&Mode::default()).unwrap()
-            };
-            if let Some(action) = component.update(action.clone())? {
-                self.action_tx.send(action.clone())?;
-            };
+            if let Some(followup) = modal.update(action.clone())? {
+                self.action_tx.send(followup)?;
+            }
+        } else if let Some(followup) = self.active_component_mut().update(action.clone())? {
+            self.action_tx.send(followup)?;
         }
         #[cfg(feature = "fps")]
         self.fps.update(action.clone())?;
@@ -1026,9 +1035,7 @@ impl App {
             return modal.editor_mode();
         }
         self.modes
-            .get(&self.mode)
-            .or_else(|| self.modes.get(&self.prev_mode))
-            .or_else(|| self.modes.get(&Mode::default()))
+            .get(&self.active_mode())
             .and_then(|comp| comp.editor_mode())
     }
 
@@ -1037,18 +1044,18 @@ impl App {
         self.prev_mode = self.mode;
         self.mode = mode;
         self.refresh_keys()?;
-        let component = if let Some(comp) = self.modes.get_mut(&self.mode) {
-            comp
-        } else if let Some(comp) = self.modes.get_mut(&self.prev_mode) {
-            comp
-        } else {
-            self.modes.get_mut(&Mode::default()).unwrap()
-        };
 
-        component.register_action_handler(self.action_tx.clone())?;
-        component.register_config_handler(self.config.clone())?;
-        component.init(tui.size()?)?;
-        if component.captures_input() {
+        // Clone the shared handles up front so they don't overlap the mutable
+        // borrow of the component.
+        let tx = self.action_tx.clone();
+        let config = self.config.clone();
+        let size = tui.size()?;
+        let component = self.active_component_mut();
+        component.register_action_handler(tx)?;
+        component.register_config_handler(config)?;
+        component.init(size)?;
+        let captures = component.captures_input();
+        if captures {
             self.action_tx.send(Action::StartCapture)?;
         }
         Ok(())
@@ -1074,19 +1081,12 @@ impl App {
             // modals. The only case with nothing worth showing behind the dialog
             // is the initial login/register prompt, where redrawing the full
             // `Home` workspace every frame is pure wasted work on the hot path.
-            if self.modal.is_none() || self.account_verified {
-                let component = if let Some(comp) = self.modes.get_mut(&self.mode) {
-                    comp
-                } else if let Some(comp) = self.modes.get_mut(&self.prev_mode) {
-                    comp
-                } else {
-                    self.modes.get_mut(&Mode::default()).unwrap()
-                };
-                if let Err(err) = component.draw(frame, body) {
-                    let _ = self
-                        .action_tx
-                        .send(Action::Error(format!("Failed to draw screen: {:?}", err)));
-                }
+            if (self.modal.is_none() || self.account_verified)
+                && let Err(err) = self.active_component_mut().draw(frame, body)
+            {
+                let _ = self
+                    .action_tx
+                    .send(Action::Error(format!("Failed to draw screen: {:?}", err)));
             }
             // Draw the modal last so it overlays the active mode. The modal
             // centers itself and `Clear`s its region, so the screen behind it
@@ -1135,11 +1135,10 @@ impl App {
     pub fn login(&self, username: String, password: Zeroizing<String>) {
         // Drive the networked OPAQUE login off the UI loop; results
         // come back as actions (Error, or Keys+StopCapture+SetMode).
+        // `username`/`password` are already owned params; move them into the task.
         let tx = self.action_tx.clone();
         let db = self.db.clone();
         let du = self.config.config.device_unlock.clone();
-        let username = username.clone();
-        let password = password.clone();
         let net = self.net.clone();
         tokio::spawn(async move {
             // Online login needs NO local account — it recovers the
@@ -1194,7 +1193,11 @@ impl App {
             // If password-less unlock is enabled and this device isn't enrolled
             // yet, seal the keys to the configured local AGE/SSH key and register a
             // trusted key with the server. Best-effort: a failure here doesn't
-            // block the login — the user can still unlock with their password.
+            // block the login — the user can still unlock with their password — so
+            // failures are LOGGED, never surfaced as a user-facing error. (Enrollment
+            // is step-up-gated server-side; it only runs here because `login` always
+            // mints a fresh password session, which passes step-up. A device-minted
+            // session never reaches this code, so it can't trigger the 403.)
             if du.enabled && !keys.token.is_empty() {
                 let already_enrolled = matches!(db.load_device_cache().await, Ok(Some(_)));
                 if !already_enrolled {
@@ -1205,21 +1208,15 @@ impl App {
                         {
                             Ok((device_id, blob)) => {
                                 if let Err(e) = db.save_device_cache(&device_id, &blob).await {
-                                    let _ = tx.send(Action::Error(format!(
-                                        "Logged in, but could not save device cache: {e:#}"
-                                    )));
+                                    warn!(error = ?e, "device enrolled, but could not cache it locally");
                                 }
                             }
                             Err(e) => {
-                                let _ = tx.send(Action::Error(format!(
-                                    "Logged in, but device enrollment failed: {e:#}"
-                                )));
+                                warn!(error = ?e, "device enrollment failed; password unlock still works");
                             }
                         },
                         None => {
-                            let _ = tx.send(Action::Error(
-                                "device_unlock.enabled is set but recipient is missing".to_string(),
-                            ));
+                            warn!("device_unlock.enabled is set but no recipient is configured; skipping enrollment");
                         }
                     }
                 }

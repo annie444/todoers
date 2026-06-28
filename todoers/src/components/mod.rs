@@ -5,24 +5,25 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::{action::Action, config::Config, tui::Event};
 
-mod button;
-mod errorbar;
-mod form_keys;
+pub(super) mod button;
+pub(super) mod errorbar;
+pub(super) mod form_keys;
 #[cfg(feature = "fps")]
-mod fps;
-mod help;
-mod home;
-mod keys;
-mod list_form;
-mod login;
-mod members;
-mod modal;
-mod prompt;
-mod register;
-mod share_form;
-mod text_input;
-mod todo_form;
-mod unlock;
+pub(super) mod fps;
+pub(super) mod help;
+pub(super) mod home;
+pub(super) mod keys;
+pub(super) mod list_form;
+pub(super) mod login;
+pub(super) mod members;
+pub(super) mod modal;
+pub(super) mod prompt;
+pub(super) mod register;
+pub(super) mod share_form;
+pub(super) mod sidebar;
+pub(super) mod text_input;
+pub(super) mod todo_form;
+pub(super) mod unlock;
 
 pub use button::Button;
 pub use errorbar::ErrorBar;

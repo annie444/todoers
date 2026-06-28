@@ -5,7 +5,7 @@ icon_theme = "nerd-fonts"
 # Text-field editing style: "emacs" (default) or "vim". Emacs gives the usual
 # terminal readline motions (Ctrl-A/E/F/B/K/W, Alt-F/B, arrows); Vim gives a
 # modal editor (press `i` to insert, Esc to return to normal mode).
-# editing_mode = "vim"
+editing_mode = "emacs"
 
 # Password-less device unlock. Generate a post-quantum (X-Wing) keypair with
 # `todoers keygen <path>`; it writes the hex secret to <path> and prints the hex
