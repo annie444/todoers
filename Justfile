@@ -5,7 +5,7 @@ todoers-db-password := "todoers"
 # macOS code-signing identity. Sign local binaries with a *stable* identity so the
 # keychain trusts the app across rebuilds (no repeated "allow access" prompts).
 # One-time: create a self-signed "Code Signing" cert named below in Keychain Access.
-signing-identity := env_var_or_default("TODOERS_SIGN_ID", "Todoers Dev")
+signing-identity := env("TODOERS_SIGN_ID", "Todoers Dev")
 
 [default]
 [private]
@@ -15,6 +15,22 @@ default:
 [group("Setup")]
 install-tools:
     cargo install sqlx-cli --features postgres,sqlite,sqlx-toml
+
+[group("Dev")]
+test:
+    cargo test --workspace --all-targets
+
+[group("Dev")]
+lint:
+    cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+[group("Dev")]
+fmt:
+    cargo fmt --all
+
+[group("Dev")]
+fmt-check:
+    cargo fmt --all -- --check
 
 [group("Database")]
 db-up:
