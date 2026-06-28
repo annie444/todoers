@@ -5,7 +5,10 @@
 
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
-use todoers_client::model::{ListSummary, MetaList, SortMode, TodoItem, TodoItemInput, ViewTarget};
+use crate::{
+    error::TodoersResult,
+    model::{ListSummary, MetaList, SortMode, TodoItem, TodoItemInput, ViewTarget},
+};
 use todoers_types::{KeySlotDto, ListId, Member, MemberId, MetadataResponse, StoredUpdateDto};
 
 use crate::store::Store;
@@ -99,7 +102,7 @@ pub async fn run_store_worker(mut store: Store, mut cmd_rx: CommandRx, out: Work
 
     while let Some(cmd) = cmd_rx.recv().await {
         // Returns true if the command changed list/todo state (snapshot needed).
-        let result: anyhow::Result<bool> = async {
+        let result: TodoersResult<bool> = async {
             match cmd {
                 StoreCommand::SetView {
                     targets: t,
@@ -114,11 +117,11 @@ pub async fn run_store_worker(mut store: Store, mut cmd_rx: CommandRx, out: Work
                     Ok(true)
                 }
                 StoreCommand::RenameList { list_id, name } => {
-                    store.rename_list(list_id, &name).await?;
+                    store.rename_list(&list_id, &name).await?;
                     Ok(true)
                 }
                 StoreCommand::DeleteList(list_id) => {
-                    store.delete_list(list_id).await?;
+                    store.delete_list(&list_id).await?;
                     // Any pane showing the deleted list falls back to All Tasks.
                     let fallback = ViewTarget::Meta(MetaList::AllTasks);
                     for t in targets.iter_mut() {
@@ -129,7 +132,7 @@ pub async fn run_store_worker(mut store: Store, mut cmd_rx: CommandRx, out: Work
                     Ok(true)
                 }
                 StoreCommand::AddTodo { list_id, input } => {
-                    store.add_todo(list_id, &input).await?;
+                    store.add_todo(&list_id, &input).await?;
                     Ok(true)
                 }
                 StoreCommand::EditTodo {
@@ -137,39 +140,39 @@ pub async fn run_store_worker(mut store: Store, mut cmd_rx: CommandRx, out: Work
                     item_id,
                     input,
                 } => {
-                    store.edit_todo(list_id, &item_id, &input).await?;
+                    store.edit_todo(&list_id, &item_id, &input).await?;
                     Ok(true)
                 }
                 StoreCommand::ToggleDone { list_id, item_id } => {
-                    store.toggle_done(list_id, &item_id).await?;
+                    store.toggle_done(&list_id, &item_id).await?;
                     Ok(true)
                 }
                 StoreCommand::DeleteTodo { list_id, item_id } => {
-                    store.delete_todo(list_id, &item_id).await?;
+                    store.delete_todo(&list_id, &item_id).await?;
                     Ok(true)
                 }
                 StoreCommand::AddMember { list_id, member } => {
-                    store.add_member_local(list_id, member).await?;
+                    store.add_member_local(&list_id, member).await?;
                     Ok(true)
                 }
                 StoreCommand::RemoveMember { list_id, member_id } => {
-                    store.remove_member_local(list_id, member_id).await?;
+                    store.remove_member_local(&list_id, member_id).await?;
                     Ok(true)
                 }
                 StoreCommand::FetchFullItem { list_id, item_id } => {
-                    let item = store.full_item(list_id, &item_id).await?;
+                    let item = store.full_item(&list_id, &item_id).await?;
                     let _ = out.send(WorkerMsg::FullItem(Box::new(item.map(|it| (list_id, it)))));
                     Ok(false)
                 }
                 StoreCommand::FetchMembers(list_id) => {
-                    let members = store.members(list_id).await?;
+                    let members = store.members(&list_id).await?;
                     let _ = out.send(WorkerMsg::Members(Box::new((list_id, members))));
                     Ok(false)
                 }
                 StoreCommand::ApplyRemote { list_id, updates } => {
                     let mut changed = false;
                     for dto in updates {
-                        changed |= store.apply_remote_update(list_id, dto).await?;
+                        changed |= store.apply_remote_update(&list_id, dto).await?;
                     }
                     Ok(changed)
                 }
@@ -204,11 +207,11 @@ mod tests {
     use sqlx::{Pool, Sqlite};
     use tokio::sync::mpsc::unbounded_channel;
 
-    use todoers_client::auth::UnlockedKeys;
-    use todoers_client::crypto;
-    use todoers_client::db::Db;
-    use todoers_client::model::MetaList;
-    use todoers_client::session::Session;
+    use crate::auth::UnlockedKeys;
+    use crate::crypto;
+    use crate::db::Db;
+    use crate::model::MetaList;
+    use crate::session::Session;
 
     fn test_store(db: Pool<Sqlite>) -> Store {
         let db = Db::from_pool(db);

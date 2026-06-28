@@ -411,6 +411,12 @@ impl Component for TodoForm {
                     .title(due_title)
                     .border_style(Style::default().fg(due_border)),
             );
+        let [_, due, _] = Layout::horizontal([
+            Constraint::Fill(1),
+            Constraint::Length(calendar.width()),
+            Constraint::Fill(1),
+        ])
+        .areas(due);
         frame.render_widget(calendar, due);
 
         // Priority list; the highlighted row is the chosen priority.
@@ -459,7 +465,7 @@ mod tests {
     /// `[keybindings.form]` map is live and `SaveTodo` is captured on `rx`.
     fn form() -> (TodoForm, mpsc::UnboundedReceiver<Action>) {
         let (tx, rx) = mpsc::unbounded_channel();
-        let mut form = TodoForm::add(ListId([0u8; 16]));
+        let mut form = TodoForm::add(ListId::new([0u8; 16]));
         form.register_config_handler(Config::defaults()).unwrap();
         form.register_action_handler(tx).unwrap();
         (form, rx)
@@ -502,7 +508,10 @@ mod tests {
         form.handle_key_event(key(KeyCode::Right)).unwrap();
         assert_eq!(form.due_cursor.day(), 16);
         form.handle_key_event(key(KeyCode::Down)).unwrap();
-        assert_eq!(form.due_cursor, Date::from_calendar_date(2026, Month::June, 23).unwrap());
+        assert_eq!(
+            form.due_cursor,
+            Date::from_calendar_date(2026, Month::June, 23).unwrap()
+        );
         form.handle_key_event(key(KeyCode::Left)).unwrap();
         assert_eq!(form.due_cursor.day(), 22);
     }
@@ -560,7 +569,7 @@ mod tests {
             subtasks: vec![],
             order_key: "a0".to_string(),
         };
-        let form = TodoForm::edit(ListId([0u8; 16]), &item);
+        let form = TodoForm::edit(ListId::new([0u8; 16]), &item);
         assert!(form.due_enabled);
         assert_eq!(form.due_cursor, due.date());
         assert_eq!(form.priority, Priority::High);

@@ -19,12 +19,12 @@ use opaque_ke::{
     ClientRegistrationFinishParameters, CredentialResponse, RegistrationResponse,
 };
 use serde::{Deserialize, Serialize};
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use todoers_types::{
-    Ed25519Pub, FinishRegisterRequest, LoginFinishRequest, LoginFinishResponse, LoginStartRequest,
-    LoginStartResponse, MemberId, SharedCipherSuite, StartRegisterRequest, StartRegisterResponse,
-    X25519Pub,
+    DeviceId, Ed25519Pub, Ed25519Signing, FinishRegisterRequest, LoginFinishRequest,
+    LoginFinishResponse, LoginStartRequest, LoginStartResponse, MemberId, SharedCipherSuite,
+    StartRegisterRequest, StartRegisterResponse, X25519Pub, X25519Secret,
 };
 
 use crate::crypto;
@@ -36,11 +36,32 @@ pub const KDF_MEM_KIB: u32 = 19_456;
 pub const KDF_ITERS: u32 = 2;
 pub const KDF_PARALLELISM: u32 = 1;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize, Serialize, Zeroize)]
-pub struct KdfSalt(#[serde(with = "todoers_types::b6416")] pub [u8; 16]);
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, Hash, Deserialize, Serialize, Zeroize, ZeroizeOnDrop,
+)]
+pub struct KdfSalt([u8; 16]);
 
-impl AsRef<[u8]> for KdfSalt {
-    fn as_ref(&self) -> &[u8] {
+impl<'r, DB: sqlx::Database> sqlx::Decode<'r, DB> for KdfSalt
+where
+    &'r [u8]: sqlx::Decode<'r, DB>,
+{
+    fn decode(
+        value: <DB as sqlx::Database>::ValueRef<'r>,
+    ) -> Result<Self, sqlx::error::BoxDynError> {
+        let bytes: &[u8] = <&[u8] as sqlx::Decode<DB>>::decode(value)?;
+        if bytes.len() != 16 {
+            return Err(sqlx::error::BoxDynError::from(TodoersError::BadSize(
+                "kdf salt is not 16 bytes".to_string(),
+            )));
+        }
+        let mut slice = [0u8; 16];
+        slice.copy_from_slice(bytes);
+        Ok(Self(slice))
+    }
+}
+
+impl AsRef<[u8; 16]> for KdfSalt {
+    fn as_ref(&self) -> &[u8; 16] {
         &self.0
     }
 }
@@ -57,11 +78,28 @@ impl From<[u8; 16]> for KdfSalt {
     }
 }
 
-impl From<Vec<u8>> for KdfSalt {
-    fn from(vec: Vec<u8>) -> Self {
-        let mut bytes = [0u8; 16];
-        bytes.copy_from_slice(&vec);
-        KdfSalt(bytes)
+impl TryFrom<Vec<u8>> for KdfSalt {
+    type Error = TodoersError;
+    fn try_from(vec: Vec<u8>) -> Result<Self, Self::Error> {
+        let bytes: [u8; 16] = vec
+            .try_into()
+            .map_err(|_| TodoersError::BadSize("kdf salt is not 16 bytes".to_string()))?;
+        Ok(KdfSalt(bytes))
+    }
+}
+
+impl KdfSalt {
+    pub fn generate<Rng>(rng: &mut Rng) -> Self
+    where
+        Rng: old_rand_core::RngCore + old_rand_core::CryptoRng,
+    {
+        let mut salt = [0u8; 16];
+        rng.fill_bytes(&mut salt);
+        KdfSalt(salt)
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.0
     }
 }
 
@@ -72,9 +110,9 @@ pub struct RegisterFlow {
     username: String,
     password: Zeroizing<Vec<u8>>,
     reg_state: ClientRegistration<SharedCipherSuite>,
-    identity_secret: [u8; 32],
+    identity_secret: X25519Secret,
     identity_pub: X25519Pub,
-    signing_seed: [u8; 32],
+    signing_seed: Ed25519Signing,
     signing_pub: Ed25519Pub,
 }
 
@@ -100,7 +138,7 @@ pub struct AccountRow {
     pub username: String,
     pub identity_pub: X25519Pub,
     pub signing_pub: Ed25519Pub,
-    pub wrapped_secret_keys: Zeroizing<Vec<u8>>,
+    pub wrapped_secret_keys: Vec<u8>,
     pub kdf_salt: KdfSalt,
     pub kdf_mem_kib: i64,
     pub kdf_iters: i64,
@@ -112,9 +150,9 @@ pub struct AccountRow {
 #[derive(Debug, Clone, PartialEq, Eq, Zeroize, Serialize, Deserialize)]
 pub struct UnlockedKeys {
     pub member_id: MemberId,
-    pub identity_secret: [u8; 32],
+    pub identity_secret: X25519Secret,
     pub identity_pub: X25519Pub,
-    pub signing_seed: [u8; 32],
+    pub signing_seed: Ed25519Signing,
     pub signing_pub: Ed25519Pub,
     /// Session bearer token (empty for the offline path).
     pub token: String,
@@ -141,7 +179,7 @@ pub fn register_begin(
 
     let start = ClientRegistration::<SharedCipherSuite>::start(&mut rng, password.as_bytes())?;
     let request = StartRegisterRequest {
-        identity_pub,
+        identity_pub: identity_pub.clone(),
         registration_req: start.message.serialize().to_vec(),
     };
 
@@ -198,8 +236,8 @@ pub fn register_finish(
 
     let request = FinishRegisterRequest {
         username: flow.username.clone(),
-        identity_pub: flow.identity_pub,
-        signing_pub: flow.signing_pub.0,
+        identity_pub: flow.identity_pub.clone(),
+        signing_pub: flow.signing_pub.clone(),
         wrapped_secret_keys: escrow_wrapped,
         registration_up: finish.message.serialize().to_vec(),
     };
@@ -276,25 +314,12 @@ pub fn unlock_from_escrow(
     let (identity_secret, signing_seed) =
         crypto::unwrap_secret_keys(&master, &response.wrapped_secret_keys)?;
 
-    let identity_pub = X25519Pub(
-        response
-            .identity_pub
-            .try_into()
-            .map_err(|_| TodoersError::Aead)?,
-    );
-    let signing_pub = Ed25519Pub(
-        response
-            .signing_pub
-            .try_into()
-            .map_err(|_| TodoersError::Aead)?,
-    );
-
     Ok(Zeroizing::new(UnlockedKeys {
-        member_id: MemberId(*response.member_id.as_bytes()),
+        member_id: response.member_id,
         identity_secret,
-        identity_pub,
+        identity_pub: response.identity_pub,
         signing_seed,
-        signing_pub,
+        signing_pub: response.signing_pub,
         token: response.token,
     }))
 }
@@ -321,9 +346,9 @@ pub fn unlock_offline(
     Ok(Zeroizing::new(UnlockedKeys {
         member_id: account.member_id,
         identity_secret,
-        identity_pub: account.identity_pub,
+        identity_pub: account.identity_pub.clone(),
         signing_seed,
-        signing_pub: account.signing_pub,
+        signing_pub: account.signing_pub.clone(),
         token: String::new(),
     }))
 }
@@ -357,8 +382,8 @@ pub fn build_local_account(
     Ok(NewAccount {
         member_id: keys.member_id,
         username: username.to_string(),
-        identity_pub: keys.identity_pub,
-        signing_pub: keys.signing_pub,
+        identity_pub: keys.identity_pub.clone(),
+        signing_pub: keys.signing_pub.clone(),
         wrapped_secret_keys,
         kdf_salt,
         kdf_mem_kib: KDF_MEM_KIB.into(),
@@ -384,24 +409,21 @@ pub struct DeviceCachePayload {
     /// fresh session is minted via device login, never cached.
     pub keys: UnlockedKeys,
     /// Opaque 16-byte device id, enrolled with the server.
-    pub device_id: [u8; 16],
+    pub device_id: DeviceId,
     /// Ed25519 device-auth seed (signs the device-login challenge).
-    pub device_signing_seed: [u8; 32],
+    pub device_signing_seed: Ed25519Signing,
     /// Ed25519 device-auth public key (enrolled as the server-side trusted key).
-    pub device_signing_pub: [u8; 32],
+    pub device_signing_pub: Ed25519Pub,
 }
 
 /// Generate a fresh device id + Ed25519 device-auth keypair for enrollment.
 /// Returns `(device_id, signing_seed, signing_pub)`.
 #[tracing::instrument]
-pub fn generate_device_identity() -> ([u8; 16], [u8; 32], [u8; 32]) {
-    let mut device_id = [0u8; 16];
-    {
-        use old_rand_core::RngCore;
-        OsRng.fill_bytes(&mut device_id);
-    }
+pub fn generate_device_identity() -> (DeviceId, Ed25519Signing, Ed25519Pub) {
+    let mut rng = OsRng;
+    let device_id = DeviceId::generate(&mut rng);
     let (seed, pubkey) = crypto::generate_signing();
-    (device_id, seed, pubkey.0)
+    (device_id, seed, pubkey)
 }
 
 /// Seal the unlocked keys + device-auth keypair to a local AGE/SSH recipient,
@@ -410,17 +432,17 @@ pub fn generate_device_identity() -> ([u8; 16], [u8; 32], [u8; 32]) {
 pub fn build_device_cache(
     recipient: &str,
     keys: &UnlockedKeys,
-    device_id: [u8; 16],
-    device_signing_seed: [u8; 32],
-    device_signing_pub: [u8; 32],
+    device_id: &DeviceId,
+    device_signing_seed: &Ed25519Signing,
+    device_signing_pub: &Ed25519Pub,
 ) -> TodoersResult<Vec<u8>> {
     let mut keys = keys.clone();
     keys.token.zeroize(); // never cache a live session token
     let payload = DeviceCachePayload {
         keys,
-        device_id,
-        device_signing_seed,
-        device_signing_pub,
+        device_id: *device_id,
+        device_signing_seed: device_signing_seed.clone(),
+        device_signing_pub: device_signing_pub.clone(),
     };
     let mut json = serde_json::to_vec(&payload).map_err(|_| TodoersError::Aead)?;
     let sealed = crypto::device_seal(recipient, &json);
@@ -449,6 +471,7 @@ mod tests {
         CredentialFinalization, CredentialRequest, RegistrationRequest, RegistrationUpload,
         ServerLogin, ServerLoginParameters, ServerRegistration, ServerSetup,
     };
+    use todoers_types::Nonce;
     use uuid::Uuid;
 
     /// Drive the full register → login → unlock cycle, playing the server side of
@@ -468,7 +491,7 @@ mod tests {
             &setup,
             RegistrationRequest::<SharedCipherSuite>::deserialize(&start_req.registration_req)
                 .unwrap(),
-            member_id.as_bytes(),
+            member_id.as_ref(),
         )
         .unwrap();
         let start_resp = StartRegisterResponse {
@@ -490,7 +513,7 @@ mod tests {
             Some(password_file),
             CredentialRequest::<SharedCipherSuite>::deserialize(&lstart_req.credential_req)
                 .unwrap(),
-            member_id.as_bytes(),
+            member_id.as_ref(),
             ServerLoginParameters::default(),
         )
         .unwrap();
@@ -515,23 +538,20 @@ mod tests {
         // The server returns the escrow blob it stored at registration.
         let login_resp = LoginFinishResponse {
             token: "session-token".into(),
-            member_id: Uuid::from_bytes(member_id.0),
-            identity_pub: finish_req.identity_pub.0.to_vec(),
-            signing_pub: finish_req.signing_pub.to_vec(),
+            member_id,
+            identity_pub: finish_req.identity_pub,
+            signing_pub: finish_req.signing_pub,
             wrapped_secret_keys: finish_req.wrapped_secret_keys.clone(),
         };
         let unlocked = unlock_from_escrow(&export_key, login_resp).unwrap();
 
         // The recovered secrets must reproduce the registered public keys.
-        let recovered_id_pub = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(
-            unlocked.identity_secret,
-        ))
-        .to_bytes();
-        assert_eq!(X25519Pub(recovered_id_pub), account.identity_pub);
+        let recovered_id_pub = x25519_dalek::PublicKey::from(&unlocked.identity_pub);
+        assert_eq!(X25519Pub::from(recovered_id_pub), account.identity_pub);
         let recovered_sign_pub = ed25519_dalek::SigningKey::from_bytes(&unlocked.signing_seed)
             .verifying_key()
             .to_bytes();
-        assert_eq!(Ed25519Pub(recovered_sign_pub), account.signing_pub);
+        assert_eq!(Ed25519Pub::new(recovered_sign_pub), account.signing_pub);
         assert_eq!(unlocked.member_id, member_id);
         assert_eq!(unlocked.token, "session-token");
 
@@ -544,7 +564,7 @@ mod tests {
             username: fresh.username.clone(),
             identity_pub: fresh.identity_pub,
             signing_pub: fresh.signing_pub,
-            wrapped_secret_keys: fresh.wrapped_secret_keys.into(),
+            wrapped_secret_keys: fresh.wrapped_secret_keys,
             kdf_salt: fresh.kdf_salt,
             kdf_mem_kib: fresh.kdf_mem_kib,
             kdf_iters: fresh.kdf_iters,
@@ -561,7 +581,7 @@ mod tests {
             username: account.username.clone(),
             identity_pub: account.identity_pub,
             signing_pub: account.signing_pub,
-            wrapped_secret_keys: account.wrapped_secret_keys.into(),
+            wrapped_secret_keys: account.wrapped_secret_keys,
             kdf_salt: account.kdf_salt,
             kdf_mem_kib: account.kdf_mem_kib,
             kdf_iters: account.kdf_iters,
@@ -581,11 +601,11 @@ mod tests {
     #[test]
     fn device_cache_round_trip_and_challenge() {
         let keys = UnlockedKeys {
-            member_id: MemberId([5u8; 16]),
-            identity_secret: [9u8; 32],
-            identity_pub: X25519Pub([1u8; 32]),
-            signing_seed: [7u8; 32],
-            signing_pub: Ed25519Pub([2u8; 32]),
+            member_id: MemberId::new([5u8; 16]),
+            identity_secret: X25519Secret::new([9u8; 32]),
+            identity_pub: X25519Pub::new([1u8; 32]),
+            signing_seed: Ed25519Signing::from([7u8; 32]),
+            signing_pub: Ed25519Pub::new([2u8; 32]),
             token: "live-token-should-not-be-cached".into(),
         };
 
@@ -597,7 +617,7 @@ mod tests {
 
         let (device_id, device_seed, device_pub) = generate_device_identity();
         let blob =
-            build_device_cache(&recipient, &keys, device_id, device_seed, device_pub).unwrap();
+            build_device_cache(&recipient, &keys, &device_id, &device_seed, &device_pub).unwrap();
 
         // The sealed blob must not be the plaintext, and must not leak the token.
         assert!(!blob.windows(9).any(|w| w == b"live-toke"));
@@ -612,20 +632,18 @@ mod tests {
         // The device-auth key signs a challenge that verifies against device_pub,
         // exactly as the server will verify it.
         use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-        let member_uuid = Uuid::from_bytes(keys.member_id.0);
-        let device_uuid = Uuid::from_bytes(device_id);
-        let nonce = [42u8; 32];
+        let nonce = Nonce::generate(&mut OsRng);
         let sig = crypto::sign_device_challenge(
             &recovered.device_signing_seed,
-            &member_uuid,
-            &device_uuid,
+            &keys.member_id,
+            &device_id,
             &nonce,
         );
         let vk = VerifyingKey::from_bytes(&recovered.device_signing_pub).unwrap();
         let msg = todoers_types::device_challenge_view(
             todoers_types::DEVICE_CHALLENGE_VERSION,
-            &member_uuid,
-            &device_uuid,
+            &keys.member_id,
+            &device_id,
             &nonce,
         );
         assert!(vk.verify(&msg, &Signature::from_bytes(&sig)).is_ok());
@@ -649,7 +667,7 @@ mod tests {
             &setup,
             RegistrationRequest::<SharedCipherSuite>::deserialize(&start_req.registration_req)
                 .unwrap(),
-            member_id.as_bytes(),
+            member_id.as_ref(),
         )
         .unwrap();
         let (finish_req, _account) = register_finish(
@@ -672,7 +690,7 @@ mod tests {
             Some(password_file),
             CredentialRequest::<SharedCipherSuite>::deserialize(&lstart_req.credential_req)
                 .unwrap(),
-            member_id.as_bytes(),
+            member_id.as_ref(),
             ServerLoginParameters::default(),
         )
         .unwrap();

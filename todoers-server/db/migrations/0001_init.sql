@@ -1,4 +1,4 @@
--- ============================================================================
+-- =====================trusted_device_keys=======================================================
 -- Zero-knowledge shared todo app — PostgreSQL schema.
 --
 -- BLINDNESS CONTRACT: the database stores no plaintext. Columns ending in
@@ -6,9 +6,7 @@
 -- column is opaque bytes the server cannot interpret. List content, DEKs,
 -- private keys, and passwords never touch this DB in the clear.
 --
--- 16-byte identifiers are stored as UUID (a UUID is exactly 16 bytes and maps
--- cleanly to [u8 16] / uuid::Uuid). member_id is the client-derived hash of a
--- user's identity_pub it is not a real RFC-4122 UUID, just an opaque 16 bytes.
+-- member_id is the client-derived hash of a user's identity_pub
 -- ============================================================================
 
 CREATE EXTENSION IF NOT EXISTS "moddatetime";
@@ -27,7 +25,7 @@ $$;
 -- a master key derived from the OPAQUE export_key, so the server stays blind.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS users (
-    member_id           UUID PRIMARY KEY,
+    member_id           BYTEA PRIMARY KEY CHECK (octet_length(member_id) = 16), 
     username            TEXT NOT NULL UNIQUE,                       -- OPAQUE login lookup handle
     identity_pub        BYTEA NOT NULL UNIQUE CHECK (octet_length(identity_pub) = 32),  -- X25519 DEKs sealed to this
     signing_pub         BYTEA NOT NULL UNIQUE CHECK (octet_length(signing_pub) = 32),   -- Ed25519 verifies updates
@@ -51,7 +49,8 @@ CREATE OR REPLACE TRIGGER users_set_updated_at BEFORE UPDATE ON users
 -- ---------------------------------------------------------------------------
 CREATE UNLOGGED TABLE IF NOT EXISTS login_cache (
     login_id   UUID PRIMARY KEY,
-    member_id  UUID,
+    -- NULL on the enumeration-resistant unknown-user path (that login can never finish).
+    member_id  BYTEA REFERENCES users(member_id) ON DELETE CASCADE,
     state      BYTEA NOT NULL, -- OPAQUE server login state
     expires_at TIMESTAMPTZ NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -73,21 +72,23 @@ SELECT pg_prewarm('login_cache');
 -- request and looks the row up by `token_hash`.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS sessions (
-    token_hash BYTEA PRIMARY KEY,                 -- hash of the bearer token, never the token
-    member_id  UUID NOT NULL REFERENCES users(member_id) ON DELETE CASCADE,
+    token_hash BYTEA PRIMARY KEY CHECK (octet_length(token_hash) = 64), -- SHA-512 hash of the bearer token, never the token
+    member_id  BYTEA NOT NULL REFERENCES users(member_id) ON DELETE CASCADE,
+    device_id  BYTEA CHECK (octet_length(device_id) = 16), -- NULL = password login
     expires_at TIMESTAMPTZ NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 -- Serves the periodic cleanup of expired sessions.
 CREATE INDEX IF NOT EXISTS sessions_by_expires_at ON sessions (expires_at);
+CREATE INDEX IF NOT EXISTS sessions_by_member_device ON sessions (member_id, device_id);
 
 -- ---------------------------------------------------------------------------
 -- lists — the list itself. current_epoch is the DEK generation new updates are
 -- written under. encrypted_name is AEAD'd under the current DEK (nullable).
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS lists (
-    list_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    list_id        BYTEA PRIMARY KEY CHECK (octet_length(list_id) = 16), -- client-generated, opaque
     current_epoch  BIGINT NOT NULL DEFAULT 1 CHECK (current_epoch >= 1),
     encrypted_name BYTEA,
     created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -102,8 +103,8 @@ CREATE OR REPLACE TRIGGER lists_set_updated_at BEFORE UPDATE ON lists
 -- cleartext metadata (an inherent E2EE leak see the threat-model note).
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS list_members (
-    list_id    UUID NOT NULL REFERENCES lists(list_id) ON DELETE CASCADE,
-    member_id  UUID NOT NULL REFERENCES users(member_id) ON DELETE CASCADE,
+    list_id    BYTEA NOT NULL REFERENCES lists(list_id) ON DELETE CASCADE,
+    member_id  BYTEA NOT NULL REFERENCES users(member_id) ON DELETE CASCADE,
     role       member_role NOT NULL DEFAULT 'member',
     added_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (list_id, member_id)
@@ -117,9 +118,9 @@ CREATE INDEX IF NOT EXISTS list_members_by_member ON list_members (member_id);
 -- epochs. A returning client fetches exactly the epochs still live in the log.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS key_slots (
-    list_id     UUID NOT NULL REFERENCES lists(list_id) ON DELETE CASCADE,
+    list_id     BYTEA NOT NULL REFERENCES lists(list_id) ON DELETE CASCADE,
     epoch       BIGINT NOT NULL CHECK (epoch >= 1),
-    member_id   UUID NOT NULL REFERENCES users(member_id) ON DELETE CASCADE,
+    member_id   BYTEA NOT NULL REFERENCES users(member_id) ON DELETE CASCADE,
     wrapped_dek BYTEA NOT NULL,                                    -- sealed_box(DEK[epoch], member.identity_pub)
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (list_id, epoch, member_id)
@@ -136,9 +137,9 @@ CREATE INDEX IF NOT EXISTS key_slots_fetch ON key_slots (list_id, member_id);
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS updates (
     seq        BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    list_id    UUID NOT NULL REFERENCES lists(list_id) ON DELETE CASCADE,
+    list_id    BYTEA NOT NULL REFERENCES lists(list_id) ON DELETE CASCADE,
     epoch      BIGINT NOT NULL CHECK (epoch >= 1),
-    author     UUID NOT NULL REFERENCES users(member_id) ON DELETE RESTRICT,
+    author     BYTEA NOT NULL REFERENCES users(member_id) ON DELETE RESTRICT,
     nonce      BYTEA NOT NULL CHECK (octet_length(nonce) = 24),   -- XChaCha20-Poly1305
     ciphertext BYTEA NOT NULL,                                    -- AEAD(DEK[epoch]) of a Loro binary update
     signature  BYTEA NOT NULL CHECK (octet_length(signature) = 64),
@@ -157,7 +158,7 @@ CREATE INDEX IF NOT EXISTS updates_pull ON updates (list_id, seq);
 -- compaction time so a new member needs only the current DEK to read history.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS snapshots (
-    list_id     UUID PRIMARY KEY REFERENCES lists(list_id) ON DELETE CASCADE,
+    list_id     BYTEA PRIMARY KEY REFERENCES lists(list_id) ON DELETE CASCADE,
     epoch       BIGINT NOT NULL CHECK (epoch >= 1),
     covers_seq  BIGINT NOT NULL DEFAULT 0,
     nonce       BYTEA NOT NULL CHECK (octet_length(nonce) = 24),
@@ -170,6 +171,34 @@ CREATE TABLE IF NOT EXISTS snapshots (
 CREATE OR REPLACE TRIGGER snapshots_set_updated_at BEFORE UPDATE ON snapshots
     FOR EACH ROW EXECUTE FUNCTION moddatetime('updated_at');
 
+-- ============================================================================
+-- Trusted device keys — password-less "device login".
+--
+-- Each device that opts into password-less unlock enrolls a dedicated Ed25519
+-- device-auth public key here. To sync without a password the device proves
+-- possession of the matching private key via a signed challenge (see the
+-- /v1/auth/device-login/* endpoints). Removing (revoking) a row makes the server
+-- reject that device, even if its on-disk encrypted key cache was compromised.
+--
+-- BLINDNESS CONTRACT: device_signing_pub is a PUBLIC key — like users.signing_pub
+-- it reveals no list content, so storing it in the clear does not weaken the
+-- zero-knowledge model. The server only ever verifies signatures with it.
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS trusted_device_keys (
+    member_id          BYTEA NOT NULL REFERENCES users(member_id) ON DELETE CASCADE,
+    device_id          BYTEA NOT NULL CHECK (octet_length(device_id) = 16), -- client-generated, opaque
+    device_signing_pub BYTEA NOT NULL CHECK (octet_length(device_signing_pub) = 32),  -- Ed25519, public
+    label              TEXT NOT NULL DEFAULT '',                               -- human label, not a secret
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    revoked_at         TIMESTAMPTZ,                                            -- NULL = active
+    PRIMARY KEY (member_id, device_id)
+);
+
+CREATE INDEX IF NOT EXISTS trusted_device_keys_by_member ON trusted_device_keys (member_id);
+
+
+COMMENT ON TABLE trusted_device_keys IS 'Per-device Ed25519 public keys for password-less device login; revoke a row to reject a lost/compromised device.';
 COMMENT ON COLUMN users.wrapped_secret_keys IS 'X25519+Ed25519 private keys sealed under the OPAQUE export_key-derived master key - server-blind.';
 COMMENT ON COLUMN updates.seq IS 'Global append order. Per-list pull = WHERE list_id=arg1 AND seq>arg2 ORDER BY seq.';
 COMMENT ON TABLE  snapshots IS 'One compacted snapshot per list - replaces updates with seq <= covers_seq.';
+COMMENT ON COLUMN sessions.device_id IS 'Device that minted this session (NULL = password login). Lets revocation kill device sessions and gates step-up auth.';

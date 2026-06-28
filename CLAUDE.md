@@ -182,9 +182,10 @@ and also forwards each action to the active component's `update`. Components imp
 
 ## Conventions
 
-- Byte fields cross the JSON wire base64-encoded via the `b64`/`b6416`/`b6424`/`b6432`/`b6464`
-  serde helper modules in `todoers-types`. (The header note flags octet-stream as a future
-  optimization — the current API is JSON-inspectable.)
+- The HTTP/WS wire is **postcard** (binary): requests/responses are `postcard::to_stdvec` /
+  `from_bytes` of the `todoers-types` DTOs — no `axum::Json`, not base64-JSON. Client `net/`
+  calls funnel through the `req` / `decode` / `unit` helpers in `todoers-client/src/net/mod.rs`;
+  reuse them instead of re-inlining the send → `error_for_status` → decode chain.
 - 16-byte ids are stored as Postgres `UUID` / sqlx `Uuid` (a `member_id` is an opaque 16 bytes,
   not a real RFC-4122 UUID). SQLite stores ids/keys as length-checked `BLOB`s.
 - DEKs and secret keys use `zeroize`; the `Dek` type zeroes on drop.

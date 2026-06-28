@@ -3,39 +3,60 @@
 //! Offline members are not this layer's concern — they catch up via the pull
 //! endpoint on (re)connect.
 
+use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, State};
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::broadcast::error::RecvError;
-use uuid::Uuid;
 
-use crate::error::AppError;
+use todoers_types::{ListId, MemberId};
+
 use crate::state::AppState;
 
 use super::auth::AuthMember;
 
-/// `GET /v1/lists/{list_id}/ws`. Registered with `any()` so the upgrade works
-/// over both HTTP/1.1 (GET) and HTTP/2 (CONNECT).
+/// `GET /v1/lists/ws`. Registered with `any()` so the upgrade works over both
+/// HTTP/1.1 (GET) and HTTP/2 (CONNECT). The list to subscribe to arrives as the
+/// first postcard frame after the upgrade (paths carry no ids).
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
-    Path(list_id): Path<Uuid>,
     auth: AuthMember,
 ) -> Response {
-    // A valid token is not enough: only members of THIS list may attach to its
-    // stream, otherwise any authenticated user could tap any list's fanout.
-    match state.db.member_role(list_id, auth.member_id).await {
-        Ok(Some(_)) => ws.on_upgrade(move |socket| handle_socket(socket, state, list_id)),
-        Ok(None) => AppError::Forbidden("not a member of this list".into()).into_response(),
-        Err(e) => e.into_response(),
-    }
+    ws.on_upgrade(move |socket| handle_socket(socket, state, auth.member_id))
 }
 
-async fn handle_socket(socket: WebSocket, state: AppState, list_id: Uuid) {
-    let tx = state.hub.sender(list_id);
-    let mut rx = tx.subscribe();
+async fn handle_socket(socket: WebSocket, state: AppState, member_id: MemberId) {
     let (mut sink, mut stream) = socket.split();
+
+    // First frame names the list (postcard `ListId`). A malformed/missing frame
+    // or a non-member just gets the stream closed.
+    let list_id: ListId = match stream.next().await {
+        Some(Ok(Message::Binary(buf))) => match postcard::from_bytes(&buf) {
+            Ok(id) => id,
+            Err(_) => {
+                let _ = sink.send(Message::Close(None)).await;
+                return;
+            }
+        },
+        _ => {
+            let _ = sink.send(Message::Close(None)).await;
+            return;
+        }
+    };
+
+    // A valid token is not enough: only members of THIS list may attach to its
+    // stream, otherwise any authenticated user could tap any list's fanout.
+    if !matches!(
+        state.db.member_role(&list_id, &member_id).await,
+        Ok(Some(_))
+    ) {
+        let _ = sink.send(Message::Close(None)).await;
+        return;
+    }
+
+    let tx = state.hub.sender(&list_id);
+    let mut rx = tx.subscribe();
 
     // Pump broadcast -> client.
     let mut forward = tokio::spawn(async move {

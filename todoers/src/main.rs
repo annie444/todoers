@@ -13,10 +13,8 @@ mod components;
 mod config;
 mod error;
 mod logging;
-mod store;
-mod store_worker;
-mod sync;
 mod tui;
+mod view;
 
 use crate::app::App;
 use crate::cli::{Cli, Commands, LOGO};

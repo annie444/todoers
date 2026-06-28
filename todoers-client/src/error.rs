@@ -14,10 +14,12 @@ pub enum TodoersError {
     Header(#[from] http::header::InvalidHeaderValue),
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("postcard error: {0}")]
+    Postcard(#[from] postcard::Error),
     #[error("error generating key")]
     Aead,
     #[error("device key vault error: {0}")]
-    DeviceVault(std::string::String),
+    DeviceVault(String),
     #[error("API client error: {0}")]
     Reqwest(#[from] reqwest::Error),
     #[error("online login failed: {0}")]
@@ -68,4 +70,12 @@ pub enum TodoersError {
     NoPassword,
     #[error("invalid database key length")]
     InvalidKeyLength,
+    #[error("unknown list")]
+    UnknownList,
+    #[error("no DEK for current epoch")]
+    NoDek,
+    #[error("doc not open")]
+    DocNotOpen,
+    #[error("bad key size: {0}")]
+    BadSize(String),
 }

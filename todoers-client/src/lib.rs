@@ -8,6 +8,9 @@ pub mod model;
 pub mod net;
 pub mod session;
 pub mod sqlcipher;
+pub mod store;
+pub mod sync;
+pub mod worker;
 
 use std::env;
 use std::path::PathBuf;

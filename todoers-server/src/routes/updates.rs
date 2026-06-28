@@ -1,27 +1,27 @@
 //! HTTP handlers for list updates: append and pull.
 
-use axum::Json;
-use axum::extract::{Path, Query, State};
+use axum::body::Bytes;
+use axum::extract::State;
 use axum::http::StatusCode;
-use bytes::Bytes;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-use uuid::Uuid;
 
-use todoers_types::{AppendResult, AppendUpdate, PullParams, StoredUpdateDto};
+use todoers_types::{AppendResult, AppendUpdate, ListId, PullParams, StoredUpdateDto};
 
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
 
 use super::auth::AuthMember;
 
-/// `POST /v1/lists/{list_id}/updates` — append one signed, encrypted update.
+/// `POST /v1/lists/updates` — append one signed, encrypted update. `list_id`
+/// rides in the postcard body.
 pub async fn append_update(
     State(state): State<AppState>,
-    Path(list_id): Path<Uuid>,
     auth: AuthMember,
-    Json(body): Json<AppendUpdate>,
-) -> AppResult<(StatusCode, Json<AppendResult>)> {
-    // Basic shape checks the JSON layer can't enforce.
+    bytes: Bytes,
+) -> AppResult<(StatusCode, Bytes)> {
+    let body: AppendUpdate = postcard::from_bytes(&bytes)?;
+    let list_id = body.list_id;
+    // Basic shape checks the wire layer can't enforce.
     if body.nonce.len() != 24 {
         return Err(AppError::BadRequest("nonce must be 24 bytes".into()));
     }
@@ -38,7 +38,7 @@ pub async fn append_update(
     if state.verify_signatures {
         let signing_pub = state
             .db
-            .fetch_author_signing_pub(list_id, body.author)
+            .fetch_author_signing_pub(&list_id, &body.author)
             .await?
             .ok_or(AppError::InvalidSignature)?;
 
@@ -48,9 +48,9 @@ pub async fn append_update(
     let seq = state
         .db
         .insert_update(
-            list_id,
+            &list_id,
             body.epoch,
-            body.author,
+            &body.author,
             &body.nonce,
             &body.ciphertext,
             &body.signature,
@@ -58,7 +58,7 @@ pub async fn append_update(
         .await?;
 
     // Fan out to online members. We re-serialize the stored shape so WS and
-    // pull deliver identical bytes.
+    // pull deliver identical (postcard) bytes.
     let stored = StoredUpdateDto {
         seq,
         epoch: body.epoch,
@@ -67,20 +67,23 @@ pub async fn append_update(
         ciphertext: body.ciphertext,
         signature: body.signature,
     };
-    if let Ok(json) = serde_json::to_vec(&stored) {
+    if let Ok(frame) = postcard::to_stdvec(&stored) {
         state.hub.publish(
-            list_id,
-            axum::extract::ws::Message::Binary(Bytes::from(json)),
+            &list_id,
+            axum::extract::ws::Message::Binary(Bytes::from(frame)),
         );
     }
 
-    Ok((StatusCode::CREATED, Json(AppendResult { seq })))
+    Ok((
+        StatusCode::CREATED,
+        Bytes::from(postcard::to_stdvec(&AppendResult { seq })?),
+    ))
 }
 
 fn verify_update_signature(
     signing_pub: &[u8],
     body: &AppendUpdate,
-    list_id: &Uuid,
+    list_id: &ListId,
 ) -> AppResult<()> {
     let vk_bytes: [u8; 32] = signing_pub
         .try_into()
@@ -107,16 +110,17 @@ fn verify_update_signature(
         .map_err(|_| AppError::InvalidSignature)
 }
 
-/// `GET /v1/lists/{list_id}/updates?after=N&limit=M`
+/// `PUT /v1/lists/updates` — pull updates after a cursor. `list_id`, `after`,
+/// and `limit` all ride in the postcard `PullParams` body.
 pub async fn pull_updates(
     State(state): State<AppState>,
-    Path(list_id): Path<Uuid>,
     _auth: AuthMember,
-    Query(params): Query<PullParams>,
-) -> AppResult<Json<Vec<StoredUpdateDto>>> {
+    bytes: Bytes,
+) -> AppResult<Bytes> {
+    let params: PullParams = postcard::from_bytes(&bytes)?;
     let rows = state
         .db
-        .fetch_updates_after(list_id, params.after, params.limit)
+        .fetch_updates_after(&params.list_id, params.after, params.limit)
         .await?;
-    Ok(Json(rows))
+    Ok(Bytes::from(postcard::to_stdvec(&rows)?))
 }

@@ -23,8 +23,13 @@ sqlx = { workspace = true, features = [
 base64 = { workspace = true }
 opaque-ke = { workspace = true }
 oldsha2 = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+x25519-dalek = { workspace = true }
+ed25519-dalek = { workspace = true }
+old_rand_core = { workspace = true }
 
 [features]
-default = ["sqlite"]
-postgres = ["sqlx/postgres", "sqlx/tls-rustls-ring-native-roots"]
+default = []
 sqlite = ["sqlx/sqlite"]
+postgres = ["sqlx/postgres"]

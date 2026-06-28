@@ -133,7 +133,7 @@ impl Component for Members {
                     Role::Owner => "owner ",
                     Role::Member => "member",
                 };
-                let short = hex::encode(m.id.0);
+                let short = hex::encode(m.id.as_ref());
                 let you = if m.id == self.me { "  (you)" } else { "" };
                 ListItem::new(format!(" {role}  {}…{you}", &short[..8]))
             })

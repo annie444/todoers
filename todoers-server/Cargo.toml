@@ -32,6 +32,7 @@ config = { workspace = true }
 serde_arrays = { workspace = true }
 serde_json = { workspace = true }
 dashmap = { workspace = true }
+x25519-dalek = { workspace = true }
 ed25519-dalek = { workspace = true }
 chacha20poly1305 = { workspace = true }
 getrandom = { workspace = true }
@@ -52,6 +53,7 @@ tokio-util = { workspace = true }
 humantime-serde = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }
+postcard = { workspace = true }
 
 [dev-dependencies]
 axum-test = { workspace = true }

@@ -10,7 +10,7 @@ use todoers_types::ListId;
 use super::{Captures, Component};
 use crate::action::{Action, DeleteTarget};
 use crate::config::{Config, IconType, KeyContext, compile_keymap, parse_command, resolve};
-use crate::store::SharedView;
+use crate::view::SharedView;
 
 /// The workspace's key-triggerable operations. Bound to keys via
 /// `[keybindings.home]`; the component resolves a key to one of these and runs

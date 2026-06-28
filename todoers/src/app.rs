@@ -17,9 +17,12 @@ use todoers_client::auth::{self, AccountRow, UnlockedKeys};
 use todoers_client::db::Db;
 use todoers_client::model::TodoItem;
 use todoers_client::model::{MetaList, ViewTarget};
-use todoers_client::net;
+use todoers_client::net::Net;
 use todoers_client::session::Session;
-use todoers_types::{ListId, Member, MemberId};
+use todoers_client::store::Store;
+use todoers_client::sync::SyncEngine;
+use todoers_client::worker::{CommandTx, StoreCommand, WorkerMsg, WorkerRx, run_store_worker};
+use todoers_types::{ListId, Member, MemberId, Role};
 
 use crate::action::{Action, DeleteTarget};
 #[cfg(feature = "fps")]
@@ -29,14 +32,13 @@ use crate::components::{
     Modal, Prompt, Register, ShareForm, TodoForm, Unlock,
 };
 use crate::config::{Config, KeyContext, compile_keymap, parse_command, resolve};
-use crate::store::{SharedView, Store, ViewModel};
-use crate::store_worker::{CommandTx, StoreCommand, WorkerMsg, WorkerRx, run_store_worker};
-use crate::sync::SyncCommand;
 use crate::tui::{Event, Tui};
+use crate::view::{SharedView, ViewModel};
 
 pub struct App {
     config: Config,
     db: Db,
+    net: Net,
     account: Option<Zeroizing<AccountRow>>,
     modes: HashMap<Mode, Box<dyn Component>, BuildNoHashHasher<u8>>,
     should_quit: bool,
@@ -76,6 +78,12 @@ pub struct App {
     cmd_tx: Option<CommandTx>,
     /// Replies from the worker (chiefly [`ViewSnapshot`](crate::store_worker::ViewSnapshot)s).
     worker_rx: Option<WorkerRx>,
+    /// Background task handles for the store worker and the sync engine. Kept so
+    /// quit can abort them: `SyncEngine` holds a clone of its own command sender,
+    /// so its channel never closes on its own — dropping the App's handles is not
+    /// enough to end `run_sync`.
+    store_task: Option<tokio::task::JoinHandle<()>>,
+    sync_task: Option<tokio::task::JoinHandle<()>>,
     /// Stashed while waiting on the worker so the modal can be opened on the next
     /// `dispatch_action` pass (which has `tui`). See [`Self::handle_worker_msg`].
     pending_edit: Option<(ListId, TodoItem)>,
@@ -153,21 +161,10 @@ async fn recv_opt(rx: &mut Option<WorkerRx>) -> Option<WorkerMsg> {
 /// Convert a `users/{username}/pubkeys` response into a [`Member`] to seal a list
 /// DEK to. Rejects keys of the wrong length rather than panicking.
 fn resolved_member(dto: todoers_types::UserPubkeysDto) -> anyhow::Result<todoers_types::Member> {
-    use todoers_types::{Ed25519Pub, Member, MemberId, Role, X25519Pub};
-    let identity_pub: [u8; 32] = dto
-        .identity_pub
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("bad identity key length"))?;
-    let signing_pub: [u8; 32] = dto
-        .signing_pub
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("bad signing key length"))?;
     Ok(Member {
-        id: MemberId(*dto.member_id.as_bytes()),
-        identity_pub: X25519Pub(identity_pub),
-        signing_pub: Ed25519Pub(signing_pub),
+        id: dto.member_id,
+        identity_pub: dto.identity_pub,
+        signing_pub: dto.signing_pub,
         role: Role::Member,
     })
 }
@@ -182,6 +179,7 @@ impl App {
     ) -> anyhow::Result<Self> {
         let (action_tx, action_rx) = mpsc::unbounded_channel();
         let view: SharedView = Rc::new(RefCell::new(ViewModel::default()));
+        let net = Net::new(config.config.server_url.clone())?;
         let mut modes: HashMap<Mode, Box<dyn Component>, BuildNoHashHasher<u8>> =
             HashMap::with_capacity_and_hasher(1, BuildNoHashHasher::default());
         modes.insert(Mode::Home, Box::new(Home::new(view.clone())));
@@ -190,31 +188,34 @@ impl App {
             parse_command::<Action>,
         );
         Ok(Self {
+            net,
             modes,
             global_keys,
-            mode: Mode::default(),
-            prev_mode: Mode::default(),
-            should_quit: false,
-            should_suspend: false,
-            capturing: false,
-            modal: None,
             config,
             db,
-            last_tick_key_events: Vec::new(),
             action_tx,
             action_rx,
-            keys: Keys::new(Mode::default()),
             acct_keys,
             account,
-            errorbar: ErrorBar::new(),
+            view,
             account_verified: false,
             account_checked: false,
             device_unlock_attempted: false,
             cmd_tx: None,
             worker_rx: None,
+            store_task: None,
+            sync_task: None,
             pending_edit: None,
             pending_members: None,
-            view,
+            should_quit: false,
+            should_suspend: false,
+            capturing: false,
+            modal: None,
+            mode: Mode::default(),
+            prev_mode: Mode::default(),
+            last_tick_key_events: Vec::new(),
+            keys: Keys::new(Mode::default()),
+            errorbar: ErrorBar::new(),
             #[cfg(feature = "fps")]
             fps: FpsCounter::new(),
         })
@@ -248,20 +249,29 @@ impl App {
         let (sync_tx, sync_rx) = mpsc::unbounded_channel();
 
         store.set_sync_tx(sync_tx.clone());
-        tokio::spawn(run_store_worker(store, cmd_rx, out_tx));
-        tokio::spawn(crate::sync::run_sync(
-            base_url,
-            token,
-            self.db.clone(),
-            cmd_tx.clone(),
-            sync_tx.clone(),
-            sync_rx,
-        ));
-        // Discover lists we belong to, pull their logs, and go live.
-        let _ = sync_tx.send(SyncCommand::InitialSync);
+        let sync_db = self.db.clone();
+        let sync_cmd_tx = cmd_tx.clone();
+        let sync_sync_tx = sync_tx.clone();
+
+        // Build the engine up front so a construction error propagates here
+        // (rather than being swallowed inside the spawned task's `?`).
+        let mut sync =
+            SyncEngine::new(base_url, token, sync_db, sync_cmd_tx, sync_sync_tx, sync_rx)?;
+
+        let store_task = tokio::spawn(run_store_worker(store, cmd_rx, out_tx));
+        // Run the engine off-loop; an early exit means a real failure (the engine
+        // self-kicks InitialSync and otherwise loops forever), so surface it.
+        let err_tx = self.action_tx.clone();
+        let sync_task = tokio::spawn(async move {
+            if let Err(e) = sync.run_sync().await {
+                let _ = err_tx.send(Action::Error(format!("Sync engine stopped: {e:#}")));
+            }
+        });
 
         self.cmd_tx = Some(cmd_tx);
         self.worker_rx = Some(out_rx);
+        self.store_task = Some(store_task);
+        self.sync_task = Some(sync_task);
 
         // Prime the worker with the initial pane targets + sort from the view-model.
         self.send_set_view();
@@ -298,8 +308,7 @@ impl App {
         if keys.token.is_empty() {
             return;
         }
-        let base = self.config.config.server_url.clone();
-        if let Err(e) = net::auth::logout(&base, &keys.token).await {
+        if let Err(e) = self.net.logout(&keys.token).await {
             tracing::warn!(error = ?e, "logout on exit failed");
         }
     }
@@ -373,6 +382,14 @@ impl App {
             } else if self.should_quit {
                 tui.stop()?;
                 self.logout_best_effort().await;
+                // Stop the background tasks. `SyncEngine` holds a clone of its own
+                // command sender, so its channel never closes on its own — abort.
+                if let Some(t) = self.sync_task.take() {
+                    t.abort();
+                }
+                if let Some(t) = self.store_task.take() {
+                    t.abort();
+                }
                 break;
             }
         }
@@ -594,8 +611,8 @@ impl App {
                 // prompt. Runs off the UI loop; result returns as actions.
                 let tx = self.action_tx.clone();
                 let db = self.db.clone();
-                let base_url = self.config.config.server_url.clone();
                 let du = self.config.config.device_unlock.clone();
+                let net = self.net.clone();
                 tokio::spawn(async move {
                     let attempt = async {
                         let (device_id, blob) = db
@@ -605,10 +622,7 @@ impl App {
                         let identity = du.identity.clone().ok_or_else(|| {
                             anyhow::anyhow!("no device-unlock identity configured")
                         })?;
-                        anyhow::Ok(
-                            net::auth::unlock_via_device(&base_url, &identity, device_id, blob)
-                                .await?,
-                        )
+                        anyhow::Ok(net.unlock_via_device(&identity, &device_id, blob).await?)
                     }
                     .await;
                     match attempt {
@@ -632,11 +646,11 @@ impl App {
                 // results come back as actions (Error, or StopCapture+SetMode).
                 let tx = self.action_tx.clone();
                 let db = self.db.clone();
-                let base_url = self.config.config.server_url.clone();
                 let username = username.clone();
                 let password = password.clone();
+                let net = self.net.clone();
                 tokio::spawn(async move {
-                    match net::auth::register(&base_url, &username, &password).await {
+                    match net.register(&username, &password).await {
                         Ok(account) => match db.save_account(&account).await {
                             Ok(()) => {
                                 let _ = tx.send(Action::StopCapture);
@@ -872,7 +886,6 @@ impl App {
                 // Resolving a username to keys is the one networked step;
                 // run it off the loop and feed the member back as an action.
                 let tx = self.action_tx.clone();
-                let base_url = self.config.config.server_url.clone();
                 // The worker owns the session now; the bearer token also lives in
                 // the unlocked account keys.
                 let token = self
@@ -881,8 +894,9 @@ impl App {
                     .map(|k| k.token.clone())
                     .unwrap_or_default();
                 let username = username.clone();
+                let net = self.net.clone();
                 tokio::spawn(async move {
-                    match net::auth::lookup_pubkeys(&base_url, &token, &username).await {
+                    match net.lookup_pubkeys(&token, &username).await {
                         Ok(dto) => match resolved_member(dto) {
                             Ok(member) => {
                                 let _ = tx.send(Action::AddResolvedMember { list_id, member });
@@ -1122,11 +1136,11 @@ impl App {
         // Drive the networked OPAQUE login off the UI loop; results
         // come back as actions (Error, or Keys+StopCapture+SetMode).
         let tx = self.action_tx.clone();
-        let base_url = self.config.config.server_url.clone();
         let db = self.db.clone();
         let du = self.config.config.device_unlock.clone();
         let username = username.clone();
         let password = password.clone();
+        let net = self.net.clone();
         tokio::spawn(async move {
             // Online login needs NO local account — it recovers the
             // keys from the server escrow. A local account (if any)
@@ -1138,14 +1152,13 @@ impl App {
                     return;
                 }
             };
-            let keys =
-                match net::auth::login(&base_url, &username, &password, account.as_ref()).await {
-                    Ok(keys) => keys,
-                    Err(e) => {
-                        let _ = tx.send(Action::Error(format!("Login failed: {e}")));
-                        return;
-                    }
-                };
+            let keys = match net.login(&username, &password, account.as_ref()).await {
+                Ok(keys) => keys,
+                Err(e) => {
+                    let _ = tx.send(Action::Error(format!("Login failed: {e}")));
+                    return;
+                }
+            };
             // First login on this device → persist a local account so
             // future launches recognize us and offline unlock works.
             // Argon2id is CPU-bound, so wrap off the async worker.
@@ -1186,14 +1199,9 @@ impl App {
                 let already_enrolled = matches!(db.load_device_cache().await, Ok(Some(_)));
                 if !already_enrolled {
                     match du.recipient.as_deref() {
-                        Some(recipient) => match net::auth::enroll_this_device(
-                            &base_url,
-                            &keys.token,
-                            recipient,
-                            &keys,
-                            &username,
-                        )
-                        .await
+                        Some(recipient) => match net
+                            .enroll_this_device(&keys.token, recipient, &keys, &username)
+                            .await
                         {
                             Ok((device_id, blob)) => {
                                 if let Err(e) = db.save_device_cache(&device_id, &blob).await {

@@ -41,6 +41,12 @@ pub enum AppError {
 
     #[error("bad encoding: {0}")]
     Base46(#[from] base64::DecodeError),
+
+    #[error("bad length: {0}")]
+    BadLength(#[from] todoers_types::TypeError),
+
+    #[error("bad request: {0}")]
+    Bytes(#[from] postcard::Error),
 }
 
 impl IntoResponse for AppError {
@@ -83,6 +89,14 @@ impl IntoResponse for AppError {
             AppError::Base46(e) => {
                 error!(error = %e, "base64 decoding error");
                 (StatusCode::BAD_REQUEST, "bad encoding".to_string())
+            }
+            AppError::BadLength(e) => {
+                error!(error = %e, "bad length error");
+                (StatusCode::BAD_REQUEST, "bad length".to_string())
+            }
+            AppError::Bytes(e) => {
+                error!(error = %e, "postcard serialization error");
+                (StatusCode::BAD_REQUEST, "bad request".to_string())
             }
         };
         (status, Json(json!({ "error": msg }))).into_response()

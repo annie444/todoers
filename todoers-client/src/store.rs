@@ -12,73 +12,29 @@
 //! Keeping this dance in one audited place means UI components stay "dumb":
 //! they render data and emit intent, never touching crypto or the wire format.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
-use std::rc::Rc;
 
-use anyhow::Context;
 use loro::VersionVector;
-use ratatui::layout::Direction;
+use old_rand_core::OsRng;
 use time::OffsetDateTime;
-use uuid::Uuid;
 
-use todoers_client::crypto;
-use todoers_client::db::Db;
-use todoers_client::list_doc::TodoDoc;
-use todoers_client::model::{
+use crate::crypto;
+use crate::db::Db;
+use crate::error::{TodoersError, TodoersResult};
+use crate::list_doc::TodoDoc;
+use crate::model::{
     ListSummary, MetaList, Priority, SortMode, TodoItem, TodoItemInput, ViewTarget,
 };
-use todoers_client::session::Session;
-use todoers_types::{Ed25519Pub, Epoch, ListId, Member, MemberId, Role, X25519Pub};
+use crate::session::Session;
+use crate::sync::SyncTx;
+use crate::worker::ViewSnapshot;
+use todoers_types::{
+    Dek, Epoch, KeySlotDto, ListId, Member, MemberId, MetadataResponse, Role, StoredUpdateDto,
+};
 
 /// Signed/AEAD byte-layout version for produced updates. Must match the
-/// `signing_view`/`aead_aad` version on both ends (see [`crate::crypto`]).
+/// `signing_view`/`aead_aad` version on both ends (see [`todoers_client::crypto`]).
 const UPDATE_VERSION: u8 = 1;
-
-/// One open pane: a view target plus its (sorted) items.
-#[derive(Default, Clone)]
-pub struct PaneData {
-    /// The list/meta-list this pane shows (`None` before anything is opened).
-    pub target: Option<ViewTarget>,
-    /// The pane's items, sorted, each tagged with its owning list so commands
-    /// work even in meta-list views (which span lists).
-    pub items: Vec<(ListId, TodoItem)>,
-}
-
-/// The render-side snapshot the UI reads in `draw`. `App` refreshes it after
-/// actions; the workspace component holds a clone of the [`SharedView`] handle.
-/// Single-threaded (the run loop is driven by `block_on`), so `Rc<RefCell>` is
-/// sound — no `Send` is required and net tasks never capture it.
-pub struct ViewModel {
-    /// Sidebar user lists (meta-lists are fixed and not stored here).
-    pub lists: Vec<ListSummary>,
-    /// Active sort applied to items + sidebar aggregates.
-    pub sort: SortMode,
-    /// Open panes (1 or 2). The workspace renders them side-by-side / stacked.
-    pub panes: Vec<PaneData>,
-    /// `None` = single pane; `Some(dir)` = two panes split along `dir`.
-    pub split: Option<Direction>,
-    /// Percent of the area given to the first pane when split (clamped 10..=90).
-    pub ratio: u16,
-}
-
-impl Default for ViewModel {
-    fn default() -> Self {
-        Self {
-            lists: Vec::new(),
-            sort: SortMode::default(),
-            panes: vec![PaneData {
-                target: Some(ViewTarget::Meta(MetaList::AllTasks)),
-                items: Vec::new(),
-            }],
-            split: None,
-            ratio: 50,
-        }
-    }
-}
-
-/// Shared handle to the [`ViewModel`].
-pub type SharedView = Rc<RefCell<ViewModel>>;
 
 /// Owns the session and a cache of open CRDT documents.
 pub struct Store {
@@ -90,7 +46,7 @@ pub struct Store {
     /// Channel to the sync engine. The store produces all server-bound material
     /// (sealed DEKs, signed updates) and hands it here; the sync task does the
     /// I/O. `None` in tests / before the sync task is wired.
-    sync_tx: Option<crate::sync::SyncTx>,
+    sync_tx: Option<SyncTx>,
 }
 
 impl Store {
@@ -105,7 +61,7 @@ impl Store {
 
     /// Attach the sync engine so mutations are pushed to the server. Call once,
     /// right after the sync task is spawned.
-    pub fn set_sync_tx(&mut self, tx: crate::sync::SyncTx) {
+    pub fn set_sync_tx(&mut self, tx: SyncTx) {
         self.sync_tx = Some(tx);
     }
 
@@ -125,20 +81,20 @@ impl Store {
     /// Create a new owned list: mint a DEK (epoch 1) sealed to ourselves, write
     /// the list + self-membership rows, and seed a titled document.
     #[tracing::instrument(skip(self))]
-    pub async fn create_list(&mut self, name: &str) -> anyhow::Result<ListId> {
-        let list_id = ListId(*Uuid::new_v4().as_bytes());
+    pub async fn create_list(&mut self, name: &str) -> TodoersResult<ListId> {
+        let list_id = ListId::generate(&mut OsRng);
         let epoch = 1;
-        let dek = crypto::generate_dek();
+        let dek = Dek::generate(&mut OsRng);
 
         // The list row must exist before rows that FK-reference it (key_slots,
         // list_members, documents).
         self.db
-            .upsert_list(list_id, Role::Owner, epoch, name)
+            .upsert_list(&list_id, Role::Owner, epoch, name)
             .await?;
 
         // Our own wrapped DEK (the only key slot the client persists locally).
         let wrapped = crypto::seal_to(&dek, &self.session.identity_pub());
-        self.db.save_key_slot(list_id, epoch, &wrapped).await?;
+        self.db.save_key_slot(&list_id, epoch, &wrapped).await?;
         self.session.insert_dek(list_id, epoch, dek);
 
         // Create the list server-side under our client-minted id (local-first:
@@ -150,7 +106,7 @@ impl Store {
 
         self.db
             .add_member_row(
-                list_id,
+                &list_id,
                 &Member {
                     id: self.session.member_id(),
                     identity_pub: self.session.identity_pub(),
@@ -165,28 +121,28 @@ impl Store {
         doc.set_title(name)?;
         self.docs.insert(list_id, doc);
         let doc = self.docs.get(&list_id).expect("just inserted");
-        self.persist(list_id, doc, &vv).await?;
+        self.persist(&list_id, doc, &vv).await?;
         Ok(list_id)
     }
 
     #[tracing::instrument(skip(self))]
-    pub async fn rename_list(&mut self, list_id: ListId, name: &str) -> anyhow::Result<()> {
+    pub async fn rename_list(&mut self, list_id: &ListId, name: &str) -> TodoersResult<()> {
         self.db.rename_list(list_id, name).await?;
         self.edit_doc(list_id, |d| d.set_title(name)).await?;
         Ok(())
     }
 
     #[tracing::instrument(skip(self))]
-    pub async fn delete_list(&mut self, list_id: ListId) -> anyhow::Result<()> {
+    pub async fn delete_list(&mut self, list_id: &ListId) -> TodoersResult<()> {
         self.db.delete_list(list_id).await?;
-        self.docs.remove(&list_id);
+        self.docs.remove(list_id);
         Ok(())
     }
 
     /// Sidebar list summaries with aggregates (open count, nearest due, top
     /// priority) computed from the read model.
     #[tracing::instrument(skip(self))]
-    pub async fn list_summaries(&self) -> anyhow::Result<Vec<ListSummary>> {
+    pub async fn list_summaries(&self) -> TodoersResult<Vec<ListSummary>> {
         let lists = self.db.list_lists().await?;
         let all = self.db.load_all_todo_items().await?;
         Ok(lists
@@ -218,35 +174,35 @@ impl Store {
     #[tracing::instrument(skip(self, input))]
     pub async fn add_todo(
         &mut self,
-        list_id: ListId,
+        list_id: &ListId,
         input: &TodoItemInput,
-    ) -> anyhow::Result<String> {
+    ) -> TodoersResult<String> {
         self.edit_doc(list_id, |d| d.add_item(input)).await
     }
 
     #[tracing::instrument(skip(self, input))]
     pub async fn edit_todo(
         &mut self,
-        list_id: ListId,
+        list_id: &ListId,
         item_id: &str,
         input: &TodoItemInput,
-    ) -> anyhow::Result<()> {
+    ) -> TodoersResult<()> {
         self.edit_doc(list_id, |d| d.update_item(item_id, input))
             .await
     }
 
     #[tracing::instrument(skip(self))]
-    pub async fn toggle_done(&mut self, list_id: ListId, item_id: &str) -> anyhow::Result<()> {
+    pub async fn toggle_done(&mut self, list_id: &ListId, item_id: &str) -> TodoersResult<()> {
         self.edit_doc(list_id, |d| d.toggle_done(item_id)).await
     }
 
     #[tracing::instrument(skip(self))]
     pub async fn set_priority(
         &mut self,
-        list_id: ListId,
+        list_id: &ListId,
         item_id: &str,
         priority: Priority,
-    ) -> anyhow::Result<()> {
+    ) -> TodoersResult<()> {
         self.edit_doc(list_id, |d| d.set_priority(item_id, priority))
             .await
     }
@@ -254,55 +210,55 @@ impl Store {
     #[tracing::instrument(skip(self))]
     pub async fn set_due(
         &mut self,
-        list_id: ListId,
+        list_id: &ListId,
         item_id: &str,
         due: Option<OffsetDateTime>,
-    ) -> anyhow::Result<()> {
+    ) -> TodoersResult<()> {
         self.edit_doc(list_id, |d| d.set_due(item_id, due)).await
     }
 
     #[tracing::instrument(skip(self))]
     pub async fn move_todo(
         &mut self,
-        list_id: ListId,
+        list_id: &ListId,
         from: usize,
         to: usize,
-    ) -> anyhow::Result<()> {
+    ) -> TodoersResult<()> {
         self.edit_doc(list_id, |d| d.move_item(from, to)).await
     }
 
     #[tracing::instrument(skip(self))]
-    pub async fn delete_todo(&mut self, list_id: ListId, item_id: &str) -> anyhow::Result<()> {
+    pub async fn delete_todo(&mut self, list_id: &ListId, item_id: &str) -> TodoersResult<()> {
         self.edit_doc(list_id, |d| d.remove_item(item_id)).await
     }
 
     #[tracing::instrument(skip(self))]
     pub async fn add_tag(
         &mut self,
-        list_id: ListId,
+        list_id: &ListId,
         item_id: &str,
         tag: &str,
-    ) -> anyhow::Result<()> {
+    ) -> TodoersResult<()> {
         self.edit_doc(list_id, |d| d.add_tag(item_id, tag)).await
     }
 
     #[tracing::instrument(skip(self))]
     pub async fn remove_tag(
         &mut self,
-        list_id: ListId,
+        list_id: &ListId,
         item_id: &str,
         tag: &str,
-    ) -> anyhow::Result<()> {
+    ) -> TodoersResult<()> {
         self.edit_doc(list_id, |d| d.remove_tag(item_id, tag)).await
     }
 
     #[tracing::instrument(skip(self))]
     pub async fn add_subtask(
         &mut self,
-        list_id: ListId,
+        list_id: &ListId,
         item_id: &str,
         title: &str,
-    ) -> anyhow::Result<String> {
+    ) -> TodoersResult<String> {
         self.edit_doc(list_id, |d| d.add_subtask(item_id, title))
             .await
     }
@@ -310,10 +266,10 @@ impl Store {
     #[tracing::instrument(skip(self))]
     pub async fn toggle_subtask(
         &mut self,
-        list_id: ListId,
+        list_id: &ListId,
         item_id: &str,
         subtask_id: &str,
-    ) -> anyhow::Result<()> {
+    ) -> TodoersResult<()> {
         self.edit_doc(list_id, |d| d.toggle_subtask(item_id, subtask_id))
             .await
     }
@@ -321,10 +277,10 @@ impl Store {
     #[tracing::instrument(skip(self))]
     pub async fn remove_subtask(
         &mut self,
-        list_id: ListId,
+        list_id: &ListId,
         item_id: &str,
         subtask_id: &str,
-    ) -> anyhow::Result<()> {
+    ) -> TodoersResult<()> {
         self.edit_doc(list_id, |d| d.remove_subtask(item_id, subtask_id))
             .await
     }
@@ -338,17 +294,17 @@ impl Store {
         &self,
         targets: &[Option<ViewTarget>],
         sort: SortMode,
-    ) -> anyhow::Result<crate::store_worker::ViewSnapshot> {
+    ) -> TodoersResult<ViewSnapshot> {
         let mut lists = self.list_summaries().await?;
         sort_summaries(&mut lists, sort);
         let mut panes = Vec::with_capacity(targets.len());
         for t in targets {
             panes.push(match t {
-                Some(target) => self.load_view(*target, sort).await?,
+                Some(target) => self.load_view(target, sort).await?,
                 None => Vec::new(),
             });
         }
-        Ok(crate::store_worker::ViewSnapshot { lists, panes })
+        Ok(ViewSnapshot { lists, panes })
     }
 
     // ── reads ─────────────────────────────────────────────────────────────────
@@ -358,16 +314,16 @@ impl Store {
     #[tracing::instrument(skip(self))]
     pub async fn load_view(
         &self,
-        target: ViewTarget,
+        target: &ViewTarget,
         sort: SortMode,
-    ) -> anyhow::Result<Vec<(ListId, TodoItem)>> {
+    ) -> TodoersResult<Vec<(ListId, TodoItem)>> {
         let mut items: Vec<(ListId, TodoItem)> = match target {
             ViewTarget::List(id) => self
                 .db
                 .load_todo_items(id)
                 .await?
                 .into_iter()
-                .map(|it| (id, it))
+                .map(|it| (*id, it))
                 .collect(),
             ViewTarget::Meta(meta) => {
                 let now = OffsetDateTime::now_utc();
@@ -387,16 +343,16 @@ impl Store {
     #[tracing::instrument(skip(self))]
     pub async fn full_item(
         &mut self,
-        list_id: ListId,
+        list_id: &ListId,
         item_id: &str,
-    ) -> anyhow::Result<Option<TodoItem>> {
+    ) -> TodoersResult<Option<TodoItem>> {
         self.ensure_doc(list_id).await?;
-        let doc = self.docs.get(&list_id).expect("ensured");
+        let doc = self.docs.get(list_id).expect("ensured");
         Ok(doc.items().into_iter().find(|i| i.id == item_id))
     }
 
     #[tracing::instrument(skip(self))]
-    pub async fn members(&self, list_id: ListId) -> anyhow::Result<Vec<Member>> {
+    pub async fn members(&self, list_id: &ListId) -> TodoersResult<Vec<Member>> {
         let mems = self.db.list_members(list_id).await?;
         Ok(mems)
     }
@@ -409,25 +365,26 @@ impl Store {
     #[tracing::instrument(skip(self))]
     pub async fn add_member_local(
         &mut self,
-        list_id: ListId,
+        list_id: &ListId,
         member: Member,
-    ) -> anyhow::Result<()> {
+    ) -> TodoersResult<()> {
         let epoch = self
             .db
             .list_epoch(list_id)
             .await?
-            .context("add_member: unknown list")?;
+            .ok_or(TodoersError::UnknownList)?;
         let dek = self
             .session
-            .dek(list_id, epoch)
-            .context("add_member: no DEK for current epoch")?;
+            .dek(*list_id, epoch)
+            .ok_or(TodoersError::NoDek)?;
         let wrapped = crypto::seal_to(&dek, &member.identity_pub);
 
         self.db.add_member_row(list_id, &member).await?;
         self.sync(crate::sync::SyncCommand::AddMember {
-            list_id,
+            list_id: *list_id,
             body: Box::new(todoers_types::AddMemberRequest {
-                member_id: Uuid::from_bytes(member.id.0),
+                list_id: *list_id,
+                member_id: member.id,
                 role: member.role,
                 wrapped_dek: wrapped,
                 epoch: epoch as i64,
@@ -443,16 +400,16 @@ impl Store {
     #[tracing::instrument(skip(self))]
     pub async fn remove_member_local(
         &mut self,
-        list_id: ListId,
+        list_id: &ListId,
         member_id: MemberId,
-    ) -> anyhow::Result<()> {
+    ) -> TodoersResult<()> {
         let current = self
             .db
             .list_epoch(list_id)
             .await?
-            .context("remove_member: unknown list")?;
+            .ok_or(TodoersError::UnknownList)?;
         let new_epoch = current + 1;
-        let new_dek = crypto::generate_dek();
+        let new_dek = Dek::generate(&mut OsRng);
 
         // The members who remain after this removal each need the new DEK sealed
         // to their own key. (We include ourselves; we are not the one removed.)
@@ -466,7 +423,7 @@ impl Store {
         let new_slots: Vec<todoers_types::KeySlotEntry> = remaining
             .iter()
             .map(|m| todoers_types::KeySlotEntry {
-                member_id: Uuid::from_bytes(m.id.0),
+                member_id: m.id,
                 wrapped_dek: crypto::seal_to(&new_dek, &m.identity_pub),
             })
             .collect();
@@ -476,14 +433,15 @@ impl Store {
         self.db
             .save_key_slot(list_id, new_epoch, &my_wrapped)
             .await?;
-        self.session.insert_dek(list_id, new_epoch, new_dek);
+        self.session.insert_dek(*list_id, new_epoch, new_dek);
         self.db.set_epoch(list_id, new_epoch).await?;
-        self.db.remove_member_row(list_id, member_id).await?;
+        self.db.remove_member_row(list_id, &member_id).await?;
 
         self.sync(crate::sync::SyncCommand::RemoveMember {
-            list_id,
+            list_id: *list_id,
             body: Box::new(todoers_types::RemoveMemberRequest {
-                remove_member_id: Uuid::from_bytes(member_id.0),
+                list_id: *list_id,
+                remove_member_id: member_id,
                 epoch: current as i64,
                 new_slots,
             }),
@@ -499,11 +457,11 @@ impl Store {
     #[tracing::instrument(skip(self, dto))]
     pub async fn apply_remote_update(
         &mut self,
-        list_id: ListId,
-        dto: todoers_types::StoredUpdateDto,
-    ) -> anyhow::Result<bool> {
+        list_id: &ListId,
+        dto: StoredUpdateDto,
+    ) -> TodoersResult<bool> {
         let epoch = dto.epoch as Epoch;
-        let author = MemberId(dto.author.into_bytes());
+        let author = dto.author;
 
         // Our own appends come back on the WS/pull too — already merged, skip.
         if author == self.session.member_id() {
@@ -511,7 +469,7 @@ impl Store {
             return Ok(false);
         }
 
-        let Some(dek) = self.session.dek(list_id, epoch) else {
+        let Some(dek) = self.session.dek(*list_id, epoch) else {
             tracing::warn!(?list_id, epoch, "no DEK for update epoch; skipping");
             return Ok(false);
         };
@@ -527,22 +485,14 @@ impl Store {
             return Ok(false);
         };
 
-        let nonce: [u8; 24] = match dto.nonce.as_slice().try_into() {
-            Ok(n) => n,
-            Err(_) => return Ok(false),
-        };
-        let signature: [u8; 64] = match dto.signature.as_slice().try_into() {
-            Ok(s) => s,
-            Err(_) => return Ok(false),
-        };
         let payload = todoers_types::UpdatePayload {
             version: UPDATE_VERSION,
-            list_id,
+            list_id: *list_id,
             epoch,
             author,
-            nonce,
+            nonce: dto.nonce,
             ciphertext: dto.ciphertext,
-            signature,
+            signature: dto.signature,
         };
 
         let loro = match crypto::verify_and_decrypt(&payload, list_id, &author_pub, &dek) {
@@ -554,7 +504,7 @@ impl Store {
         };
 
         self.ensure_doc(list_id).await?;
-        let doc = self.docs.get(&list_id).expect("ensured");
+        let doc = self.docs.get(list_id).expect("ensured");
         doc.import(&loro)?;
         self.rebuild_read_model(list_id).await?;
         self.db.set_applied_through_seq(list_id, dto.seq).await?;
@@ -567,30 +517,30 @@ impl Store {
     #[tracing::instrument(skip(self, meta, keys))]
     pub async fn ingest_remote_list(
         &mut self,
-        meta: todoers_types::MetadataResponse,
-        keys: Vec<todoers_types::KeySlotDto>,
-    ) -> anyhow::Result<()> {
-        let list_id = ListId(meta.list_id.into_bytes());
+        meta: MetadataResponse,
+        keys: Vec<KeySlotDto>,
+    ) -> TodoersResult<()> {
+        let list_id = meta.list_id;
         let me = self.session.member_id();
         let my_role = meta
             .members
             .iter()
-            .find(|m| m.member_id.into_bytes() == me.0)
+            .find(|m| m.member_id == me)
             .map(|m| m.role)
             .unwrap_or(Role::Member);
 
         self.db
-            .upsert_list_meta(list_id, my_role, meta.current_epoch as Epoch)
+            .upsert_list_meta(&list_id, my_role, meta.current_epoch as Epoch)
             .await?;
 
         for m in &meta.members {
             self.db
                 .add_member_row(
-                    list_id,
+                    &list_id,
                     &Member {
-                        id: MemberId(m.member_id.into_bytes()),
-                        identity_pub: X25519Pub(to_32_vec(&m.identity_pub)?),
-                        signing_pub: Ed25519Pub(to_32_vec(&m.signing_pub)?),
+                        id: m.member_id,
+                        identity_pub: m.identity_pub.clone(),
+                        signing_pub: m.signing_pub.clone(),
                         role: m.role,
                     },
                 )
@@ -598,7 +548,7 @@ impl Store {
         }
         for slot in &keys {
             self.db
-                .save_key_slot(list_id, slot.epoch as Epoch, &slot.wrapped_dek)
+                .save_key_slot(&list_id, slot.epoch, &slot.wrapped_dek)
                 .await?;
         }
         // Load the (possibly new) wrapped DEKs into the in-memory map.
@@ -609,8 +559,8 @@ impl Store {
     /// Re-derive the SQLite read model + persist the snapshot from the live doc.
     /// The write half of `persist` without producing/enqueuing a new update —
     /// used after merging a *remote* change (which we must not re-sign/-upload).
-    async fn rebuild_read_model(&self, list_id: ListId) -> anyhow::Result<()> {
-        let doc = self.docs.get(&list_id).context("rebuild: doc not open")?;
+    async fn rebuild_read_model(&self, list_id: &ListId) -> TodoersResult<()> {
+        let doc = self.docs.get(list_id).ok_or(TodoersError::DocNotOpen)?;
         let snap = doc.export_snapshot()?;
         self.db.save_document(list_id, &snap).await?;
         self.db.replace_todo_items(list_id, &doc.items()).await?;
@@ -620,29 +570,30 @@ impl Store {
     // ── internals ──────────────────────────────────────────────────────────────
 
     /// Load a list's document into the cache if not already open.
-    async fn ensure_doc(&mut self, list_id: ListId) -> anyhow::Result<()> {
-        if self.docs.contains_key(&list_id) {
+    async fn ensure_doc(&mut self, list_id: &ListId) -> TodoersResult<()> {
+        if self.docs.contains_key(list_id) {
             return Ok(());
         }
         let doc = match self.db.load_document(list_id).await? {
             Some(snap) => TodoDoc::from_snapshot(&snap)?,
             None => TodoDoc::new(),
         };
-        self.docs.insert(list_id, doc);
+        self.docs.insert(*list_id, doc);
         Ok(())
     }
 
     /// Run a closure that mutates the document, then run the persist pipeline.
     async fn edit_doc<R, E>(
         &mut self,
-        list_id: ListId,
+        list_id: &ListId,
         f: impl FnOnce(&TodoDoc) -> Result<R, E>,
-    ) -> anyhow::Result<R>
+    ) -> TodoersResult<R>
     where
-        E: Into<anyhow::Error> + std::error::Error + Send + Sync + 'static,
+        E: std::error::Error + Send + Sync + 'static,
+        TodoersError: From<E>,
     {
         self.ensure_doc(list_id).await?;
-        let doc = self.docs.get(&list_id).expect("ensured");
+        let doc = self.docs.get(list_id).expect("ensured");
         let vv = doc.version();
         let out = f(doc)?;
         self.persist(list_id, doc, &vv).await?;
@@ -653,19 +604,19 @@ impl Store {
     /// snapshot and rebuild the read model.
     async fn persist(
         &self,
-        list_id: ListId,
+        list_id: &ListId,
         doc: &TodoDoc,
         vv_before: &VersionVector,
-    ) -> anyhow::Result<()> {
+    ) -> TodoersResult<()> {
         let epoch = self
             .db
             .list_epoch(list_id)
             .await?
-            .context("persist: unknown list")?;
+            .ok_or(TodoersError::UnknownList)?;
         let dek = self
             .session
-            .dek(list_id, epoch)
-            .context("persist: no DEK for list/epoch")?;
+            .dek(*list_id, epoch)
+            .ok_or(TodoersError::NoDek)?;
 
         let update = doc.export_updates_from(vv_before)?;
         if !update.is_empty() {
@@ -673,7 +624,7 @@ impl Store {
                 UPDATE_VERSION,
                 list_id,
                 epoch,
-                self.session.member_id(),
+                &self.session.member_id(),
                 &dek,
                 &self.session.signing_key(),
                 &update,
@@ -683,7 +634,7 @@ impl Store {
                 .enqueue_outbound(list_id, epoch, &bytes, &payload.signature)
                 .await?;
             // Nudge the sync engine to drain the queue for this list.
-            self.sync(crate::sync::SyncCommand::Push(list_id));
+            self.sync(crate::sync::SyncCommand::Push(*list_id));
         }
 
         let snap = doc.export_snapshot()?;
@@ -694,15 +645,8 @@ impl Store {
 }
 
 /// Whether an item belongs in a meta-list view as of `now`.
-fn in_meta(meta: MetaList, it: &TodoItem, now: OffsetDateTime) -> bool {
+fn in_meta(meta: &MetaList, it: &TodoItem, now: OffsetDateTime) -> bool {
     meta.contains(it.due, now)
-}
-
-/// Length-check a wire pubkey (Vec<u8>) into a fixed 32-byte array.
-fn to_32_vec(bytes: &[u8]) -> anyhow::Result<[u8; 32]> {
-    bytes
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("expected 32-byte key, got {}", bytes.len()))
 }
 
 /// Sort sidebar list summaries by the active mode, using per-list aggregates for
@@ -742,7 +686,7 @@ mod tests {
     use sqlx::{Pool, Sqlite};
     use todoers_types::MemberId;
 
-    use todoers_client::auth::UnlockedKeys;
+    use crate::auth::UnlockedKeys;
 
     /// Build a Store over a migrated test pool with a fresh random identity.
     fn store_with(db: Pool<Sqlite>) -> Store {
@@ -767,7 +711,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test(migrations = "../todoers-client/db/migrations")]
+    #[sqlx::test(migrations = "db/migrations")]
     async fn create_list_seeds_summary_and_outbound(db: Pool<Sqlite>) {
         let mut store = store_with(db);
         let id = store.create_list("Groceries").await.unwrap();
@@ -779,9 +723,9 @@ mod tests {
         assert_eq!(summaries[0].open_count, 0);
 
         // The title edit produced one queued update.
-        assert!(store.db.outbound_count(id).await.unwrap() >= 1);
+        assert!(store.db.outbound_count(&id).await.unwrap() >= 1);
         // We are recorded as the sole (owner) member.
-        assert_eq!(store.members(id).await.unwrap().len(), 1);
+        assert_eq!(store.members(&id).await.unwrap().len(), 1);
     }
 
     #[sqlx::test(migrations = "../todoers-client/db/migrations")]
@@ -789,11 +733,11 @@ mod tests {
         let mut store = store_with(db);
         let list = store.create_list("L").await.unwrap();
 
-        let a = store.add_todo(list, &input("buy milk")).await.unwrap();
-        store.add_todo(list, &input("walk dog")).await.unwrap();
+        let a = store.add_todo(&list, &input("buy milk")).await.unwrap();
+        store.add_todo(&list, &input("walk dog")).await.unwrap();
 
         let view = store
-            .load_view(ViewTarget::List(list), SortMode::Alphabetical)
+            .load_view(&ViewTarget::List(list), SortMode::Alphabetical)
             .await
             .unwrap();
         assert_eq!(
@@ -803,16 +747,16 @@ mod tests {
             vec!["buy milk", "walk dog"]
         );
 
-        store.toggle_done(list, &a).await.unwrap();
+        store.toggle_done(&list, &a).await.unwrap();
         let done = store
-            .load_view(ViewTarget::List(list), SortMode::Alphabetical)
+            .load_view(&ViewTarget::List(list), SortMode::Alphabetical)
             .await
             .unwrap();
         assert!(done.iter().find(|(_, i)| i.id == a).unwrap().1.done);
 
         store
             .edit_todo(
-                list,
+                &list,
                 &a,
                 &TodoItemInput {
                     title: "buy oat milk".into(),
@@ -823,22 +767,22 @@ mod tests {
             .await
             .unwrap();
         let edited = store
-            .load_view(ViewTarget::List(list), SortMode::Priority)
+            .load_view(&ViewTarget::List(list), SortMode::Priority)
             .await
             .unwrap();
         assert_eq!(edited[0].1.title, "buy oat milk");
         assert_eq!(edited[0].1.priority, Priority::High);
 
-        store.delete_todo(list, &a).await.unwrap();
+        store.delete_todo(&list, &a).await.unwrap();
         let after = store
-            .load_view(ViewTarget::List(list), SortMode::Alphabetical)
+            .load_view(&ViewTarget::List(list), SortMode::Alphabetical)
             .await
             .unwrap();
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].1.title, "walk dog");
     }
 
-    #[sqlx::test(migrations = "../todoers-client/db/migrations")]
+    #[sqlx::test(migrations = "db/migrations")]
     async fn meta_list_due_today_aggregates_across_lists(db: Pool<Sqlite>) {
         let mut store = store_with(db);
         let a = store.create_list("A").await.unwrap();
@@ -849,7 +793,7 @@ mod tests {
 
         store
             .add_todo(
-                a,
+                &a,
                 &TodoItemInput {
                     title: "due now".into(),
                     due: Some(today),
@@ -860,7 +804,7 @@ mod tests {
             .unwrap();
         store
             .add_todo(
-                b,
+                &b,
                 &TodoItemInput {
                     title: "later".into(),
                     due: Some(next_month),
@@ -871,7 +815,7 @@ mod tests {
             .unwrap();
 
         let today_view = store
-            .load_view(ViewTarget::Meta(MetaList::DueToday), SortMode::DueDate)
+            .load_view(&ViewTarget::Meta(MetaList::DueToday), SortMode::DueDate)
             .await
             .unwrap();
         assert_eq!(
@@ -883,54 +827,57 @@ mod tests {
         );
 
         let all = store
-            .load_view(ViewTarget::Meta(MetaList::AllTasks), SortMode::DueDate)
+            .load_view(&ViewTarget::Meta(MetaList::AllTasks), SortMode::DueDate)
             .await
             .unwrap();
         assert_eq!(all.len(), 2, "AllTasks spans both lists");
     }
 
-    #[sqlx::test(migrations = "../todoers-client/db/migrations")]
+    #[sqlx::test(migrations = "db/migrations")]
     async fn data_survives_a_fresh_store(db: Pool<Sqlite>) {
         // First store creates and populates.
         let id;
         {
             let mut store = store_with(db.clone());
             id = store.create_list("Persistent").await.unwrap();
-            store.add_todo(id, &input("remember me")).await.unwrap();
+            store.add_todo(&id, &input("remember me")).await.unwrap();
         }
         // A brand-new store over the same DB still reads the read model.
         let store2 = store_with(db);
         let view = store2
-            .load_view(ViewTarget::List(id), SortMode::Alphabetical)
+            .load_view(&ViewTarget::List(id), SortMode::Alphabetical)
             .await
             .unwrap();
         assert_eq!(view.len(), 1);
         assert_eq!(view[0].1.title, "remember me");
     }
 
-    #[sqlx::test(migrations = "../todoers-client/db/migrations")]
+    #[sqlx::test(migrations = "db/migrations")]
     async fn remove_member_rotates_epoch(db: Pool<Sqlite>) {
         let mut store = store_with(db);
         let list = store.create_list("Shared").await.unwrap();
-        assert_eq!(store.db.list_epoch(list).await.unwrap(), Some(1));
+        assert_eq!(store.db.list_epoch(&list).await.unwrap(), Some(1));
 
         // Add then remove a fabricated member; epoch should bump and a new DEK
         // for the new epoch must be available for subsequent writes.
         let other = Member {
-            id: MemberId([42u8; 16]),
+            id: MemberId::new([42u8; 16]),
             identity_pub: crypto::generate_identity().1,
             signing_pub: crypto::generate_signing().1,
             role: Role::Member,
         };
-        store.add_member_local(list, other.clone()).await.unwrap();
-        assert_eq!(store.members(list).await.unwrap().len(), 2);
+        store.add_member_local(&list, other.clone()).await.unwrap();
+        assert_eq!(store.members(&list).await.unwrap().len(), 2);
 
-        store.remove_member_local(list, other.id).await.unwrap();
-        assert_eq!(store.db.list_epoch(list).await.unwrap(), Some(2));
-        assert_eq!(store.members(list).await.unwrap().len(), 1);
+        store.remove_member_local(&list, other.id).await.unwrap();
+        assert_eq!(store.db.list_epoch(&list).await.unwrap(), Some(2));
+        assert_eq!(store.members(&list).await.unwrap().len(), 1);
 
         // A write after rotation still succeeds (DEK for epoch 2 is present).
-        store.add_todo(list, &input("post-rotation")).await.unwrap();
+        store
+            .add_todo(&list, &input("post-rotation"))
+            .await
+            .unwrap();
     }
 
     /// A migrated, single-connection in-memory pool for a second "device".
@@ -940,22 +887,19 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!("../todoers-client/db/migrations")
-            .run(&pool)
-            .await
-            .unwrap();
+        sqlx::migrate!("db/migrations").run(&pool).await.unwrap();
         pool
     }
 
-    #[sqlx::test(migrations = "../todoers-client/db/migrations")]
+    #[sqlx::test(migrations = "db/migrations")]
     async fn remote_updates_apply_on_a_second_device(db: Pool<Sqlite>) {
         // Author A produces updates on their device.
         let mut a = store_with(db);
         let list = a.create_list("Shared").await.unwrap();
-        a.add_todo(list, &input("buy milk")).await.unwrap();
+        a.add_todo(&list, &input("buy milk")).await.unwrap();
 
         // The exact envelopes the server would relay, in edit order.
-        let rows = a.db.take_outbound(list, 100).await.unwrap();
+        let rows = a.db.take_outbound(&list, 100).await.unwrap();
         assert!(rows.len() >= 2, "expected title + add_todo updates");
 
         // Capture A's public identity + the list DEK to seed receiver B.
@@ -965,16 +909,16 @@ mod tests {
             signing_pub: a.session.signing_pub(),
             role: Role::Owner,
         };
-        let epoch = a.db.list_epoch(list).await.unwrap().unwrap();
+        let epoch = a.db.list_epoch(&list).await.unwrap().unwrap();
         let dek = a.session.dek(list, epoch).unwrap();
 
         // Receiver B on a separate device/db: a member who holds the DEK and
         // knows A's signing key, but has never seen the list contents.
         let mut b = store_with(fresh_pool().await);
-        b.db.upsert_list_meta(list, Role::Member, epoch)
+        b.db.upsert_list_meta(&list, Role::Member, epoch)
             .await
             .unwrap();
-        b.db.add_member_row(list, &a_member).await.unwrap();
+        b.db.add_member_row(&list, &a_member).await.unwrap();
         b.session_mut().insert_dek(list, epoch, dek);
 
         // Apply each relayed update in seq order; B should reconstruct the item.
@@ -984,29 +928,29 @@ mod tests {
             let dto = todoers_types::StoredUpdateDto {
                 seq: (i + 1) as i64,
                 epoch: payload.epoch,
-                author: Uuid::from_bytes(payload.author.0),
-                nonce: payload.nonce.to_vec(),
+                author: payload.author,
+                nonce: payload.nonce,
                 ciphertext: payload.ciphertext.clone(),
-                signature: payload.signature.to_vec(),
+                signature: payload.signature,
             };
-            b.apply_remote_update(list, dto).await.unwrap();
+            b.apply_remote_update(&list, dto).await.unwrap();
         }
 
-        let items = b.db.load_todo_items(list).await.unwrap();
+        let items = b.db.load_todo_items(&list).await.unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].title, "buy milk");
         assert_eq!(
-            b.db.applied_through_seq(list).await.unwrap(),
+            b.db.applied_through_seq(&list).await.unwrap(),
             rows.len() as i64
         );
     }
 
-    #[sqlx::test(migrations = "../todoers-client/db/migrations")]
+    #[sqlx::test(migrations = "db/migrations")]
     async fn remote_update_with_bad_signature_is_skipped(db: Pool<Sqlite>) {
         let mut a = store_with(db);
         let list = a.create_list("Shared").await.unwrap();
-        a.add_todo(list, &input("buy milk")).await.unwrap();
-        let rows = a.db.take_outbound(list, 100).await.unwrap();
+        a.add_todo(&list, &input("buy milk")).await.unwrap();
+        let rows = a.db.take_outbound(&list, 100).await.unwrap();
 
         let a_member = Member {
             id: a.session.member_id(),
@@ -1014,14 +958,14 @@ mod tests {
             signing_pub: a.session.signing_pub(),
             role: Role::Owner,
         };
-        let epoch = a.db.list_epoch(list).await.unwrap().unwrap();
+        let epoch = a.db.list_epoch(&list).await.unwrap().unwrap();
         let dek = a.session.dek(list, epoch).unwrap();
 
         let mut b = store_with(fresh_pool().await);
-        b.db.upsert_list_meta(list, Role::Member, epoch)
+        b.db.upsert_list_meta(&list, Role::Member, epoch)
             .await
             .unwrap();
-        b.db.add_member_row(list, &a_member).await.unwrap();
+        b.db.add_member_row(&list, &a_member).await.unwrap();
         b.session_mut().insert_dek(list, epoch, dek);
 
         // Tamper with the signature: the blind relay can corrupt bytes, and a
@@ -1030,16 +974,17 @@ mod tests {
             serde_json::from_slice(&rows[0].payload).unwrap();
         let mut bad_sig = payload.signature.to_vec();
         bad_sig[0] ^= 0xff;
+        let bad_sig = bad_sig.try_into().unwrap();
         let dto = todoers_types::StoredUpdateDto {
             seq: 1,
             epoch: payload.epoch,
-            author: Uuid::from_bytes(payload.author.0),
-            nonce: payload.nonce.to_vec(),
+            author: payload.author,
+            nonce: payload.nonce,
             ciphertext: payload.ciphertext.clone(),
             signature: bad_sig,
         };
-        let changed = b.apply_remote_update(list, dto).await.unwrap();
+        let changed = b.apply_remote_update(&list, dto).await.unwrap();
         assert!(!changed, "tampered update must not change state");
-        assert!(b.db.load_todo_items(list).await.unwrap().is_empty());
+        assert!(b.db.load_todo_items(&list).await.unwrap().is_empty());
     }
 }

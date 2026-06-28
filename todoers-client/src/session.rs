@@ -8,9 +8,10 @@
 use std::collections::HashMap;
 
 use ed25519_dalek::SigningKey;
-use zeroize::Zeroizing;
 
-use todoers_types::{Ed25519Pub, Epoch, ListId, MemberId, X25519Pub};
+use todoers_types::{
+    Dek, Ed25519Pub, Ed25519Signing, Epoch, ListId, MemberId, X25519Pub, X25519Secret,
+};
 
 use crate::auth::UnlockedKeys;
 use crate::crypto;
@@ -20,13 +21,13 @@ use crate::error::TodoersResult;
 /// The decrypted identity + the DEKs needed to read/write list updates.
 pub struct Session {
     member_id: MemberId,
-    identity_secret: Zeroizing<[u8; 32]>,
+    identity_secret: X25519Secret,
     identity_pub: X25519Pub,
-    signing_seed: Zeroizing<[u8; 32]>,
+    signing_seed: Ed25519Signing,
     signing_pub: Ed25519Pub,
     token: String,
     /// `(list, epoch) -> DEK`. Class-3: memory only.
-    deks: HashMap<(ListId, Epoch), Zeroizing<[u8; 32]>>,
+    deks: HashMap<(ListId, Epoch), Dek>,
 }
 
 impl Session {
@@ -34,10 +35,10 @@ impl Session {
     pub fn new(keys: &UnlockedKeys) -> Self {
         Self {
             member_id: keys.member_id,
-            identity_secret: Zeroizing::new(keys.identity_secret),
-            identity_pub: keys.identity_pub,
-            signing_seed: Zeroizing::new(keys.signing_seed),
-            signing_pub: keys.signing_pub,
+            identity_secret: keys.identity_secret.clone(),
+            identity_pub: keys.identity_pub.clone(),
+            signing_seed: keys.signing_seed.clone(),
+            signing_pub: keys.signing_pub.clone(),
             token: keys.token.clone(),
             deks: HashMap::new(),
         }
@@ -51,21 +52,20 @@ impl Session {
             if let Ok(dek) =
                 crypto::open_sealed(&slot.wrapped_dek, &self.identity_pub, &self.identity_secret)
             {
-                self.deks
-                    .insert((slot.list_id, slot.epoch), Zeroizing::new(dek));
+                self.deks.insert((slot.list_id, slot.epoch), dek);
             }
         }
         Ok(())
     }
 
     /// The DEK for a `(list, epoch)`, if known.
-    pub fn dek(&self, list_id: ListId, epoch: Epoch) -> Option<[u8; 32]> {
-        self.deks.get(&(list_id, epoch)).map(|d| **d)
+    pub fn dek(&self, list_id: ListId, epoch: Epoch) -> Option<Dek> {
+        self.deks.get(&(list_id, epoch)).cloned()
     }
 
     /// Record a DEK (e.g. just after creating a list or rotating on removal).
-    pub fn insert_dek(&mut self, list_id: ListId, epoch: Epoch, dek: [u8; 32]) {
-        self.deks.insert((list_id, epoch), Zeroizing::new(dek));
+    pub fn insert_dek(&mut self, list_id: ListId, epoch: Epoch, dek: Dek) {
+        self.deks.insert((list_id, epoch), dek);
     }
 
     pub fn member_id(&self) -> MemberId {
@@ -73,11 +73,11 @@ impl Session {
     }
 
     pub fn identity_pub(&self) -> X25519Pub {
-        self.identity_pub
+        self.identity_pub.clone()
     }
 
     pub fn signing_pub(&self) -> Ed25519Pub {
-        self.signing_pub
+        self.signing_pub.clone()
     }
 
     pub fn token(&self) -> &str {
@@ -86,6 +86,6 @@ impl Session {
 
     /// Reconstruct the Ed25519 signing key from its seed (for `produce_update`).
     pub fn signing_key(&self) -> SigningKey {
-        SigningKey::from_bytes(&self.signing_seed)
+        (&self.signing_seed).into()
     }
 }

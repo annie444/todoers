@@ -10,7 +10,7 @@ use opaque_ke::{
 };
 
 use todoers_types::{
-    FinishRegisterRequest, LoginFinishRequest, LoginFinishResponse, LoginStartRequest,
+    Ed25519Pub, FinishRegisterRequest, LoginFinishRequest, LoginFinishResponse, LoginStartRequest,
     LoginStartResponse, SharedCipherSuite, StartRegisterRequest, StartRegisterResponse, X25519Pub,
 };
 
@@ -26,7 +26,7 @@ pub async fn register_and_login(server: &TestServer, username: &str, password: &
     let mut rng = OsRng;
 
     let id_secret = x25519_dalek::StaticSecret::random_from_rng(OsRng);
-    let identity_pub = X25519Pub(x25519_dalek::PublicKey::from(&id_secret).to_bytes());
+    let identity_pub = X25519Pub::new(x25519_dalek::PublicKey::from(&id_secret).to_bytes());
     let signing = ed25519_dalek::SigningKey::generate(&mut rng);
 
     // ── register/start ──
@@ -34,13 +34,17 @@ pub async fn register_and_login(server: &TestServer, username: &str, password: &
         ClientRegistration::<SharedCipherSuite>::start(&mut rng, password.as_bytes()).unwrap();
     let resp = server
         .post("/v1/auth/register/start")
-        .json(&StartRegisterRequest {
-            identity_pub,
-            registration_req: reg_start.message.serialize().to_vec(),
-        })
+        .bytes(
+            postcard::to_stdvec(&StartRegisterRequest {
+                identity_pub: identity_pub.clone(),
+                registration_req: reg_start.message.serialize().to_vec(),
+            })
+            .unwrap()
+            .into(),
+        )
         .await;
     resp.assert_status_ok();
-    let start_resp: StartRegisterResponse = resp.json();
+    let start_resp: StartRegisterResponse = postcard::from_bytes(resp.as_bytes()).unwrap();
 
     let reg_response =
         RegistrationResponse::<SharedCipherSuite>::deserialize(&start_resp.response).unwrap();
@@ -57,13 +61,17 @@ pub async fn register_and_login(server: &TestServer, username: &str, password: &
     // ── register/finish ──
     let resp = server
         .post("/v1/auth/register/finish")
-        .json(&FinishRegisterRequest {
-            username: username.to_string(),
-            identity_pub,
-            signing_pub: signing.verifying_key().to_bytes(),
-            wrapped_secret_keys: ESCROW_SENTINEL.to_vec(),
-            registration_up: reg_finish.message.serialize().to_vec(),
-        })
+        .bytes(
+            postcard::to_stdvec(&FinishRegisterRequest {
+                username: username.to_string(),
+                identity_pub,
+                signing_pub: Ed25519Pub::new(signing.verifying_key().to_bytes()),
+                wrapped_secret_keys: ESCROW_SENTINEL.to_vec(),
+                registration_up: reg_finish.message.serialize().to_vec(),
+            })
+            .unwrap()
+            .into(),
+        )
         .await;
     resp.assert_status_ok();
 
@@ -82,13 +90,17 @@ pub async fn login(server: &TestServer, username: &str, password: &str) -> Login
         ClientLogin::<SharedCipherSuite>::start(&mut rng, password.as_bytes()).unwrap();
     let resp = server
         .post("/v1/auth/login/start")
-        .json(&LoginStartRequest {
-            username: username.to_string(),
-            credential_req: login_start.message.serialize().to_vec(),
-        })
+        .bytes(
+            postcard::to_stdvec(&LoginStartRequest {
+                username: username.to_string(),
+                credential_req: login_start.message.serialize().to_vec(),
+            })
+            .unwrap()
+            .into(),
+        )
         .await;
     resp.assert_status_ok();
-    let login_start_resp: LoginStartResponse = resp.json();
+    let login_start_resp: LoginStartResponse = postcard::from_bytes(resp.as_bytes()).unwrap();
 
     let cred_response =
         CredentialResponse::<SharedCipherSuite>::deserialize(&login_start_resp.credential_response)
@@ -105,11 +117,15 @@ pub async fn login(server: &TestServer, username: &str, password: &str) -> Login
 
     let resp = server
         .post("/v1/auth/login/finish")
-        .json(&LoginFinishRequest {
-            login_id: login_start_resp.login_id,
-            credential_finalization: login_finish.message.serialize().to_vec(),
-        })
+        .bytes(
+            postcard::to_stdvec(&LoginFinishRequest {
+                login_id: login_start_resp.login_id,
+                credential_finalization: login_finish.message.serialize().to_vec(),
+            })
+            .unwrap()
+            .into(),
+        )
         .await;
     resp.assert_status_ok();
-    resp.json()
+    postcard::from_bytes(resp.as_bytes()).unwrap()
 }

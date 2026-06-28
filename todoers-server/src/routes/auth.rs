@@ -10,23 +10,22 @@
 //! public identity, and the user's *already-sealed* private keys, and never sees
 //! the password or the `export_key`.
 
-use axum::Json;
+use axum::body::Bytes;
 use axum::extract::{FromRequestParts, State};
 use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use hmac::{KeyInit, Mac};
 use old_rand_core::{OsRng, RngCore};
-use opaque_ke::ServerLoginParameters;
+use opaque_ke::{CredentialRequest, ServerLoginParameters};
 use sha2::{Digest, Sha512};
 use time::{Duration, OffsetDateTime};
 use tracing::error;
-use uuid::Uuid;
 
 use todoers_types::{
-    FinishRegisterRequest, FinishRegisterResponse, HmacSha256, LoginFinishRequest,
-    LoginFinishResponse, LoginStartRequest, LoginStartResponse, MemberId, StartRegisterRequest,
-    StartRegisterResponse,
+    DeviceId, FinishRegisterRequest, FinishRegisterResponse, HmacSha256, LoginFinishRequest,
+    LoginFinishResponse, LoginStartRequest, LoginStartResponse, MemberId, SharedCipherSuite,
+    StartRegisterRequest, StartRegisterResponse,
 };
 
 use crate::crypto::{
@@ -46,13 +45,13 @@ pub(crate) const STEP_UP_TTL: Duration = Duration::minutes(5);
 /// The authenticated caller, resolved from a session token on every request.
 #[derive(Debug, Clone)]
 pub struct AuthMember {
-    pub member_id: Uuid,
+    pub member_id: MemberId,
     /// Hash of the bearer token this request authenticated with. Lets handlers
     /// like logout revoke exactly this session (this device), not all of them.
-    pub token_hash: Vec<u8>,
+    pub token_hash: [u8; 64],
     /// Device that minted this session: `None` for a password login, `Some(..)`
     /// for a password-less device login.
-    pub device_id: Option<Uuid>,
+    pub device_id: Option<DeviceId>,
     /// When this session was created — used together with `device_id` for step-up.
     pub created_at: OffsetDateTime,
 }
@@ -116,40 +115,35 @@ impl FromRequestParts<AppState> for AuthMember {
 /// `POST /v1/auth/register/start`
 /// Step 1: respond to a RegistrationRequest. Returns the RegistrationResponse
 /// bytes for the client to feed into `ClientRegistration::finish`.
-pub async fn registration_start(
-    State(state): State<AppState>,
-    Json(req): Json<StartRegisterRequest>,
-) -> AppResult<Json<StartRegisterResponse>> {
+pub async fn registration_start(State(state): State<AppState>, bytes: Bytes) -> AppResult<Bytes> {
+    let req: StartRegisterRequest = postcard::from_bytes(&bytes)?;
     let member_id = MemberId::from_identity_pub(&req.identity_pub);
 
     let registration_req =
         RegistrationReq::deserialize(&req.registration_req).inspect_err(|e| {
             error!(error = ?e, "failed to deserialize registration request");
         })?;
-    let result = Registration::start(state.opaque.get(), registration_req, member_id.as_bytes())
+    let result = Registration::start(state.opaque.get(), registration_req, member_id.as_ref())
         .map_err(|e| {
             error!(error = ?e, "registration start failed");
             AppError::BadRequest("invalid registration request".into())
         })?;
-    Ok(Json(StartRegisterResponse {
+    Ok(Bytes::from(postcard::to_stdvec(&StartRegisterResponse {
         response: result.message.serialize().to_vec(),
-    }))
+    })?))
 }
 
 /// `POST /v1/auth/register/finish`
 /// Step 2: store the client's RegistrationUpload as the user's password file,
 /// alongside the public identity and escrowed (already-sealed) private keys.
-pub async fn registration_finish(
-    State(state): State<AppState>,
-    Json(req): Json<FinishRegisterRequest>,
-) -> AppResult<Json<FinishRegisterResponse>> {
+pub async fn registration_finish(State(state): State<AppState>, bytes: Bytes) -> AppResult<Bytes> {
+    let req: FinishRegisterRequest = postcard::from_bytes(&bytes)?;
     if req.signing_pub.len() != 32 {
         return Err(AppError::BadRequest("signing_pub must be 32 bytes".into()));
     }
 
     // Re-derive the id from the uploaded key so a client can't forge a mismatch.
     let member_id = MemberId::from_identity_pub(&req.identity_pub);
-    let member_uuid = Uuid::from_bytes(member_id.0);
 
     let upload = RegistrationUp::deserialize(&req.registration_up).inspect_err(|e| {
         error!(error = ?e, "failed to deserialize registration upload");
@@ -159,9 +153,9 @@ pub async fn registration_finish(
     state
         .db
         .create_user(
-            member_uuid,
+            &member_id,
             &req.username,
-            &req.identity_pub.0,
+            &req.identity_pub,
             &req.signing_pub,
             &req.wrapped_secret_keys,
             &opaque_record,
@@ -171,9 +165,9 @@ pub async fn registration_finish(
             error!(error = ?e, "failed to create user in database");
         })?;
 
-    Ok(Json(FinishRegisterResponse {
-        member_id: member_uuid,
-    }))
+    Ok(Bytes::from(postcard::to_stdvec(&FinishRegisterResponse {
+        member_id,
+    })?))
 }
 
 // ── Login ────────────────────────────────────────────────────────────────────
@@ -183,14 +177,12 @@ pub async fn registration_finish(
 
 /// Step 1: look the user up by username, run `ServerLogin::start`, stash the
 /// resulting state, and return `(login_id, credential_response)`.
-pub async fn login_start(
-    State(state): State<AppState>,
-    Json(req): Json<LoginStartRequest>,
-) -> AppResult<Json<LoginStartResponse>> {
-    let mut rng = OsRng;
-    let credential_req = CredentialReq::deserialize(&req.credential_req).inspect_err(|e| {
-        error!(error = ?e, "failed to deserialize credential request");
-    })?;
+pub async fn login_start(State(state): State<AppState>, bytes: Bytes) -> AppResult<Bytes> {
+    let req: LoginStartRequest = postcard::from_bytes(&bytes)?;
+    let credential_req: CredentialRequest<SharedCipherSuite> =
+        CredentialReq::deserialize(&req.credential_req).inspect_err(|e| {
+            error!(error = ?e, "failed to deserialize credential request");
+        })?;
 
     let user = state.db.fetch_login_user(&req.username).await?;
 
@@ -198,7 +190,7 @@ pub async fn login_start(
     // that's the stored member_id; for an unknown user we pass `None` with a
     // deterministic placeholder so the response is enumeration-resistant. The
     // placeholder path can never finish successfully.
-    let (password_file, member_id): (Option<PasswordFile>, Option<Uuid>) = match &user {
+    let (password_file, member_id): (Option<PasswordFile>, Option<MemberId>) = match &user {
         Some(u) => (
             Some(PasswordFile::deserialize(&u.opaque_record)?),
             Some(u.member_id),
@@ -206,16 +198,17 @@ pub async fn login_start(
         None => (None, None),
     };
     let credential_identifier = match member_id {
-        Some(id) => *id.as_bytes(),
+        Some(ref id) => *id,
         None => placeholder_credential_id(&state, &req.username),
     };
 
+    let mut rng = OsRng;
     let result = Login::start(
         &mut rng,
         state.opaque.get(),
         password_file,
         credential_req,
-        &credential_identifier,
+        credential_identifier.as_ref(),
         ServerLoginParameters::default(),
     )
     .map_err(|e| {
@@ -226,19 +219,17 @@ pub async fn login_start(
     let state_bytes = result.state.serialize().to_vec();
     let login_id = state.db.login_start(&state_bytes, member_id).await?;
 
-    Ok(Json(LoginStartResponse {
+    Ok(Bytes::from(postcard::to_stdvec(&LoginStartResponse {
         login_id,
         credential_response: result.message.serialize().to_vec(),
-    }))
+    })?))
 }
 
 /// Step 2: recover the stashed state, finish the AKE (proof the client knew the
 /// password), mint a session token, and return it with the escrow blob so a
 /// fresh device can rehydrate its keys.
-pub async fn login_finish(
-    State(state): State<AppState>,
-    Json(req): Json<LoginFinishRequest>,
-) -> AppResult<Json<LoginFinishResponse>> {
+pub async fn login_finish(State(state): State<AppState>, bytes: Bytes) -> AppResult<Bytes> {
+    let req: LoginFinishRequest = postcard::from_bytes(&bytes)?;
     let stash = state
         .db
         .login_finish(req.login_id)
@@ -262,7 +253,7 @@ pub async fn login_finish(
 
     let keys = state
         .db
-        .fetch_user_keys(member_id)
+        .fetch_user_keys(&member_id)
         .await?
         .ok_or(AppError::Unauthorized)?;
 
@@ -271,16 +262,16 @@ pub async fn login_finish(
     // Password login → no device tag (this is what step-up auth requires).
     state
         .db
-        .create_session(member_id, &token_hash, expires_at, None)
+        .create_session(&member_id, &token_hash, expires_at, None)
         .await?;
 
-    Ok(Json(LoginFinishResponse {
+    Ok(Bytes::from(postcard::to_stdvec(&LoginFinishResponse {
         token,
         member_id,
         identity_pub: keys.identity_pub,
         signing_pub: keys.signing_pub,
         wrapped_secret_keys: keys.wrapped_secret_keys,
-    }))
+    })?))
 }
 
 // ── Logout ──────────────────────────────────────────────────────────────────
@@ -296,27 +287,27 @@ pub async fn logout(State(state): State<AppState>, auth: AuthMember) -> AppResul
 /// `(token, token_hash)`: the `token` is sent to the client exactly once; only
 /// the `token_hash` is ever stored, so a leak of the `sessions` table can't be
 /// replayed as a credential.
-pub(crate) fn mint_session_token() -> (String, Vec<u8>) {
+pub(crate) fn mint_session_token() -> (String, [u8; 64]) {
     let mut token_bytes = [0u8; 32];
     let mut rng = OsRng;
     rng.fill_bytes(&mut token_bytes);
     let token = STANDARD.encode(token_bytes);
-    let token_hash = Sha512::digest(token_bytes).to_vec();
+    let token_hash: [u8; 64] = Sha512::digest(token_bytes).into();
     (token, token_hash)
 }
 
 /// Hash a presented bearer token so the extractor can look it up by `token_hash`.
 /// MUST hash identically to step 3 of `mint_session_token`.
-fn hash_token(token: &str) -> AppResult<Vec<u8>> {
+fn hash_token(token: &str) -> AppResult<[u8; 64]> {
     let token_bytes = STANDARD.decode(token)?;
-    Ok(Sha512::digest(token_bytes).to_vec())
+    Ok(Sha512::digest(token_bytes).into())
 }
 
 /// Derive a stable, non-enumerable 16-byte `credential_identifier` for an unknown
 /// username, so `login/start` for a missing user is indistinguishable from a real
 /// one. Must be deterministic (same username -> same bytes) and must NOT reveal
 /// whether the user exists.
-fn placeholder_credential_id(state: &AppState, username: &str) -> [u8; 16] {
+fn placeholder_credential_id(state: &AppState, username: &str) -> MemberId {
     let key = state.opaque.serialize();
     let mut username_id = [0u8; 16];
     let mut rng = OsRng;
@@ -327,13 +318,14 @@ fn placeholder_credential_id(state: &AppState, username: &str) -> [u8; 16] {
         .finalize()
         .into_bytes();
     username_id.copy_from_slice(&mac[..16]);
-    username_id
+    MemberId::new(username_id)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum_test::TestServer;
+    use todoers_types::{Ed25519Pub, X25519Pub};
 
     #[sqlx::test]
     async fn test_placeholder_credential_id(db: sqlx::PgPool) {
@@ -371,18 +363,20 @@ mod tests {
 
         let response = app
             .post("/v1/auth/register/start")
-            .json(&StartRegisterRequest {
-                identity_pub: todoers_types::X25519Pub(client_public.to_bytes()),
-                registration_req: client_registration_start.message.serialize().to_vec(), // This would be a real OPAQUE request in a full test
-            })
+            .bytes(
+                postcard::to_stdvec(&StartRegisterRequest {
+                    identity_pub: X25519Pub::new(client_public.to_bytes()),
+                    registration_req: client_registration_start.message.serialize().to_vec(), // This would be a real OPAQUE request in a full test
+                })
+                .unwrap()
+                .into(),
+            )
             .await;
 
         response.assert_status_ok();
-        response.assert_json(&serde_json::json!({
-            "response": axum_test::expect_json::string()
-        }));
 
-        let data = response.json::<StartRegisterResponse>();
+        let data: StartRegisterResponse = postcard::from_bytes(response.as_bytes()).unwrap();
+        assert!(!data.response.is_empty());
 
         let response =
             opaque_ke::RegistrationResponse::<todoers_types::SharedCipherSuite>::deserialize(
@@ -396,21 +390,24 @@ mod tests {
 
         let response = app
             .post("/v1/auth/register/finish")
-            .json(&FinishRegisterRequest {
-                username: "testuser".to_string(),
-                identity_pub: todoers_types::X25519Pub(client_public.to_bytes()),
-                signing_pub: signing_key.verifying_key().to_bytes(),
-                wrapped_secret_keys: vec![], // In a real test, this would be the client's encrypted
-                // private keys, but the server doesn't actually use them in this flow, so we can
-                // leave it empty.
-                registration_up: client_registration_finish.message.serialize().to_vec(),
-            })
+            .bytes(
+                postcard::to_stdvec(&FinishRegisterRequest {
+                    username: "testuser".to_string(),
+                    identity_pub: X25519Pub::new(client_public.to_bytes()),
+                    signing_pub: Ed25519Pub::new(*signing_key.verifying_key().as_bytes()),
+                    wrapped_secret_keys: vec![], // In a real test, this would be the client's encrypted
+                    // private keys, but the server doesn't actually use them in this flow, so we can
+                    // leave it empty.
+                    registration_up: client_registration_finish.message.serialize().to_vec(),
+                })
+                .unwrap()
+                .into(),
+            )
             .await;
 
         response.assert_status_ok();
-        response.assert_json(&serde_json::json!({
-            "member_id": axum_test::expect_json::string()
-        }));
+        let finish: FinishRegisterResponse = postcard::from_bytes(response.as_bytes()).unwrap();
+        assert_eq!(finish.member_id.as_ref().len(), 16);
     }
 
     #[sqlx::test(migrations = "db/migrations")]
@@ -502,14 +499,18 @@ mod tests {
             opaque_ke::ClientLogin::<SharedCipherSuite>::start(&mut OsRng, b"whatever").unwrap();
         let resp = server
             .post("/v1/auth/login/start")
-            .json(&LoginStartRequest {
-                username: "ghost-user".into(),
-                credential_req: login.message.serialize().to_vec(),
-            })
+            .bytes(
+                postcard::to_stdvec(&LoginStartRequest {
+                    username: "ghost-user".into(),
+                    credential_req: login.message.serialize().to_vec(),
+                })
+                .unwrap()
+                .into(),
+            )
             .await;
         // A missing user yields a well-formed dummy response, not a 404.
         resp.assert_status_ok();
-        let body: LoginStartResponse = resp.json();
+        let body: LoginStartResponse = postcard::from_bytes(resp.as_bytes()).unwrap();
         assert!(!body.credential_response.is_empty());
     }
 }

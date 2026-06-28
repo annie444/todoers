@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use axum::extract::ws::Message;
 use dashmap::DashMap;
+use todoers_types::ListId;
 use tokio::sync::broadcast;
-use uuid::Uuid;
 
 use crate::crypto::OpaqueServer;
 use crate::db::Db;
@@ -24,7 +24,7 @@ pub struct AppState {
 /// each, low volume, so this is deliberately simple — no external broker.
 #[derive(Debug, Clone, Default)]
 pub struct Hub {
-    channels: Arc<DashMap<Uuid, broadcast::Sender<Message>>>,
+    channels: Arc<DashMap<ListId, broadcast::Sender<Message>>>,
 }
 
 impl Hub {
@@ -34,17 +34,17 @@ impl Hub {
     const CHANNEL_CAPACITY: usize = 256;
 
     /// Get (or lazily create) the sender for a list, so subscribers can attach.
-    pub fn sender(&self, list_id: Uuid) -> broadcast::Sender<Message> {
+    pub fn sender(&self, list_id: &ListId) -> broadcast::Sender<Message> {
         self.channels
-            .entry(list_id)
+            .entry(*list_id)
             .or_insert_with(|| broadcast::channel(Self::CHANNEL_CAPACITY).0)
             .clone()
     }
 
     /// Publish a message to any online subscribers of a list. No-op if nobody
     /// is currently listening (no channel materialized yet).
-    pub fn publish(&self, list_id: Uuid, msg: Message) {
-        if let Some(tx) = self.channels.get(&list_id) {
+    pub fn publish(&self, list_id: &ListId, msg: Message) {
+        if let Some(tx) = self.channels.get(list_id) {
             // Err only means "no receivers"; that's fine, offline members catch
             // up via pull on next connect.
             let _ = tx.send(msg);

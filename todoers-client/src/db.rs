@@ -10,9 +10,11 @@ use time::OffsetDateTime;
 use tokio::fs;
 use zeroize::Zeroizing;
 
-use todoers_types::{Epoch, ListId, Member, MemberId, Role};
+use todoers_types::{
+    DeviceId, Ed25519Pub, Epoch, ListId, Member, MemberId, Role, Signature, X25519Pub,
+};
 
-use crate::auth::{AccountRow, NewAccount};
+use crate::auth::{AccountRow, KdfSalt, NewAccount};
 use crate::error::{TodoersError, TodoersResult};
 use crate::model::{Priority, Subtask, SubtaskRow, TodoItem, TodoItemRow};
 use crate::sqlcipher::DbCipher;
@@ -46,10 +48,16 @@ pub struct OutboundRow {
     pub payload: Vec<u8>,
 }
 
+#[derive(Debug, Clone)]
+pub struct DeviceCacheRow {
+    pub device_id: DeviceId,
+    pub device_wrapped_keys: Vec<u8>,
+}
+
 fn list_id_from(bytes: Vec<u8>) -> ListId {
     let mut id = [0u8; 16];
     id.copy_from_slice(&bytes);
-    ListId(id)
+    ListId::new(id)
 }
 
 #[derive(Clone)]
@@ -142,12 +150,12 @@ impl Db {
                 wrapped_secret_keys, kdf_salt, kdf_mem_kib, kdf_iters, kdf_parallelism)
             VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
-            account.member_id.0.as_slice(),
+            account.member_id.as_slice(),
             &account.username,
-            account.identity_pub.0.as_slice(),
-            account.signing_pub.0.as_slice(),
+            account.identity_pub.as_slice(),
+            account.signing_pub.as_slice(),
             &account.wrapped_secret_keys,
-            account.kdf_salt.0.as_slice(),
+            account.kdf_salt.as_slice(),
             account.kdf_mem_kib,
             account.kdf_iters,
             account.kdf_parallelism,
@@ -166,8 +174,16 @@ impl Db {
         let account = sqlx::query_as!(
             AccountRow,
             r#"
-            SELECT member_id, username, identity_pub, signing_pub,
-                wrapped_secret_keys, kdf_salt, kdf_mem_kib, kdf_iters, kdf_parallelism
+            SELECT
+                member_id AS "member_id: MemberId",
+                username,
+                identity_pub AS "identity_pub: X25519Pub",
+                signing_pub AS "signing_pub: Ed25519Pub",
+                wrapped_secret_keys,
+                kdf_salt AS "kdf_salt: KdfSalt",
+                kdf_mem_kib,
+                kdf_iters,
+                kdf_parallelism
             FROM account WHERE id = 1
             "#,
         )
@@ -200,20 +216,19 @@ impl Db {
     /// Load the device cache (`device_id`, sealed blob), if this device has
     /// enrolled for password-less unlock.
     #[tracing::instrument(skip(self))]
-    pub async fn load_device_cache(&self) -> TodoersResult<Option<([u8; 16], Vec<u8>)>> {
-        let row = sqlx::query!("SELECT device_id, device_wrapped_keys FROM account WHERE id = 1")
-            .fetch_optional(&*self.pool)
-            .await?;
-        Ok(
-            row.and_then(|r| match (r.device_id, r.device_wrapped_keys) {
-                (Some(id), Some(blob)) if id.len() == 16 => {
-                    let mut device_id = [0u8; 16];
-                    device_id.copy_from_slice(&id);
-                    Some((device_id, blob))
-                }
-                _ => None,
-            }),
+    pub async fn load_device_cache(&self) -> TodoersResult<Option<(DeviceId, Vec<u8>)>> {
+        let row = sqlx::query_as!(
+            DeviceCacheRow,
+            r#"
+            SELECT
+                device_id AS "device_id!: DeviceId",
+                device_wrapped_keys AS "device_wrapped_keys!: Vec<u8>"
+            FROM account
+            WHERE id = 1"#
         )
+        .fetch_optional(&*self.pool)
+        .await?;
+        Ok(row.map(|r| (r.device_id, r.device_wrapped_keys)))
     }
 
     /// Forget the device cache (e.g. after revocation or a backend change).
@@ -235,7 +250,7 @@ impl Db {
     #[tracing::instrument(skip(self))]
     pub async fn upsert_list(
         &self,
-        list_id: ListId,
+        list_id: &ListId,
         role: Role,
         current_epoch: Epoch,
         name: &str,
@@ -250,7 +265,7 @@ impl Db {
                 name_plaintext = excluded.name_plaintext,
                 updated_at = unixepoch()
             "#,
-            list_id.0.as_slice(),
+            list_id.as_slice(),
             role.as_str(),
             current_epoch,
             name,
@@ -265,7 +280,15 @@ impl Db {
     pub async fn list_lists(&self) -> TodoersResult<Vec<ListRow>> {
         let rows = sqlx::query_as!(
             ListRow,
-            "SELECT list_id, role, current_epoch, name_plaintext AS name FROM lists ORDER BY name_plaintext",
+            r#"
+            SELECT
+                list_id AS "list_id: ListId",
+                role,
+                current_epoch,
+                name_plaintext AS name
+            FROM lists
+            ORDER BY name_plaintext
+            "#,
         )
         .fetch_all(&*self.pool)
         .await?;
@@ -274,10 +297,10 @@ impl Db {
 
     /// The current DEK epoch a list writes new updates under.
     #[tracing::instrument(skip(self))]
-    pub async fn list_epoch(&self, list_id: ListId) -> TodoersResult<Option<Epoch>> {
+    pub async fn list_epoch(&self, list_id: &ListId) -> TodoersResult<Option<Epoch>> {
         let row = sqlx::query_scalar!(
             "SELECT current_epoch FROM lists WHERE list_id = ?",
-            list_id.0.as_slice()
+            list_id.as_slice()
         )
         .fetch_optional(&*self.pool)
         .await?;
@@ -287,11 +310,11 @@ impl Db {
     /// Bump (or set) a list's current DEK epoch — used after a membership
     /// rotation so subsequent updates are written under the new epoch.
     #[tracing::instrument(skip(self))]
-    pub async fn set_epoch(&self, list_id: ListId, epoch: Epoch) -> TodoersResult<()> {
+    pub async fn set_epoch(&self, list_id: &ListId, epoch: Epoch) -> TodoersResult<()> {
         sqlx::query!(
             "UPDATE lists SET current_epoch = ?, updated_at = unixepoch() WHERE list_id = ?",
             epoch,
-            list_id.0.as_slice()
+            list_id.as_slice()
         )
         .execute(&*self.pool)
         .await?;
@@ -299,11 +322,11 @@ impl Db {
     }
 
     #[tracing::instrument(skip(self))]
-    pub async fn rename_list(&self, list_id: ListId, name: &str) -> TodoersResult<()> {
+    pub async fn rename_list(&self, list_id: &ListId, name: &str) -> TodoersResult<()> {
         sqlx::query!(
             "UPDATE lists SET name_plaintext = ?, updated_at = unixepoch() WHERE list_id = ?",
             name,
-            list_id.0.as_slice()
+            list_id.as_slice()
         )
         .execute(&*self.pool)
         .await?;
@@ -313,8 +336,8 @@ impl Db {
     /// Delete a list and everything that cascades (members, key_slots, document,
     /// outbound, todo_items) via the schema's `ON DELETE CASCADE`.
     #[tracing::instrument(skip(self))]
-    pub async fn delete_list(&self, list_id: ListId) -> TodoersResult<()> {
-        sqlx::query!("DELETE FROM lists WHERE list_id = ?", list_id.0.as_slice())
+    pub async fn delete_list(&self, list_id: &ListId) -> TodoersResult<()> {
+        sqlx::query!("DELETE FROM lists WHERE list_id = ?", list_id.as_slice())
             .execute(&*self.pool)
             .await?;
         Ok(())
@@ -323,10 +346,10 @@ impl Db {
     // ── documents (Loro snapshot) ──────────────────────────────────────────────
 
     #[tracing::instrument(skip(self))]
-    pub async fn load_document(&self, list_id: ListId) -> TodoersResult<Option<Vec<u8>>> {
+    pub async fn load_document(&self, list_id: &ListId) -> TodoersResult<Option<Vec<u8>>> {
         let row = sqlx::query_scalar!(
             "SELECT loro_snapshot FROM documents WHERE list_id = ?",
-            list_id.0.as_slice()
+            list_id.as_slice()
         )
         .fetch_optional(&*self.pool)
         .await?;
@@ -334,7 +357,7 @@ impl Db {
     }
 
     #[tracing::instrument(skip(self, snapshot))]
-    pub async fn save_document(&self, list_id: ListId, snapshot: &[u8]) -> TodoersResult<()> {
+    pub async fn save_document(&self, list_id: &ListId, snapshot: &[u8]) -> TodoersResult<()> {
         sqlx::query!(
             r#"
             INSERT INTO documents (list_id, loro_snapshot)
@@ -343,7 +366,7 @@ impl Db {
                 loro_snapshot = excluded.loro_snapshot,
                 updated_at = unixepoch()
             "#,
-            list_id.0.as_slice(),
+            list_id.as_slice(),
             snapshot,
         )
         .execute(&*self.pool)
@@ -359,13 +382,13 @@ impl Db {
     #[tracing::instrument(skip(self, items))]
     pub async fn replace_todo_items(
         &self,
-        list_id: ListId,
+        list_id: &ListId,
         items: &[TodoItem],
     ) -> TodoersResult<()> {
         let mut txn = self.pool.begin().await?;
         sqlx::query!(
             "DELETE FROM todo_items WHERE list_id = ?",
-            list_id.0.as_slice()
+            list_id.as_slice()
         )
         .execute(&mut *txn)
         .await?;
@@ -377,7 +400,7 @@ impl Db {
                     (list_id, item_id, text, done, order_key, due_at, priority, notes, tags)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 "#,
-                list_id.0.as_slice(),
+                list_id.as_slice(),
                 &it.id,
                 &it.title,
                 it.done as i64,
@@ -397,23 +420,23 @@ impl Db {
     /// Load a list's read-model items in stored order (subtasks empty — load the
     /// full item from the doc for editing).
     #[tracing::instrument(skip(self))]
-    pub async fn load_todo_items(&self, list_id: ListId) -> TodoersResult<Vec<TodoItem>> {
+    pub async fn load_todo_items(&self, list_id: &ListId) -> TodoersResult<Vec<TodoItem>> {
         let item_rows = sqlx::query_as!(
             TodoItemRow,
             r#"
             SELECT
                 item_id   AS "id!",
                 text      AS "title!",
-                notes     AS "notes!",
-                due_at    AS "due_at: i64",
-                priority  AS "priority!: i64",
+                notes,
+                due_at,
+                priority,
                 done      AS "done!: bool",
-                tags      AS "tags!",
+                tags,
                 order_key AS "order_key!"
             FROM todo_items
             WHERE list_id = ?
             ORDER BY order_key"#,
-            list_id.0.as_slice()
+            list_id.as_slice()
         )
         .fetch_all(&*self.pool)
         .await?;
@@ -424,7 +447,7 @@ impl Db {
             FROM subtasks
             WHERE list_id = ?
             "#,
-            list_id.0.as_slice()
+            list_id.as_slice()
         )
         .fetch_all(&*self.pool)
         .await?;
@@ -476,11 +499,18 @@ impl Db {
     // ── members ────────────────────────────────────────────────────────────────
 
     #[tracing::instrument(skip(self))]
-    pub async fn list_members(&self, list_id: ListId) -> TodoersResult<Vec<Member>> {
+    pub async fn list_members(&self, list_id: &ListId) -> TodoersResult<Vec<Member>> {
         let rows = sqlx::query_as!(
             Member,
-            "SELECT member_id as 'id!', identity_pub, signing_pub, role FROM list_members WHERE list_id = ?",
-            list_id.0.as_slice(),
+            r#"
+            SELECT
+                member_id AS "id: MemberId",
+                identity_pub AS "identity_pub: X25519Pub",
+                signing_pub AS "signing_pub: Ed25519Pub",
+                role AS "role: Role"
+            FROM list_members
+            WHERE list_id = ?"#,
+            list_id.as_slice(),
         )
         .fetch_all(&*self.pool)
         .await?;
@@ -488,7 +518,7 @@ impl Db {
     }
 
     #[tracing::instrument(skip(self))]
-    pub async fn add_member_row(&self, list_id: ListId, member: &Member) -> TodoersResult<()> {
+    pub async fn add_member_row(&self, list_id: &ListId, member: &Member) -> TodoersResult<()> {
         sqlx::query!(
             r#"
             INSERT INTO list_members (list_id, member_id, identity_pub, signing_pub, role)
@@ -498,10 +528,10 @@ impl Db {
                 signing_pub = excluded.signing_pub,
                 role = excluded.role
             "#,
-            list_id.0.as_slice(),
-            member.id.0.as_slice(),
-            member.identity_pub.0.as_slice(),
-            member.signing_pub.0.as_slice(),
+            list_id.as_slice(),
+            member.id.as_slice(),
+            member.identity_pub.as_slice(),
+            member.signing_pub.as_slice(),
             member.role.as_str()
         )
         .execute(&*self.pool)
@@ -512,13 +542,13 @@ impl Db {
     #[tracing::instrument(skip(self))]
     pub async fn remove_member_row(
         &self,
-        list_id: ListId,
-        member_id: MemberId,
+        list_id: &ListId,
+        member_id: &MemberId,
     ) -> TodoersResult<()> {
         sqlx::query!(
             "DELETE FROM list_members WHERE list_id = ? AND member_id = ?",
-            list_id.0.as_slice(),
-            member_id.0.as_slice()
+            list_id.as_slice(),
+            member_id.as_slice()
         )
         .execute(&*self.pool)
         .await?;
@@ -530,7 +560,7 @@ impl Db {
     #[tracing::instrument(skip(self, wrapped_dek))]
     pub async fn save_key_slot(
         &self,
-        list_id: ListId,
+        list_id: &ListId,
         epoch: Epoch,
         wrapped_dek: &[u8],
     ) -> TodoersResult<()> {
@@ -540,7 +570,7 @@ impl Db {
             VALUES (?, ?, ?)
             ON CONFLICT(list_id, epoch) DO UPDATE SET wrapped_dek = excluded.wrapped_dek
             "#,
-            list_id.0.as_slice(),
+            list_id.as_slice(),
             epoch,
             wrapped_dek
         )
@@ -572,10 +602,10 @@ impl Db {
     #[tracing::instrument(skip(self, payload, signature))]
     pub async fn enqueue_outbound(
         &self,
-        list_id: ListId,
+        list_id: &ListId,
         epoch: Epoch,
         payload: &[u8],
-        signature: &[u8; 64],
+        signature: &Signature,
     ) -> TodoersResult<()> {
         sqlx::query!(
             r#"
@@ -583,7 +613,7 @@ impl Db {
             VALUES (?, ?, ?, ?)
             ON CONFLICT(signature) DO NOTHING
             "#,
-            list_id.0.as_slice(),
+            list_id.as_slice(),
             epoch,
             payload,
             signature.as_slice()
@@ -595,10 +625,10 @@ impl Db {
 
     /// Count pending outbound rows for a list (used by tests / a future uploader).
     #[tracing::instrument(skip(self))]
-    pub async fn outbound_count(&self, list_id: ListId) -> TodoersResult<i64> {
+    pub async fn outbound_count(&self, list_id: &ListId) -> TodoersResult<i64> {
         let row = sqlx::query_scalar!(
             "SELECT COUNT(*) FROM outbound WHERE list_id = ?",
-            list_id.0.as_slice()
+            list_id.as_slice()
         )
         .fetch_one(&*self.pool)
         .await?;
@@ -611,19 +641,22 @@ impl Db {
     #[tracing::instrument(skip(self))]
     pub async fn take_outbound(
         &self,
-        list_id: ListId,
+        list_id: &ListId,
         limit: i64,
     ) -> TodoersResult<Vec<OutboundRow>> {
         let mut txn = self.pool.begin().await?;
         let rows = sqlx::query_as!(
             OutboundRow,
             r#"
-            SELECT list_id, local_id, payload FROM outbound
+            SELECT
+                list_id AS "list_id: ListId",
+                local_id,
+                payload FROM outbound
             WHERE list_id = ? AND status = 'pending'
             ORDER BY local_id
             LIMIT ?
             "#,
-            list_id.0.as_slice(),
+            list_id.as_slice(),
             limit
         )
         .fetch_all(&mut *txn)
@@ -667,10 +700,10 @@ impl Db {
 
     /// The last server `seq` merged into this list's doc (0 if never synced).
     #[tracing::instrument(skip(self))]
-    pub async fn applied_through_seq(&self, list_id: ListId) -> TodoersResult<i64> {
+    pub async fn applied_through_seq(&self, list_id: &ListId) -> TodoersResult<i64> {
         let row = sqlx::query_scalar!(
             "SELECT applied_through_seq FROM lists WHERE list_id = ?",
-            list_id.0.as_slice()
+            list_id.as_slice()
         )
         .fetch_optional(&*self.pool)
         .await?;
@@ -680,12 +713,12 @@ impl Db {
     /// Advance the applied-through cursor and stamp `last_synced_at`. Monotonic:
     /// never moves backward, so out-of-order WS/pull merges can't rewind it.
     #[tracing::instrument(skip(self))]
-    pub async fn set_applied_through_seq(&self, list_id: ListId, seq: i64) -> TodoersResult<()> {
+    pub async fn set_applied_through_seq(&self, list_id: &ListId, seq: i64) -> TodoersResult<()> {
         sqlx::query!(
             "UPDATE lists SET applied_through_seq = MAX(applied_through_seq, ?), \
              last_synced_at = unixepoch(), updated_at = unixepoch() WHERE list_id = ?",
             seq,
-            list_id.0.as_slice()
+            list_id.as_slice()
         )
         .execute(&*self.pool)
         .await?;
@@ -694,11 +727,11 @@ impl Db {
 
     /// Record the server's compaction high-water mark (the snapshot's `covers_seq`).
     #[tracing::instrument(skip(self))]
-    pub async fn set_server_snapshot_seq(&self, list_id: ListId, seq: i64) -> TodoersResult<()> {
+    pub async fn set_server_snapshot_seq(&self, list_id: &ListId, seq: i64) -> TodoersResult<()> {
         sqlx::query!(
             "UPDATE lists SET server_snapshot_seq = ?, updated_at = unixepoch() WHERE list_id = ?",
             seq,
-            list_id.0.as_slice()
+            list_id.as_slice()
         )
         .execute(&*self.pool)
         .await?;
@@ -710,7 +743,7 @@ impl Db {
     #[tracing::instrument(skip(self))]
     pub async fn upsert_list_meta(
         &self,
-        list_id: ListId,
+        list_id: &ListId,
         role: Role,
         current_epoch: Epoch,
     ) -> TodoersResult<()> {
@@ -723,7 +756,7 @@ impl Db {
                 current_epoch = excluded.current_epoch,
                 updated_at = unixepoch()
             "#,
-            list_id.0.as_slice(),
+            list_id.as_slice(),
             role.as_str(),
             current_epoch
         )
@@ -761,10 +794,10 @@ mod tests {
         let db = Db::from_pool(db);
 
         let account = NewAccount {
-            member_id: MemberId([7u8; 16]),
+            member_id: MemberId::new([7u8; 16]),
             username: "dana".into(),
-            identity_pub: X25519Pub([1u8; 32]),
-            signing_pub: Ed25519Pub([2u8; 32]),
+            identity_pub: X25519Pub::new([1u8; 32]),
+            signing_pub: Ed25519Pub::new([2u8; 32]),
             wrapped_secret_keys: vec![9, 8, 7, 6, 5],
             kdf_salt: [3u8; 16].into(),
             kdf_mem_kib: crate::auth::KDF_MEM_KIB.into(),
@@ -780,10 +813,7 @@ mod tests {
         assert_eq!(loaded.username, account.username);
         assert_eq!(loaded.identity_pub, account.identity_pub);
         assert_eq!(loaded.signing_pub, account.signing_pub);
-        assert_eq!(
-            loaded.wrapped_secret_keys,
-            account.wrapped_secret_keys.into()
-        );
+        assert_eq!(loaded.wrapped_secret_keys, account.wrapped_secret_keys);
         assert_eq!(loaded.kdf_salt, account.kdf_salt);
         assert_eq!(loaded.kdf_mem_kib, account.kdf_mem_kib);
     }
